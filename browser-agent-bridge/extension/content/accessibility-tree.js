@@ -62,13 +62,15 @@
     return true;
   });
 
-  function buildTree(maxNodes, initialOffsetX = 0, initialOffsetY = 0, snapshotId = '', frameId = 0) {
+  globalThis.__browserAgentBridgeBuildTree = buildTree;
+
+  function buildTree(maxNodes, initialOffsetX = 0, initialOffsetY = 0, snapshotId = '', frameId = 0, scope = null) {
     const controls = [], prose = [], iframes = [];
     const visited = new WeakSet();
     const rowCounters = new WeakMap(), rowMetadata = new WeakMap();
     const a11y = globalThis.__browserAgentBridgeDomA11y;
     const containers = new Set(['document', 'article', 'complementary', 'main', 'navigation', 'region', 'form', 'list', 'listitem', 'table', 'row', 'cell', 'columnheader', 'rowheader', 'group', 'dialog', 'tablist', 'menu', 'menubar', 'tree', 'treeitem', 'grid', 'radiogroup', 'toolbar']);
-    const contextRoles = new Set(['dialog', 'form', 'row', 'main', 'navigation', 'region', 'complementary', 'tablist']);
+    const contextRoles = new Set(['dialog', 'form', 'row', 'main', 'navigation', 'region', 'complementary', 'tablist', 'group', 'menu', 'menubar', 'tree']);
     const leaves = new Set(['button', 'input', 'textarea', 'select', 'option', 'img']);
     let index = 1, scanned = 0;
     refState.snapshotId = snapshotId || `snapshot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -90,7 +92,7 @@
       const ref = `ref_${index++}`;
       rememberRef(ref, el, frameId === 0 ? initialOffsetX : 0, frameId === 0 ? initialOffsetY : 0);
       const node = { ref, snapshotId: refState.snapshotId, frameId, tag: el.tagName.toLowerCase(), ...data,
-        context: context.slice(-2).join(' > ') || undefined,
+        depth: context.length, context: context.slice(-2).join(' > ') || undefined,
         ...rowMetadata.get(el.closest?.('tr,[role="row"]')),
         focused: getActiveElementDeep() === el || undefined,
         bounds: { x: Math.round(rect.x + initialOffsetX), y: Math.round(rect.y + initialOffsetY), width: Math.round(rect.width), height: Math.round(rect.height) } };
@@ -128,15 +130,15 @@
       }
       const interactive = Boolean((role && !containers.has(role)) || el.matches('a[href],button,input,textarea,select,[tabindex],[contenteditable="true"]'));
       const name = (interactive || contextRoles.has(role)) ? a11y.accessibleName(el, el.getRootNode?.() || el.ownerDocument || document) : '';
-      if (interactive && a11y.isVisible(el)) {
+      if ((interactive || (scope && contextRoles.has(role))) && a11y.isVisible(el)) {
         const states = { disabled: !a11y.isEnabled(el), readonly: el.readOnly === true || el.getAttribute('aria-readonly') === 'true' };
         for (const state of ['checked', 'selected', 'expanded']) {
           const value = a11y.ariaBooleanState(el, state);
           if (value !== null && value !== undefined) states[state] = value;
         }
-        emit(el, { role: role || undefined, name, type: el.getAttribute('type') || undefined, value: valueOf(el), href: el instanceof HTMLAnchorElement ? el.href : undefined, ...states }, context, true);
+        emit(el, { role: role || undefined, name, type: el.getAttribute('type') || undefined, value: valueOf(el), href: el instanceof HTMLAnchorElement ? el.href : undefined, ...states }, context, interactive);
       }
-      if (role === 'row' && !interactive && a11y.isVisible(el)) emit(el, { role, name }, context, false);
+      if (role === 'row' && !interactive && !scope && a11y.isVisible(el)) emit(el, { role, name }, context, false);
       const row = rowMetadata.get(el);
       const nextContext = contextRoles.has(role) ? [...context, `${role}${row?.rowIndex ? ' ' + row.rowIndex : ''}${name ? ' ' + name.slice(0, 120) : ''}`] : context;
       if (leaves.has(tag) || (tag === 'a' && interactive)) return;
@@ -146,7 +148,7 @@
         if (text) emit(el, { text: text.slice(0, 500) }, nextContext, false);
       } else for (const child of composed) traverse(child, nextContext);
     }
-    traverse(document.body || document.documentElement);
+    traverse(scope || document.body || document.documentElement);
     controls.sort((a, b) => Number(Boolean(b.focused)) - Number(Boolean(a.focused)) || Number(Boolean(b.context?.includes('dialog'))) - Number(Boolean(a.context?.includes('dialog'))));
     const all = [...controls, ...prose], nodes = all.slice(0, maxNodes);
     const retained = new Set(nodes.map(node => node.ref));

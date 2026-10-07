@@ -85,6 +85,11 @@ RECOVERY_POLICY = {
     "FIREWALL_DENIED": "stop_retry",
     "BRIDGE_UNAVAILABLE": "transport_retry",
 }
+LOCAL_RECOVERY_CODES = frozenset({
+    'TARGET_NOT_FOUND', 'TARGET_AMBIGUOUS', 'TARGET_DISABLED', 'TARGET_EVIDENCE_UNAVAILABLE',
+    'OUTCOME_UNVERIFIED', 'OBSERVATION_REQUIRED', 'STALE_REFERENCE', 'REF_NOT_FOUND', 'STALE_SCREENSHOT',
+    'LOCATOR_STRICT_MODE_VIOLATION', 'LOCATOR_REF_NOT_ACTIONABLE',
+})
 MODEL_RETRY_CODES = frozenset({"INVALID_ARGUMENT", "STALE_REFERENCE", "REF_NOT_FOUND"})
 TOOL_FAILED_CODES = frozenset({
     "POLICY_DENIED", "FIREWALL_DENIED", "SENSITIVE_OPERATION_BLOCKED",
@@ -182,9 +187,19 @@ def _observed_effect_target(runtime, tab, locator):
     result = runtime._rpc('locator.count', {'tabId': runtime.tab(tab).raw_id,
                           **bt._locator_params(locator)}, tab=tab)
     elements = result.get('elements') or []
-    if result.get('count') != 1 or len(elements) != 1:
-        raise ToolFailed('The change needs one unambiguous observed target. Inspect the page and choose a unique control.')
+    count = result.get('count')
+    keys = ('role', 'accessibleName', 'text', 'disabled', 'context', 'tagName')
+    candidates = [{key: element[key] for key in keys if key in element} for element in elements[:5]]
+    detail = {'count': count, 'candidates': candidates}
+    if count == 0:
+        raise bt.ToolFault('TARGET_NOT_FOUND', 'No target matched. Inspect the relevant region or correct the locator.', True, detail)
+    if isinstance(count, int) and count > 1:
+        raise bt.ToolFault('TARGET_AMBIGUOUS', 'Multiple targets matched. Scope the locator using the candidate context.', True, detail)
+    if count != 1 or len(elements) != 1:
+        raise bt.ToolFault('TARGET_EVIDENCE_UNAVAILABLE', 'Target count and identity evidence disagree. Observe again.', True, detail)
     element = elements[0]
+    if element.get('disabled') is True:
+        raise bt.ToolFault('TARGET_DISABLED', 'The matched control is disabled. Inspect its prerequisites or wait for it to become enabled.', True, detail)
     keys = ('tagName', 'id', 'name', 'role', 'type', 'text', 'ariaLabel', 'placeholder',
             'accessibleName', 'href', 'formAction', 'formMethod', 'disabled', 'editable')
     return {key: element[key] for key in keys if key in element}
@@ -217,6 +232,8 @@ class StepGate:
     # bounded TaskMemory, but essential for tracing a step's root cause.
     on_refusal: Callable[[str, str | None, str, str, str | None], None] | None = None
 
+    refresh_tabs: set[str] = field(default_factory=set)
+    recovery_attempts: int = 0
     actions_used: int = 0
     interrupted: bool = False
     interrupt_reason: str | None = None
@@ -252,7 +269,7 @@ class StepGate:
     def _safe_args(self, kwargs: dict[str, Any]) -> str | None:
         return _describe_args(kwargs)
 
-    def reject(self, tool, kwargs, code, message):
+    def reject(self, tool, kwargs, code, message, detail=None):
         """Record pre-dispatch failure without manufacturing a page mutation."""
         operation = _command_operation(kwargs)
         tab = kwargs.get('tab') or getattr(kwargs.get('command'), 'tab', None)
@@ -262,10 +279,18 @@ class StepGate:
             code=code, message=message, retain_in_memory=True))
         self.effects.append((False, False))
         self.refusals += 1
-        self._interrupt(message)
+        if code in LOCAL_RECOVERY_CODES and self.recovery_attempts < 3:
+            self.recovery_attempts += 1
+            if tab:
+                self.refresh_tabs.add(tab)
+        else:
+            self._interrupt(message)
         if self.on_refusal is not None:
             self.on_refusal(tool, operation, code, message, args)
-        return _refusal(tab, code, message)
+        result = _refusal(tab, code, message)
+        result['error']['detail'] = detail
+        result['error']['retryable'] = code in LOCAL_RECOVERY_CODES and not self.interrupted
+        return result
 
     def check(
         self, tool: str, kwargs: dict[str, Any], approval_detail: dict[str, Any] | None = None,
@@ -302,9 +327,10 @@ class StepGate:
             self._interrupt("the total browser action budget was reached")
             return refuse("ACTION_BUDGET_EXHAUSTED", "The run's browser action budget is exhausted.")
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
-        if mutating and tab in self.uncertain_tabs:
-            self._interrupt("an earlier operation on this tab has an unknown outcome")
+        if mutating and (tab in self.uncertain_tabs or self.unknown_outcome):
             return refuse("OUTCOME_UNVERIFIED", "Inspect and verify the previous outcome before another change; do not replay the submission.")
+        if mutating and tab in self.refresh_tabs:
+            return refuse('OBSERVATION_REQUIRED', 'Observe this tab after the page change or targeting failure before another action.')
         target_text = str((approval_detail or {}).get("target") or "").lower()
         patterns = {
             "download": r"\bdownload\b|source code.*(?:zip|tar)|\.(?:zip|tar|gz|exe|msi|csv|xlsx)(?:\b|$)|/archive/refs/",
@@ -396,16 +422,24 @@ class StepGate:
             # the action's tab next, even when another tab was previously active.
             self.active_tab_changed_to = kwargs["tab"]
 
+        if success and tool == 'browser_observe' and 'snapshot' in data:
+            self.refresh_tabs.discard(kwargs.get('tab'))
         if not success:
             if code in STOP_CODES:
                 self.stopped = "cancelled" if code == "RUN_CANCELLED" else "paused"
-            if code in MODEL_RETRY_CODES:
+            if code in LOCAL_RECOVERY_CODES and self.recovery_attempts < 3:
+                self.recovery_attempts += 1
+                if kwargs.get('tab'):
+                    self.refresh_tabs.add(kwargs['tab'])
+            elif code in LOCAL_RECOVERY_CODES:
+                self._interrupt('the local recovery budget was reached')
+            elif code in MODEL_RETRY_CODES:
                 # Pydantic AI may issue a corrected call in this same model
                 # turn; do not make the gate reject that correction.
                 pass
             elif mutating and code in UNKNOWN_OUTCOME_CODES:
                 self.unknown_outcome = True
-                self._interrupt(f"a {operation!r} action failed with an unknown outcome ({code})")
+                # Keep reads available, but prohibit further mutations this step.
             elif code in NON_RETRYABLE_CODES:
                 self.non_retryable = True
                 self._interrupt(f"a non-retryable failure occurred ({code})")
@@ -414,9 +448,9 @@ class StepGate:
         elif refs_invalidated:
             if isinstance(kwargs.get("tab"), str):
                 self.active_tab_changed_to = kwargs["tab"]
-            self._interrupt("the page navigated and the current refs are invalid")
+            self.refresh_tabs.add(kwargs.get('tab'))
         elif rerendered:
-            self._interrupt("the page rerendered substantially")
+            self.refresh_tabs.add(kwargs.get('tab'))
         elif tool == "browser_act" and isinstance(data.get("openedTabs"), list) and data["openedTabs"]:
             candidates = [alias for alias in data["openedTabs"] if isinstance(alias, str)]
             self.active_tab_changed_to = candidates[-1] if candidates else None
@@ -508,8 +542,13 @@ class StepGate:
         self.effects.append((mutated, verified))
         if record.success:
             for earlier in self.records[:-1]:
-                if (earlier.code == "INVALID_ARGUMENT"
-                        and earlier.tool == record.tool and earlier.tab == record.tab):
+                if (earlier.code in (LOCAL_RECOVERY_CODES - {'OUTCOME_UNVERIFIED'}) | {'INVALID_ARGUMENT'}
+                        and earlier.tool == record.tool
+                        and (earlier.code == 'INVALID_ARGUMENT' or earlier.operation == record.operation)
+                        and earlier.tab == record.tab):
+                    earlier.recovered = True
+                if (earlier.code == 'OBSERVATION_REQUIRED' and earlier.tab == record.tab
+                        and tool == 'browser_observe' and 'snapshot' in data):
                     earlier.recovered = True
         self.actions_used += 1
         self.browser_ms += duration_ms
@@ -663,7 +702,7 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
                 detail['observed_target'] = _observed_effect_target(deps.browser, tab, effect_locator)
             except (ToolFailed, bt.ToolFault) as error:
                 code = getattr(error, 'code', 'LOCATOR_STRICT_MODE_VIOLATION')
-                return deps.gate.reject(function.__name__, named, code, str(error))
+                return deps.gate.reject(function.__name__, named, code, str(error), getattr(error, 'detail', None))
             observed = detail['observed_target']
             detail['target'] = ' '.join(str(observed.get(key) or '') for key in ('role', 'accessibleName', 'ariaLabel', 'text', 'name', 'type')).strip()
         refusal = deps.gate.check(function.__name__, named, detail)
@@ -681,9 +720,14 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             if live_url != current_url:
                 deps.gate._interrupt('the destination changed while authorizing the action')
                 return deps.gate.reject(function.__name__, named, 'STALE_STATE', 'The destination changed. Observe the current page before continuing.')
-            if effect_locator and _observed_effect_target(deps.browser, tab, effect_locator) != detail['observed_target']:
-                deps.gate._interrupt('the observed target changed while authorizing the action')
-                return deps.gate.reject(function.__name__, named, 'STALE_STATE', 'The target changed. Observe the page before continuing.')
+            if effect_locator:
+                try:
+                    current_target = _observed_effect_target(deps.browser, tab, effect_locator)
+                except bt.ToolFault as error:
+                    return deps.gate.reject(function.__name__, named, error.code, str(error), error.detail)
+                if current_target != detail['observed_target']:
+                    deps.gate._interrupt('the observed target changed while authorizing the action')
+                    return deps.gate.reject(function.__name__, named, 'STALE_STATE', 'The target changed. Observe the page before continuing.')
             if isinstance(command, bt.Upload) and deps.documents:
                 try:
                     deps.documents.resolve_uploads(named['command'].files)

@@ -137,6 +137,7 @@ async function runAccessibilitySession(document, message = {}) {
   listener({ type: 'GET_ACCESSIBILITY_TREE', maxNodes: 100, snapshotId: 'snap_test', frameId: 0, ...message }, {}, value => { response = value; });
   assert.equal(response.ok, true, response.error);
   return {
+    context,
     tree: response.tree,
     send(message) {
       let sent = null;
@@ -466,4 +467,43 @@ test('reference hit testing chooses an exposed point when the center is covered'
   const result = session.send({ type: 'GET_ACCESSIBILITY_REF_TARGET', ref: node.ref, snapshotId: node.snapshotId });
   assert.equal(result.target.actionability.actionable, true);
   assert.equal(result.target.element.clickPoint.x, 20);
+});
+
+
+test('scoped observations use the real resolver and retain roles, state, context and refs in the isolated world', async () => {
+  const save = new FakeElement('button', { text: 'Save', attrs: { 'aria-disabled': 'true' } });
+  const previous = new FakeElement('button', { text: 'Previous' });
+  const menu = new FakeElement('div', { attrs: { role: 'group', 'aria-label': 'Options' }, children: [previous, save] });
+  const outside = new FakeElement('button', { text: 'Outside' });
+  const document = makeDocument([menu, outside]);
+  const session = await runAccessibilitySession(document);
+  const { createLocatorHandlers } = await importLocatorModule();
+  const { renderCompactRefTree } = await import('../extension/sw/page.js');
+  const worlds = [];
+  const handlers = createLocatorHandlers({
+    assertTabId: id => id, assertTabAllowed: async () => {}, ensureContentScripts: async () => {},
+    resolveFrameTarget: async tabId => ({ target: { tabId, frameIds: [7] }, frameId: 7 }),
+    renderRefTree: renderCompactRefTree,
+    chromeApi: { tabs: {get: async () => ({url: 'https://top.example/', title: 'Top page'})}, scripting: { async executeScript({func, args, world}) {
+      worlds.push(world);
+      session.context.options = args[0];
+      return [{ result: await vm.runInContext('(' + func.toString() + ')(options)', session.context) }];
+    } } },
+  });
+  for (const format of ['compact', 'aria']) {
+    const result = await handlers.locatorSnapshot({ tabId: 1, locator: { role: 'group', name: 'Options', exact: true }, format });
+    assert.equal(result.url, 'https://top.example/');
+    assert.match(result.snapshot, /group "Options"/);
+    assert.match(result.snapshot, /button "Previous"/);
+    assert.match(result.snapshot, /disabled=true/);
+    assert.match(result.snapshot, /context="group Options"/);
+    assert.doesNotMatch(result.snapshot, /Outside/);
+    assert.match(result.snapshot, /\[f7:ref_/);
+    if (format === 'aria') assert.match(result.snapshot, /- button/);
+    const ref = result.snapshot.match(/\[f7:(ref_\d+)\].*button "Previous"/)[1];
+    assert.equal(session.send({type: 'GET_ACCESSIBILITY_REF_TARGET', ref, snapshotId: result.snapshotId}).ok, true);
+  }
+  assert.deepEqual(worlds, ['ISOLATED', 'ISOLATED']);
+  await assert.rejects(handlers.locatorSnapshot({tabId: 1, locator: {role: 'link', name: 'Missing'}}), error => error.code === 'TARGET_NOT_FOUND');
+  await assert.rejects(handlers.locatorSnapshot({tabId: 1, locator: {role: 'button'}}), error => error.code === 'TARGET_AMBIGUOUS' && error.data.count === 3);
 });

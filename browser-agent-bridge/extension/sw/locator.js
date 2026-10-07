@@ -30,6 +30,7 @@ export function createLocatorHandlers({
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   defaultTimeoutMs,
   chromeApi = chrome,
+  renderRefTree = null,
   domA11ySource = null
 }) {
   const injectedTargets = new Set();
@@ -109,6 +110,20 @@ export function createLocatorHandlers({
       world: 'MAIN'
     });
     injectedTargets.add(cacheKey);
+  }
+
+  async function locatorSnapshot(params) {
+    const tabId = assertTabId(params.tabId);
+    await assertTabAllowed(tabId, 'page.accessibilityTree');
+    const frameTarget = await resolveFrameTarget(tabId, params);
+    await ensureContentScripts(tabId, frameTarget.frameId || 0);
+    const snapshotId = 'snap_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    const tree = await runLocatorScript(tabId, { ...params, snapshotId }, 'snapshot', frameTarget);
+    const render = budget => renderRefTree(tree.nodes || [], budget, params.format === 'aria');
+    const snapshot = render(params.maxChars || 12000);
+    const tab = await chromeApi.tabs.get(tabId);
+    return { snapshot, snapshotId: tree.snapshotId, url: tab.url, title: tab.title,
+      nodeCount: tree.nodes.length, truncated: tree.truncated || snapshot.length < render(Infinity).length };
   }
 
   async function locatorCount(params) {
@@ -1117,6 +1132,9 @@ export function createLocatorHandlers({
     const limit = Number.isInteger(params.limit) && params.limit > 0 ? Math.min(params.limit, 200) : 50;
     const options = {
       locator,
+      snapshotId: params.snapshotId,
+      maxNodes: params.maxNodes || 1000,
+      frameId: frameTarget?.frameId || 0,
       action,
       index,
       limit,
@@ -1146,6 +1164,17 @@ export function createLocatorHandlers({
 
         const matches = findLocatorMatches(root, options.locator);
         const elements = matches.slice(0, options.limit).map((element, index) => summarizeElement(element, index));
+
+        if (options.action === 'snapshot') {
+          if (matches.length !== 1) {
+            const error = new Error(matches.length ? 'Scope matched multiple elements; choose a unique region.' : 'Observation scope was not found.');
+            error.code = matches.length ? 'TARGET_AMBIGUOUS' : 'TARGET_NOT_FOUND';
+            error.data = { count: matches.length, candidates: elements.slice(0, 5) };
+            throw error;
+          }
+          if (!globalThis.__browserAgentBridgeBuildTree) throw new Error('Accessibility tree serializer is not loaded');
+          return globalThis.__browserAgentBridgeBuildTree(options.maxNodes, 0, 0, options.snapshotId, options.frameId, matches[0]);
+        }
 
         if (options.action === 'query') {
           return { count: matches.length, visibleCount: matches.filter(isVisible).length, elements };
@@ -1786,6 +1815,10 @@ export function createLocatorHandlers({
             ariaLabel: element.getAttribute('aria-label') || '',
             placeholder: element.getAttribute('placeholder') || '',
             accessibleName: accessibleName(element, root).slice(0, 500),
+            context: (() => {
+              const container = element.parentElement?.closest?.('dialog,[role="dialog"],form,tr,[role="row"],nav,[role="navigation"],section,[role="group"]');
+              return container ? [inferredRole(container), accessibleName(container, root).slice(0, 160)].filter(Boolean).join(' ') : '';
+            })(),
             disabled: !isEnabled(element),
             editable: isEditable(element),
             checked: ariaBooleanState(element, 'checked'),
@@ -2017,19 +2050,21 @@ export function createLocatorHandlers({
           // null. Transport it explicitly so it cannot become a zero count or
           // an unrelated TypeError in the service worker.
           return { locatorScriptError: {
-            code: error?.name === 'SyntaxError' ? 'INVALID_ARGUMENT' : 'BRIDGE_ERROR',
+            code: typeof error?.code === 'string' ? error.code : (error?.name === 'SyntaxError' ? 'INVALID_ARGUMENT' : 'BRIDGE_ERROR'),
+            detail: error?.data,
             message: String(error?.message || error)
           } };
         }
       },
       args: [options],
-      world: 'MAIN'
+      world: action === 'snapshot' ? 'ISOLATED' : 'MAIN'
     });
     const result = injections?.[0]?.result;
     if (!result || typeof result !== 'object' || result.locatorScriptError) {
       const detail = result?.locatorScriptError;
       const error = new Error(detail?.message || 'Locator script returned no usable result; observe the page before retrying.');
       error.code = detail?.code || 'BRIDGE_ERROR';
+      error.data = detail?.detail;
       throw error;
     }
     return result;
@@ -2270,6 +2305,7 @@ export function createLocatorHandlers({
     locatorTextContent,
     locatorAllTextContents,
     locatorAllInnerTexts,
+    locatorSnapshot,
     locatorGetAttribute,
     locatorNth,
     locatorFirst,

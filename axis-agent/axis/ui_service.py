@@ -44,6 +44,7 @@ class MessageInput(Input):
     client_request_id: str = Field(pattern=r'^[a-zA-Z0-9_-]{16,80}$')
     task_id: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9_-]{16,80}$')
     context_task_id: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9_-]{16,80}$')
+    conversation_task_id: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9_-]{16,80}$')
     attachments: list[AttachmentRef] = Field(default_factory=list, max_length=8)
     execution_mode: Literal['approval', 'automatic'] = 'approval'
 
@@ -194,7 +195,7 @@ def create_app(store, runner, *, token, origin, port=8766):
 
     async def submit(request):
         body = await read_input(request, MessageInput)
-        if (body.intent == 'follow_up') != (body.task_id is not None) or (body.intent == 'follow_up' and body.context_task_id):
+        if (body.intent == 'follow_up') != (body.task_id is not None) or (body.intent == 'follow_up' and (body.context_task_id or body.conversation_task_id)):
             raise ServiceError('invalid_input', 'Follow-ups require an explicit live task target.', 422)
         with commands:
             result = runner.submit(request.path_params['conversation_id'], body)

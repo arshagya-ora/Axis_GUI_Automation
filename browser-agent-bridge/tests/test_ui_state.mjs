@@ -18,8 +18,12 @@ test('continue now retains a failed task in the selected conversation', () => {
     other: {id: 'other', conversation_id: 'other', status: 'failed', updated_at: 3},
   };
   assert.equal(continuationContext(state, 'CONTINUE NOW, I HAVE FIXED THE PERMISSION'), 'failed');
-  assert.equal(continuationContext(state, 'Open another website'), null);
+  assert.equal(continuationContext(state, 'Try to perform the service operations step again from scratch'), 'failed');
+  // Context is provided to interpret the request, not to force old work.
+  assert.equal(continuationContext(state, 'Open another website'), 'failed');
   state.tasks.completed = {id: 'completed', conversation_id: 'c', status: 'completed', updated_at: 4};
+  assert.equal(continuationContext(state, 'Continue now'), 'completed');
+  state.selected = 'new-conversation';
   assert.equal(continuationContext(state, 'Continue now'), null);
 });
 

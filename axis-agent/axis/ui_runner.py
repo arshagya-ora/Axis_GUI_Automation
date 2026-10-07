@@ -162,6 +162,24 @@ class Runner:
                 if conversation['title'] == 'New conversation':
                     self.store.db.execute('UPDATE conversations SET title=? WHERE id=?', (body.text[:80], conversation_id))
                 instruction = body.text
+                if body.conversation_task_id and not body.context_task_id:
+                    source = self.store.task(body.conversation_task_id)
+                    if source['conversation_id'] != conversation_id:
+                        raise ServiceError('invalid_input', 'Conversation context must belong to this conversation.', 422)
+                    # Context informs the existing agent; it does not replay an old
+                    # task or restore stale completion/authorization state.
+                    previous = source.get('conversation_context') or source.get('instruction') or source['title']
+                    outcome = (source.get('result') or {}).get('answer') or source.get('current_activity', '')
+                    checkpoint = source.get('browser_checkpoint') or {}
+                    context = {'request': previous, 'status': source['status'],
+                               'outcome': outcome, 'browser_checkpoint': checkpoint}
+                    instruction = (body.text + '\n\nPrior task context (reference only):\n' + json.dumps(context, ensure_ascii=False)
+                        + '\nResolve references in the current request using this context. The current request determines scope; '
+                          'starting from scratch resets execution progress, not the objective or constraints. '
+                          'Verify the live page before reusing prior evidence or repeating changes.')
+                    task['conversation_context'] = previous + '\nFollow-up: ' + body.text
+                    task['instruction'] = instruction
+                    self.store.save_task(task)
                 if body.context_task_id:
                     source = self.store.task(body.context_task_id)
                     if source['conversation_id'] != conversation_id:

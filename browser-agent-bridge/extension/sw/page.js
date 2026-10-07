@@ -1544,9 +1544,10 @@ function extractAriaProps(node) {
 // text snapshot: one line per node, interactive lines tagged with frame+ref so an
 // agent can act on them directly (clickRef/fillRef/...). Bounds are dropped — the
 // agent acts by ref, not coordinates.
-function renderCompactRefTree(nodes, maxChars = 12000) {
+export function renderCompactRefTree(nodes, maxChars = 12000, hierarchical = false) {
   const lines = [];
   const ordered = [...nodes].sort((a, b) => Number(Boolean(b.focused)) - Number(Boolean(a.focused)) || Number(Boolean(b.context?.includes('dialog'))) - Number(Boolean(a.context?.includes('dialog'))) || Number(typeof a.text === 'string') - Number(typeof b.text === 'string'));
+  if (hierarchical) ordered.sort((a, b) => Number(a.ref.replace('ref_', '')) - Number(b.ref.replace('ref_', '')));
   for (const node of ordered) {
     if (typeof node.text === 'string') {
       const text = node.text.trim();
@@ -1554,7 +1555,7 @@ function renderCompactRefTree(nodes, maxChars = 12000) {
       continue;
     }
     const frameId = Number.isInteger(node.frameId) ? node.frameId : 0;
-    const parts = [`[f${frameId}:${node.ref}]`, node.role || node.tag || 'element'];
+    const parts = [`[f${frameId}:${node.ref}]`, ...(hierarchical ? ['  '.repeat(Math.min(node.depth || 0, 12)) + '-'] : []), node.role || node.tag || 'element'];
     if (node.name) parts.push(JSON.stringify(node.name));
     if (typeof node.value === 'string' && node.value) parts.push(`=${JSON.stringify(node.value.slice(0, 500))}`);
     else if (typeof node.value === 'boolean') parts.push(node.value ? '[checked]' : '[unchecked]');

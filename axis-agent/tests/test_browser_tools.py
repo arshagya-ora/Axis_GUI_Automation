@@ -323,11 +323,11 @@ def test_observe_supports_locator_inspection_and_frames_without_raw_ids():
     assert "frameId" not in json.dumps(frames)
 
 
-def test_locator_observe_without_extract_defaults_to_all_inner_text():
+def test_locator_text_observe_without_extract_defaults_to_all_inner_text():
     bridge, runtime, alias = runtime_with_tab()
     bridge.responses["locator.allInnerTexts"] = {"texts": ["First", "Second"]}
     result = bt.browser_observe(
-        context(runtime), alias, locator=bt.Locator(role="list", name="Results"),
+        context(runtime), alias, mode="text", locator=bt.Locator(role="list", name="Results"),
     )
     method, params = bridge.calls[-1]
     assert result["ok"] is True
@@ -462,3 +462,32 @@ def test_new_module_is_substantially_smaller_and_legacy_file_is_unchanged():
     # The optional visual specialist expands capability without growing the
     # six ordinary tool schemas (bounded separately above).
     assert len(new.read_text(encoding="utf-8").splitlines()) < len(legacy.read_text(encoding="utf-8").splitlines())
+
+
+@pytest.mark.parametrize('mode', ['compact', 'aria'])
+def test_scoped_observation_keeps_roles_states_and_actionable_refs(mode):
+    bridge, runtime, tab = runtime_with_tab()
+    bridge.responses['page.accessibilityTree'] = {
+        'snapshot': '[f7:ref_3] button "Save" [disabled=true] context="dialog Preferences"',
+        'snapshotId': 'scoped-1', 'url': 'https://example.test/'}
+    result = bt.browser_observe(context(runtime), tab, mode=mode,
+                                locator=bt.Locator(role='dialog', name='Preferences'), max_nodes=80)
+    assert result['ok']
+    assert '[disabled=true]' in result['data']['snapshot']
+    assert '[ref_1]' in result['data']['snapshot']
+    assert runtime.observations[tab].refs['ref_1'] == (7, 'ref_3')
+    method, params = bridge.calls[-1]
+    assert method == 'page.accessibilityTree'
+    assert params['format'] == mode and params['maxNodes'] == 80
+    assert params['locator']['role'] == 'dialog'
+
+
+def test_reading_another_format_does_not_discard_document_refs():
+    bridge, runtime, tab = runtime_with_tab()
+    runtime.observe_refs(tab, '[f0:ref_1] button "Save"', 'snap-1')
+    previous = runtime.observations[tab]
+    bridge.responses['page.ariaSnapshot'] = {'snapshot': '- button "Save"'}
+    runtime.observe(tab, 'aria')
+    assert runtime.observations[tab] is previous
+    runtime.invalidate(tab)
+    assert tab not in runtime.observations

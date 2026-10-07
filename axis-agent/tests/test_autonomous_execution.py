@@ -220,3 +220,71 @@ def test_preflight_failure_does_not_create_an_uncertain_mutation():
     assert not controller.state.pending_changes
     assert controller.state.counters.mutation_count == 0
     assert 'locator.click' not in bridge.methods
+
+
+@pytest.mark.parametrize('count,elements,code', [
+    (0, [], 'TARGET_NOT_FOUND'),
+    (2, [{'role': 'button', 'context': 'dialog A'}, {'role': 'button', 'context': 'dialog B'}], 'TARGET_AMBIGUOUS'),
+    (1, [], 'TARGET_EVIDENCE_UNAVAILABLE'),
+    (1, [{'role': 'button', 'disabled': True}], 'TARGET_DISABLED'),
+])
+def test_target_preflight_reports_actual_failure(count, elements, code):
+    from axis.agents import _observed_effect_target
+    controller, bridge, _ = ready()
+    bridge.responses['locator.count'] = {'count': count, 'elements': elements}
+    with pytest.raises(bt.ToolFault) as fault:
+        _observed_effect_target(controller.browser, 'tab_1', bt.Locator(role='button', name='Save'))
+    assert fault.value.code == code
+    assert fault.value.detail['count'] == count
+    assert len(fault.value.detail['candidates']) == len(elements)
+
+
+def test_navigation_allows_read_then_fresh_action_in_same_step():
+    gate = StepGate(max_actions=12, remaining_total_actions=30)
+    kwargs = {'tab': 'tab_1', 'command': bt.Click(action='click', target=bt.RefTarget(kind='ref', ref='ref_1'))}
+    gate.record('browser_act', kwargs, {'ok': True, 'data': {'refsInvalidated': True}})
+    assert not gate.interrupted
+    assert gate.check('browser_wait', {'tab': 'tab_1', 'command': bt.EventWait(condition='page_load')}) is None
+    assert gate.check('browser_act', kwargs)['error']['code'] == 'OBSERVATION_REQUIRED'
+    assert gate.check('browser_observe', {'tab': 'tab_1'}) is None
+    gate.record('browser_observe', {'tab': 'tab_1'}, {'ok': True, 'data': {'snapshot': 'new page'}})
+    assert gate.check('browser_act', kwargs) is None
+
+
+def test_target_recovery_is_local_bounded_and_keeps_diagnostics():
+    gate = StepGate(max_actions=12, remaining_total_actions=30)
+    for _ in range(3):
+        result = gate.reject('browser_act', {'tab': 'tab_1'}, 'TARGET_NOT_FOUND', 'Missing', {'count': 0})
+        assert result['error']['detail']['count'] == 0
+        assert not gate.interrupted
+        assert gate.check('browser_observe', {'tab': 'tab_1'}) is None
+    gate.reject('browser_act', {'tab': 'tab_1'}, 'TARGET_NOT_FOUND', 'Missing')
+    assert gate.interrupted
+
+
+def test_unknown_submission_can_be_inspected_but_not_replayed():
+    gate = StepGate(max_actions=12, remaining_total_actions=30)
+    kwargs = {'tab': 'tab_1', 'command': bt.Click(action='click', target=bt.RefTarget(kind='ref', ref='ref_1'))}
+    gate.record('browser_act', kwargs, {'ok': False, 'error': {'code': 'TIMEOUT'}})
+    assert gate.check('browser_observe', {'tab': 'tab_1'}) is None
+    gate.record('browser_observe', {'tab': 'tab_1'}, {'ok': True, 'data': {'snapshot': 'Receipt'}})
+    assert gate.check('browser_act', kwargs)['error']['code'] == 'OUTCOME_UNVERIFIED'
+    assert not gate.interrupted
+
+
+def test_cancel_and_authorization_refusal_still_stop_recovery_reads():
+    cancelled = StepGate(max_actions=12, remaining_total_actions=30, is_cancelled=lambda: True)
+    assert cancelled.check('browser_observe', {'tab': 'tab_1'})['error']['code'] == 'RUN_CANCELLED'
+    denied = StepGate(max_actions=12, remaining_total_actions=30)
+    denied.reject('browser_act', {'tab': 'tab_1'}, 'APPROVAL_DENIED', 'Denied')
+    assert denied.check('browser_observe', {'tab': 'tab_1'})['error']['code'] == 'STEP_INTERRUPTED'
+
+
+def test_successful_local_repair_does_not_count_as_unresolved_failure():
+    gate = StepGate(max_actions=12, remaining_total_actions=30)
+    kwargs = {'tab': 'tab_1', 'command': bt.Click(action='click', target=bt.RefTarget(kind='ref', ref='ref_1'))}
+    gate.reject('browser_act', kwargs, 'TARGET_AMBIGUOUS', 'Scope it')
+    gate.record('browser_observe', {'tab': 'tab_1'}, {'ok': True, 'data': {'snapshot': 'unique button'}})
+    gate.record('browser_act', kwargs, {'ok': True, 'data': {}})
+    assert gate.records[0].recovered
+    assert not gate.interrupted

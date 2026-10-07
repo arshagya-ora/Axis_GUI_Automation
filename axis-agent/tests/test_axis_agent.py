@@ -514,12 +514,12 @@ async def test_refused_and_interrupted_calls_are_traceable_even_though_never_exe
     actions = [e for e in events if e.kind == "browser_action"]
     assert [a.detail["skipped"] for a in actions] == [False, True]
     assert actions[1].detail["tool"] == "browser_act"
-    assert "STEP_INTERRUPTED" in actions[1].detail["error"]
+    assert "OBSERVATION_REQUIRED" in actions[1].detail["error"]
     # It never reached the bridge, but every attempted call is an ActionRecord.
     assert "locator.clickRef" not in bridge.methods
     refused = [
         record for record in orchestrator.memory.recent_action_results
-        if record.code == "STEP_INTERRUPTED"
+        if record.code == "OBSERVATION_REQUIRED"
     ]
     assert refused and refused[0].executed is False
     assert refused[0].execution_success is False

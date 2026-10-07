@@ -2,7 +2,7 @@ import { createLocatorHandlers } from './sw/locator.js';
 import { createDomHandlers } from './sw/dom.js';
 import { createComputerHandlers } from './sw/computer.js';
 import { createVisualHandlers } from './sw/visual.js';
-import { createPageHandlers } from './sw/page.js';
+import { createPageHandlers, renderCompactRefTree } from './sw/page.js';
 import { createDevtoolsHandlers } from './sw/devtools.js';
 import { createDownloadsHandlers } from './sw/downloads.js';
 import { CSP_BYPASS_ALARM, createCspHandlers } from './sw/csp.js';
@@ -161,6 +161,7 @@ const recordingHandlers = createRecordingHandlers({
 });
 
 const locatorHandlers = createLocatorHandlers({
+  renderRefTree: renderCompactRefTree,
   assertTabId,
   assertTabAllowed,
   assertString,
@@ -305,7 +306,7 @@ const rpcRouter = {
   'page.addInitScript': (params) => pageHandlers.pageAddInitScript(params),
   'page.removeInitScript': (params) => pageHandlers.pageRemoveInitScript(params),
   'page.readText': (params) => pageHandlers.pageReadText(params),
-  'page.accessibilityTree': (params) => pageHandlers.pageAccessibilityTree(params),
+  'page.accessibilityTree': (params) => params.locator ? locatorHandlers.locatorSnapshot(params) : pageHandlers.pageAccessibilityTree(params),
   'page.ariaSnapshot': (params) => pageHandlers.pageAriaSnapshot(params),
   'expect.page.toMatchAriaSnapshot': (params) => pageHandlers.pageExpectAriaSnapshot(params),
   'page.screenshot': (params) => pageHandlers.pageScreenshot(params),

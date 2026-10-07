@@ -995,6 +995,7 @@ class BrowserRuntime:
         tab: str,
         mode: Literal["compact", "aria", "text"] = "compact",
         max_nodes: int = 1_000,
+        locator: Locator | None = None,
     ) -> dict[str, Any]:
         """The single observation implementation.
 
@@ -1009,9 +1010,12 @@ class BrowserRuntime:
         params: dict[str, Any] = {"tabId": state.raw_id}
         if mode == "compact":
             params.update(format="compact", maxNodes=max_nodes, maxChars=SNAPSHOT_MAX_CHARS)
-        result = self._rpc(methods[mode], params, tab=tab) or {}
-        self.observations.pop(tab, None)
-        if mode == "compact":
+        method = methods[mode]
+        if locator is not None:
+            method = 'page.accessibilityTree'
+            params.update(**_locator_params(locator), format=mode, maxNodes=max_nodes, maxChars=SNAPSHOT_MAX_CHARS)
+        result = self._rpc(method, params, tab=tab) or {}
+        if mode == "compact" or locator is not None:
             snapshot, truncated = self.observe_refs(tab, result.get("snapshot", ""), result.get("snapshotId"))
         else:
             raw = result.get("snapshot", "") if mode == "aria" else result.get("text", "")
@@ -1328,10 +1332,9 @@ def browser_observe(
                 raise ToolFault("INVALID_ARGUMENT", "A locator extraction requires locator.")
             return _ok(tab, rt.observe(tab, mode, max_nodes))
         if extract is None:
-            # A locator with no requested scalar naturally means "read this
-            # element".  Defaulting avoids an otherwise Pydantic-valid but
-            # semantically incomplete call and matches the common agent intent.
-            extract = "all_inner_text"
+            if mode in {'compact', 'aria'}:
+                return _ok(tab, rt.observe(tab, mode, max_nodes, locator))
+            extract = 'all_inner_text'
         methods = {
             "count": "locator.count", "text": "locator.textContent",
             "all_text": "locator.allTextContents", "all_inner_text": "locator.allInnerTexts",

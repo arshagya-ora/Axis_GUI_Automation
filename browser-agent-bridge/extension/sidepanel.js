@@ -584,7 +584,7 @@ $("#composer").addEventListener("submit", async (event) => {
   };
   if (!body.context_task_id && state.mode === "new_task") {
     const previous = continuationContext(state, text);
-    if (previous) body.context_task_id = previous;
+    if (previous) body.conversation_task_id = previous;
   }
   if (state.pending) {
     const previous = state.pending;
@@ -602,6 +602,7 @@ $("#composer").addEventListener("submit", async (event) => {
     body.client_request_id = previous.body.client_request_id;
     body.task_id = previous.body.task_id;
     body.context_task_id = previous.body.context_task_id;
+    body.conversation_task_id = previous.body.conversation_task_id;
   }
   await sendInstruction({ conversationId, body });
 });

@@ -25,11 +25,11 @@ export function ownsRuntime(task) {
   );
 }
 export function continuationContext(state, text) {
-  if (!/^(?:please\s+)?(?:continue|resume|restart|retry)\b/i.test(text.trim())) return null;
+  // Conversation context is relevant regardless of how a follow-up is phrased.
   const latest = Object.values(state.tasks)
     .filter(task => task.conversation_id === state.selected)
     .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))[0];
-  return latest && ["failed", "cancelled", "interrupted"].includes(latest.status) ? latest.id : null;
+  return latest && TERMINAL.has(latest.status) ? latest.id : null;
 }
 export function mergeTask(state, task) {
   state.taskVersions ||= {};

@@ -441,3 +441,40 @@ def test_named_existing_application_tab_authorizes_normal_task_actions():
     assert not automatic_scope(instruction, {**d, 'observed_target': {'href': 'https://other.test/settings'}}, 'click')
     assert not automatic_scope(instruction, {**d, 'target': 'button Delete'}, 'click')
     assert named_gui(instruction) == 'ACME'
+
+
+@pytest.mark.parametrize('followup', [
+    'Try to perform the service operations step again from scratch',
+    'Open a different website instead',
+])
+def test_conversation_context_preserves_goal_without_restoring_old_execution(service, followup):
+    client, runner, store = service
+    cid = conversation(client)
+    original = 'Open Settings, select the seventeenth operation, save only if the rule is Server.'
+    task = submit(client, cid, text=original).json()['task']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
+    client.post(f'/api/tasks/{task["id"]}/control', json={'action': 'stop'})
+    wait_for(lambda: runner.active() is None)
+    source = store.task(task['id'])
+    source['browser_checkpoint'] = {'browser_steps': [{'instruction': 'Open Settings', 'result': 'Opened'}]}
+    store.save_task(source)
+    response = submit(client, cid, text=followup, conversation_task_id=task['id'])
+    assert response.status_code == 202
+    restarted = response.json()['task']
+    assert restarted['instruction'].startswith(followup)
+    assert original in restarted['instruction']
+    assert 'Open Settings' in restarted['instruction']
+    assert 'reference only' in restarted['instruction']
+    assert not restarted.get('browser_checkpoint')
+    assert 'pending_approval' not in restarted
+
+
+def test_conversation_context_cannot_cross_conversations(service):
+    client, runner, store = service
+    cid = conversation(client)
+    task = submit(client, cid, text='Inspect Settings').json()['task']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
+    client.post(f'/api/tasks/{task["id"]}/control', json={'action': 'stop'})
+    wait_for(lambda: runner.active() is None)
+    response = submit(client, conversation(client), text='Try again', conversation_task_id=task['id'])
+    assert response.status_code == 422
