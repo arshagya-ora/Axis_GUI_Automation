@@ -9,6 +9,7 @@ import {
   rememberView,
   ownsRuntime,
   mergeTask,
+  continuationContext,
 } from "./ui/state.js";
 import { el, icon, button, decorate, feedback } from "./ui/dom.js";
 import { renderChat, duration } from "./ui/chat.js";
@@ -581,9 +582,9 @@ $("#composer").addEventListener("submit", async (event) => {
     ...(state.mode === "follow_up" ? { task_id: state.target } : {}),
     ...(state.context ? { context_task_id: state.context } : {}),
   };
-  if (!body.context_task_id && state.mode === "new_task" && /^(continue|resume|restart)(\s+(the\s+)?same(\s+(thing|task|work))?)?[.!]?$/i.test(text)) {
-    const previous = Object.values(state.tasks).filter(task => ["cancelled", "interrupted"].includes(task.status)).at(-1);
-    if (previous) body.context_task_id = previous.id;
+  if (!body.context_task_id && state.mode === "new_task") {
+    const previous = continuationContext(state, text);
+    if (previous) body.context_task_id = previous;
   }
   if (state.pending) {
     const previous = state.pending;

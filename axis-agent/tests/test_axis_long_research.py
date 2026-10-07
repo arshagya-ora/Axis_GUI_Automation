@@ -205,6 +205,8 @@ async def test_long_research_with_39_existing_tabs_reviews_18_sources_using_six_
             if method == "page.navigate":
                 self.pages[params["tabId"]]["url"] = params["url"]
                 return {"tab": self.pages[params["tabId"]]}
+            if method == "locator.count":
+                return {"count": 1, "elements": [{"role": "combobox", "accessibleName": "Search"}]}
             if method == "locator.fill":
                 self.query = params["text"]
                 return {}

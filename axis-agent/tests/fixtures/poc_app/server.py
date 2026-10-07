@@ -720,6 +720,7 @@ class QualityState:
         self.visits: list[str] = []
         self.actions: dict[str, int] = {}
         self.values: dict = {}
+        self.action_order: list[str] = []
 
     def visit(self, path: str) -> None:
         with self.lock:
@@ -729,11 +730,12 @@ class QualityState:
         with self.lock:
             self.actions[name] = self.actions.get(name, 0) + 1
             self.values[name] = value
+            self.action_order.append(name)
 
     def snapshot(self) -> dict:
         with self.lock:
             return copy.deepcopy({"case": self.case_name, "visits": self.visits,
-                                  "actions": self.actions, "values": self.values})
+                                  "actions": self.actions, "values": self.values, "action_order": self.action_order})
 
 
 _QUALITY_SCRIPT = """
@@ -749,6 +751,8 @@ function show(text) { document.getElementById('result').textContent = text; }
 def quality_page(name: str) -> str | None:
     """Small task-specific pages with server-observed, counted interactions."""
     title = "Fixture Home" if name == "planner_decision_quality" else "AXIS quality fixture"
+    if name == "autonomous_enterprise":
+        title = "ACME Console"
     scripts = ""
     bodies = {
         "literal_preservation": '<h1>Report directory</h1><a href="/eval/report?case=Exact-42">Exact report</a>',
@@ -763,6 +767,7 @@ def quality_page(name: str) -> str | None:
         "cross_provider_consistency": '<h1>Account</h1><p>Account status: <span id="status">Active</span></p>',
         "multi_tab_memory": '<h1>Product Alpha</h1><p>Price: $31.50</p><a href="/eval/product-beta">Product Beta</a>',
         "product-beta": '<h1>Product Beta</h1><p>Price: $24.25</p>',
+        "autonomous_enterprise": '<h1>ACME Console</h1><aside id="menu"><button id="services">Services</button></aside><section id="panel"></section>',
         "changing_spa_content": '<h1 id="heading">Step 1</h1><div id="workflow"><button id="advance">Advance</button></div>',
         "download_completion": '<h1>Report export</h1><a href="/eval/axis-eval-report.csv" download>Download report</a>',
         "canvas_interaction": '<h1>Canvas control</h1><p>The blue tile is inside this canvas. Use a screenshot to locate it.</p>'
@@ -813,6 +818,38 @@ document.getElementById('advance').onclick = async () => {
     }; show('Step 2 is ready');
   }, 450);
 };"""
+    elif name == "autonomous_enterprise":
+        scripts = """
+const menu = document.getElementById('menu'), panel = document.getElementById('panel');
+function servicesMenu() {
+  menu.innerHTML = '<button id="replication">Replication</button><button id="configurations">Configurations</button>';
+  document.getElementById('replication').onclick = async () => {
+    await record('replication', true); document.title = 'Replication status';
+    panel.innerHTML = '<p role="alert">Replication unavailable: upstream returned 503.</p><button id="back">Back to Services</button>';
+    document.getElementById('back').onclick = async () => { await record('back', true); panel.innerHTML = ''; servicesMenu(); };
+  };
+  document.getElementById('configurations').onclick = async () => {
+    await record('configurations', true); document.title = 'Configuration';
+    panel.innerHTML = '<button id="operations">Service Operations</button>';
+    document.getElementById('operations').onclick = async () => {
+      await record('operations', true); panel.innerHTML = '<p>Loading operations</p>';
+      setTimeout(() => {
+        panel.innerHTML = '<div style="height:320px;overflow:auto"><table aria-label="Service operations"><thead><tr><th>Name</th><th>Rule</th><th>Actions</th></tr></thead><tbody>' +
+          Array.from({length:24}, (_,i) => '<tr style="height:60px"><th scope="row">Operation ' + (i+1) + '</th><td>Server rule</td><td><button data-row="' + (i+1) + '">Edit</button></td></tr>').join('') + '</tbody></table></div>';
+        panel.querySelectorAll('[data-row]').forEach(button => button.onclick = async () => {
+          const row = Number(button.dataset.row); await record('edit_operation', row);
+          panel.innerHTML = '<section role="dialog" aria-label="Operation ' + row + '"><h2>Operation ' + row + '</h2><label>Response Priority Rule<input id="rule" value="Server rule" readonly></label><button id="save">Save</button></section>';
+          document.getElementById('save').onclick = async () => {
+            await record('save_operation', {row, rule:document.getElementById('rule').value});
+            show('Operation ' + row + ' saved successfully.');
+          };
+        });
+      }, 400);
+    };
+  };
+}
+document.getElementById('services').onclick = async () => { await record('services', true); servicesMenu(); };
+"""
     elif name == "canvas_interaction":
         scripts = """
 const surface = document.getElementById('surface'), context = surface.getContext('2d');
@@ -914,7 +951,8 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 action = data["action"]
                 if state is None or action not in {"country", "continue", "diagnostics", "settings", "compact",
-                                                   "advance", "finish", "canvas_confirm"}:
+                                                   "advance", "finish", "canvas_confirm", "services", "replication", "back",
+                                                    "configurations", "operations", "edit_operation", "save_operation"}:
                     raise ValueError("unknown action")
                 state.action(action, data.get("value"))
             except (ValueError, KeyError, TypeError):

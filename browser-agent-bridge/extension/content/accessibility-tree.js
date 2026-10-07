@@ -63,210 +63,107 @@
   });
 
   function buildTree(maxNodes, initialOffsetX = 0, initialOffsetY = 0, snapshotId = '', frameId = 0) {
-    const nodes = [];
-    const iframes = [];
-    const docView = window;
-    let currentIndex = 1;
+    const controls = [], prose = [], iframes = [];
+    const visited = new WeakSet();
+    const rowCounters = new WeakMap(), rowMetadata = new WeakMap();
+    const a11y = globalThis.__browserAgentBridgeDomA11y;
+    const containers = new Set(['document', 'article', 'complementary', 'main', 'navigation', 'region', 'form', 'list', 'listitem', 'table', 'row', 'cell', 'columnheader', 'rowheader', 'group', 'dialog', 'tablist', 'menu', 'menubar', 'tree', 'treeitem', 'grid', 'radiogroup', 'toolbar']);
+    const contextRoles = new Set(['dialog', 'form', 'row', 'main', 'navigation', 'region', 'complementary', 'tablist']);
+    const leaves = new Set(['button', 'input', 'textarea', 'select', 'option', 'img']);
+    let index = 1, scanned = 0;
     refState.snapshotId = snapshotId || `snapshot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     refState.frameId = frameId;
     refState.refs = new Map();
 
-    const TEXT_BLOCK_TAGS = new Set([
-      'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'td', 'th', 'dt', 'dd', 'span', 'strong', 'em', 'b', 'i', 'code', 'pre', 'mark'
-    ]);
-
-    const CONTAINER_ROLES = new Set([
-      'document', 'article', 'aside', 'main', 'navigation', 'region', 'form',
-      'list', 'listitem', 'table', 'row', 'cell', 'columnheader', 'group', 'dialog'
-    ]);
-
-    function isElementVisible(el, rect, style) {
-      if (rect.width <= 0 || rect.height <= 0) return false;
-      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-      return true;
-    }
-
-    function hasInteractiveDescendants(el) {
-      return el.querySelector('a[href],button,input,textarea,select,[tabindex],[contenteditable="true"],[role],h1,h2,h3,h4,h5,h6,img,option') !== null;
-    }
-
-    function traverse(node, offsetX = 0, offsetY = 0) {
-      if (nodes.length >= maxNodes) return;
-
-      // Handle Text Nodes
-      if (node.nodeType === Node.TEXT_NODE) {
-        const txt = node.textContent.replace(/\s+/g, ' ').trim();
-        if (txt) {
-          const parentEl = node.parentElement;
-          if (parentEl) {
-            const rect = parentEl.getBoundingClientRect();
-            const ref = `ref_${currentIndex++}`;
-            rememberRef(ref, parentEl, frameId === 0 ? offsetX : 0, frameId === 0 ? offsetY : 0);
-            nodes.push({
-              ref,
-              snapshotId: refState.snapshotId,
-              frameId,
-              tag: 'text',
-              text: txt,
-              bounds: {
-                x: Math.round(rect.x + offsetX),
-                y: Math.round(rect.y + offsetY),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height)
-              }
-            });
-          }
-        }
-        return;
+    function children(node) {
+      if (node.tagName?.toLowerCase() === 'slot' && node.assignedNodes) {
+        const assigned = node.assignedNodes({ flatten: true });
+        if (assigned.length) return assigned;
       }
-
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      const el = node;
-
-      // Handle iframe traversal
-      if (el.tagName.toLowerCase() === 'iframe') {
-        const rect = el.getBoundingClientRect();
-        const style = docView.getComputedStyle(el);
-        if (!isElementVisible(el, rect, style)) return;
-
-        const absoluteX = Math.round(rect.left + offsetX);
-        const absoluteY = Math.round(rect.top + offsetY);
-
-        iframes.push({
-          src: el.src || '',
-          id: el.id || '',
-          name: el.name || '',
-          x: absoluteX,
-          y: absoluteY,
-          width: Math.round(rect.width),
-          height: Math.round(rect.height)
-        });
-
-        try {
-          const iframeDoc = el.contentDocument || el.contentWindow?.document;
-          if (iframeDoc) {
-            let child = iframeDoc.body?.firstChild || iframeDoc.documentElement?.firstChild;
-            while (child) {
-              traverse(child, absoluteX, absoluteY);
-              child = child.nextSibling;
-            }
-            return;
-          }
-        } catch (e) {
-          // Cross-origin iframe
-        }
-        return;
-      }
-
+      const parent = node.shadowRoot || node;
+      const result = [];
+      for (let child = parent.firstChild; child; child = child.nextSibling) result.push(child);
+      return result;
+    }
+    function emit(el, data, context, actionable) {
       const rect = el.getBoundingClientRect();
-      const style = docView.getComputedStyle(el);
-      if (!isElementVisible(el, rect, style)) {
-        if (style.display === 'none') return;
-      }
-
-      const role = globalThis.__browserAgentBridgeDomA11y.implicitRole(el);
-      const isInteractive = Boolean(
-        (role && !CONTAINER_ROLES.has(role)) ||
-        el.matches('a[href],button,input,textarea,select,[tabindex],[contenteditable="true"]')
-      );
-
-      if (isInteractive) {
-        const name = globalThis.__browserAgentBridgeDomA11y.accessibleName(el);
-        const ref = `ref_${currentIndex++}`;
-        rememberRef(ref, el, frameId === 0 ? offsetX : 0, frameId === 0 ? offsetY : 0);
-        nodes.push({
-          ref,
-          snapshotId: refState.snapshotId,
-          frameId,
-          tag: el.tagName.toLowerCase(),
-          role: role || undefined,
-          name,
-          focused: getActiveElementDeep() === el || undefined,
-          type: el.getAttribute('type') || undefined,
-          value: valueOf(el),
-          href: el instanceof HTMLAnchorElement ? el.href : undefined,
-          bounds: {
-            x: Math.round(rect.x + offsetX),
-            y: Math.round(rect.y + offsetY),
-            width: Math.round(rect.width),
-            height: Math.round(rect.height)
-          }
-        });
-        // Stop traversing children of interactive elements to prevent redundancy
+      const ref = `ref_${index++}`;
+      rememberRef(ref, el, frameId === 0 ? initialOffsetX : 0, frameId === 0 ? initialOffsetY : 0);
+      const node = { ref, snapshotId: refState.snapshotId, frameId, tag: el.tagName.toLowerCase(), ...data,
+        context: context.slice(-2).join(' > ') || undefined,
+        ...rowMetadata.get(el.closest?.('tr,[role="row"]')),
+        focused: getActiveElementDeep() === el || undefined,
+        bounds: { x: Math.round(rect.x + initialOffsetX), y: Math.round(rect.y + initialOffsetY), width: Math.round(rect.width), height: Math.round(rect.height) } };
+      (actionable ? controls : prose).push(node);
+    }
+    function traverse(node, context = []) {
+      if (!node || visited.has(node) || scanned >= 50000) return;
+      visited.add(node); scanned++;
+      if (node.nodeType === Node.TEXT_NODE) {
+        const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && node.parentElement && a11y.isVisible(node.parentElement)) emit(node.parentElement, { text: text.slice(0, 500), textTruncated: text.length > 500 }, context, false);
         return;
       }
-
-      // Non-interactive node handling
-      const hasInteractive = hasInteractiveDescendants(el);
-
-      if (hasInteractive) {
-        // Traverse all child nodes (both Element and Text nodes)
-        let child = el.firstChild;
-        while (child) {
-          traverse(child, offsetX, offsetY);
-          child = child.nextSibling;
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const el = node, tag = el.tagName.toLowerCase();
+      const style = (el.ownerDocument?.defaultView || window).getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || el.hidden || a11y.isAriaHidden(el)) return;
+      if (tag === 'iframe' || tag === 'frame') {
+        if (a11y.isVisible(el)) {
+          const rect = el.getBoundingClientRect();
+          iframes.push({ src: el.src || '', id: el.id || '', name: el.name || '', x: rect.x, y: rect.y, width: rect.width, height: rect.height });
         }
-      } else {
-        const isTextTag = TEXT_BLOCK_TAGS.has(el.tagName.toLowerCase());
-        const hasElementChildren = el.children.length > 0;
-        
-        if (isTextTag || !hasElementChildren) {
-          const txt = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
-          if (txt) {
-            const ref = `ref_${currentIndex++}`;
-            rememberRef(ref, el, frameId === 0 ? offsetX : 0, frameId === 0 ? offsetY : 0);
-            nodes.push({
-              ref,
-              snapshotId: refState.snapshotId,
-              frameId,
-              tag: el.tagName.toLowerCase(),
-              text: txt.slice(0, 500),
-              focused: getActiveElementDeep() === el || undefined,
-              bounds: {
-                x: Math.round(rect.x + offsetX),
-                y: Math.round(rect.y + offsetY),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height)
-              }
-            });
-          }
-          // Do not traverse children of consolidated text blocks
-          return;
-        }
-
-        // Traverse only element children for structural non-text-block nodes
-        let child = el.firstElementChild;
-        while (child) {
-          traverse(child, offsetX, offsetY);
-          child = child.nextElementSibling;
-        }
+        return; // Frame documents are collected once under their actual frame ID.
       }
-
-      // Handle shadow root if present
-      if (el.shadowRoot) {
-        let child = el.shadowRoot.firstChild;
-        while (child) {
-          traverse(child, offsetX, offsetY);
-          child = child.nextSibling;
-        }
+      const role = a11y.implicitRole(el);
+      if (role === 'row') {
+        const table = el.closest?.('table,[role="table"],[role="grid"]') || document.body;
+        const cells = Array.from(el.children || []).filter(cell => ['th', 'td'].includes(cell.tagName?.toLowerCase()) || ['cell', 'gridcell', 'columnheader', 'rowheader'].includes(cell.getAttribute('role')));
+        const header = cells.length > 0 && cells.every(cell => cell.getAttribute('role') === 'columnheader' ||
+          (cell.tagName?.toLowerCase() === 'th' && cell.getAttribute('scope') !== 'row' && cell.getAttribute('role') !== 'rowheader'));
+        const rowIndex = header ? undefined : (rowCounters.get(table) || 0) + 1;
+        if (!header) rowCounters.set(table, rowIndex);
+        rowMetadata.set(el, { rowIndex, rowHeader: header, rowOrder: 'rendered',
+          ariaRowIndex: Number(el.getAttribute('aria-rowindex')) || undefined });
       }
+      const interactive = Boolean((role && !containers.has(role)) || el.matches('a[href],button,input,textarea,select,[tabindex],[contenteditable="true"]'));
+      const name = (interactive || contextRoles.has(role)) ? a11y.accessibleName(el, el.getRootNode?.() || el.ownerDocument || document) : '';
+      if (interactive && a11y.isVisible(el)) {
+        const states = { disabled: !a11y.isEnabled(el), readonly: el.readOnly === true || el.getAttribute('aria-readonly') === 'true' };
+        for (const state of ['checked', 'selected', 'expanded']) {
+          const value = a11y.ariaBooleanState(el, state);
+          if (value !== null && value !== undefined) states[state] = value;
+        }
+        emit(el, { role: role || undefined, name, type: el.getAttribute('type') || undefined, value: valueOf(el), href: el instanceof HTMLAnchorElement ? el.href : undefined, ...states }, context, true);
+      }
+      if (role === 'row' && !interactive && a11y.isVisible(el)) emit(el, { role, name }, context, false);
+      const row = rowMetadata.get(el);
+      const nextContext = contextRoles.has(role) ? [...context, `${role}${row?.rowIndex ? ' ' + row.rowIndex : ''}${name ? ' ' + name.slice(0, 120) : ''}`] : context;
+      if (leaves.has(tag) || (tag === 'a' && interactive)) return;
+      const composed = children(el);
+      if (!composed.length && !interactive && a11y.isVisible(el)) {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text) emit(el, { text: text.slice(0, 500) }, nextContext, false);
+      } else for (const child of composed) traverse(child, nextContext);
     }
+    traverse(document.body || document.documentElement);
+    controls.sort((a, b) => Number(Boolean(b.focused)) - Number(Boolean(a.focused)) || Number(Boolean(b.context?.includes('dialog'))) - Number(Boolean(a.context?.includes('dialog'))));
+    const all = [...controls, ...prose], nodes = all.slice(0, maxNodes);
+    const retained = new Set(nodes.map(node => node.ref));
+    for (const ref of refState.refs.keys()) if (!retained.has(ref)) refState.refs.delete(ref);
+    return { url: location.href, title: document.title, snapshotId: refState.snapshotId, frameId, nodes, iframes, truncated: all.length > maxNodes || scanned >= 50000 || nodes.some(node => node.textTruncated || (typeof node.value === 'string' && node.value.length > 500)) };
+  }
 
-    traverse(document.body || document.documentElement, initialOffsetX, initialOffsetY);
-
-    return {
-      url: location.href,
-      title: document.title,
-      snapshotId: refState.snapshotId,
-      frameId,
-      nodes,
-      iframes,
-      truncated: nodes.length >= maxNodes
-    };
+  function targetIdentity(element) {
+    const a11y = globalThis.__browserAgentBridgeDomA11y;
+    const container = element.closest?.('tr,[role="row"],dialog,[role="dialog"],form');
+    return JSON.stringify([a11y.implicitRole(element), a11y.accessibleName(element),
+      element.getAttribute('type'), element.getAttribute('href'),
+      container ? a11y.accessibleName(container) : null]);
   }
 
   function rememberRef(ref, element, offsetX = 0, offsetY = 0) {
-    refState.refs.set(ref, { element, offsetX, offsetY });
+    refState.refs.set(ref, { element, offsetX, offsetY, identity: targetIdentity(element) });
   }
 
   function lookupRefEntry(message) {
@@ -277,11 +174,13 @@
     }
     const entry = refState.refs.get(ref);
     if (!entry?.element || entry.element.isConnected === false) throw new Error(`Accessibility ref not found or stale: ${ref}`);
+    if (entry.identity !== targetIdentity(entry.element)) throw new Error(`Stale accessibility ref identity: ${ref}; observe the changed page`);
     return { ref, entry };
   }
 
   function resolveRefTarget(message) {
     const { ref, entry } = lookupRefEntry(message);
+    if (message.scrollIntoView && typeof entry.element.scrollIntoView === 'function') entry.element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
     return summarizeRefTarget(ref, entry);
   }
 
@@ -369,18 +268,28 @@
   function summarizeRefTarget(ref, entry) {
     const { element, offsetX = 0, offsetY = 0 } = entry;
     const rect = element.getBoundingClientRect();
-    const localClickPoint = clickablePoint(element, rect);
+    const localClickPoint = globalThis.__browserAgentBridgeDomA11y.clickablePoint(element);
     const clickPoint = localClickPoint ? { x: localClickPoint.x + offsetX, y: localClickPoint.y + offsetY } : null;
     // Reuse the shared dom-a11y atom so ref actionability matches locator.click
     // (covers element.hidden / [hidden] ancestor / aria-hidden / fieldset[disabled]).
     const visible = globalThis.__browserAgentBridgeDomA11y.isVisible(element);
     const enabled = globalThis.__browserAgentBridgeDomA11y.isEnabled(element);
     const hitDocument = element.ownerDocument || document;
-    const hit = localClickPoint && typeof hitDocument.elementFromPoint === 'function' ? hitDocument.elementFromPoint(localClickPoint.x, localClickPoint.y) : null;
-    const receivesEvents = !clickPoint || !hit || element === hit || element.contains(hit);
+    const canHitTest = localClickPoint && typeof hitDocument.elementFromPoint === 'function';
+    let hit = canHitTest ? hitDocument.elementFromPoint(localClickPoint.x, localClickPoint.y) : null;
+    const visitedHits = new Set();
+    while (hit?.shadowRoot?.elementFromPoint && !visitedHits.has(hit)) {
+      visitedHits.add(hit);
+      const inner = hit.shadowRoot.elementFromPoint(localClickPoint.x, localClickPoint.y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    const receivesEvents = !canHitTest || Boolean(hit && (element === hit || element.contains(hit)));
     const reasons = [];
     if (!visible) reasons.push('not visible');
     if (!enabled) reasons.push('disabled');
+    const pointerEvents = getComputedStyle(element).pointerEvents !== 'none';
+    if (!pointerEvents) reasons.push('pointer-events none');
     if (!clickPoint) reasons.push('no clickable point');
     if (!receivesEvents) reasons.push('covered by another element');
     return {
@@ -402,7 +311,7 @@
         clickPoint
       },
       actionability: {
-        actionable: visible && enabled && Boolean(clickPoint) && receivesEvents,
+        actionable: visible && enabled && pointerEvents && Boolean(clickPoint) && receivesEvents,
         visible,
         enabled,
         receivesEvents,
@@ -411,15 +320,9 @@
     };
   }
 
-  function clickablePoint(element, rect = element.getBoundingClientRect()) {
-    const width = Math.max(0, rect.width);
-    const height = Math.max(0, rect.height);
-    if (width <= 0 || height <= 0) return null;
-    return { x: rect.x + width / 2, y: rect.y + height / 2 };
-  }
-
   function valueOf(el) {
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+      if (el instanceof HTMLInputElement && (el.getAttribute('type') || '').toLowerCase() === 'password') return undefined;
       return el.value;
     }
     return undefined;

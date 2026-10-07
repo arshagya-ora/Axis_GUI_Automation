@@ -149,6 +149,18 @@ AXIS_QUALITY_DATASET = Dataset(
             dimension="download completion",
         ),
         _case(
+            "autonomous_enterprise",
+            "In the ACME Console tab, execute these steps in order:\n"
+            "1. Click Services, then Replication. Record the exact error shown.\n"
+            "2. Click Back to Services, then Configurations, then Service Operations. Wait for the list.\n"
+            "3. Edit the 17th data row in displayed order and record its name.\n"
+            "4. Verify Response Priority Rule is Server rule. If it matches, click Save and verify confirmation; otherwise stop.\n"
+            "5. Report the error, selected operation, rule and save result. Do not claim completion if any step failed.",
+            "A changing-title console with a delayed scrollable table, row headers and repeated Edit labels.",
+            "Visit the error first, edit Operation 17, verify Server rule and save exactly once, without unnecessary approval.",
+            dimension="autonomous ordered enterprise workflow",
+        ),
+        _case(
             "canvas_interaction",
             "Use the visual canvas to click the blue Confirm tile and verify 'Canvas confirmed'.",
             "The only Confirm tile is drawn in a canvas and has no DOM control or accessible label.",

@@ -63,6 +63,8 @@ provider:
   settings: {}
 
 run:
+  # Start browser work directly; the browser agent can request planner help.
+  direct_browser_execution: true
   # Planner cadence: one planner pass every N navigator steps, plus every
   # event listed in the orchestrator (goal reached, blocked, follow-up, ...).
   planner_interval_steps: 3
@@ -70,7 +72,7 @@ run:
   # interval above for fixed planner cadence.
   planner_max_interval_steps: 6
   # Browser tool calls the navigator may make inside one navigator step.
-  max_actions_per_step: 3
+  max_actions_per_step: 12
   max_total_steps: 30
   # Progress-gated document extensions; browser actions retain their own limits.
   document_extra_steps: 30

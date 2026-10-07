@@ -1,5 +1,6 @@
 """Durable, task-scoped authorization before browser effects (never replay RPCs)."""
 import hashlib
+from dataclasses import replace
 import json
 import re
 import time
@@ -7,18 +8,48 @@ from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 from axis.ui_store import ServiceError
+from axis.login import authorized_login_action, parse_login_intent
 
 
 def external_effect(tool, operation):
     return (tool in {'browser_act', 'browser_visual'} and operation not in {'capture', 'scroll', 'hover'}) or (tool == 'browser_tabs' and operation == 'close')
 
 
+def read_only_navigation(detail, operation):
+    observed = detail.get('observed_target') or {}
+    target = str(detail.get('target') or '').lower()
+    href = observed.get('href') or ''
+    link = observed.get('role') == 'link' or bool(href) or target.startswith('link ')
+    return (operation == 'click' and link
+            and not re.search(r'javascript:|data:|logout|log.out|signout|delete|remove|purchase|checkout|submit|download|/send|[?&](?:action|do)=', target + ' ' + href))
+
+
+def origin(url):
+    """Canonical HTTP origin; permission never depends on a mutable page title."""
+    parts = urlsplit(url or '')
+    if parts.scheme not in {'http', 'https'} or not parts.hostname:
+        return None
+    try:
+        port = parts.port or (443 if parts.scheme == 'https' else 80)
+    except ValueError:
+        return None
+    return f'{parts.scheme}://{parts.hostname}:{port}'
+
+
 def automatic_scope(instruction, detail, operation):
     """Conservative scope filter; ambiguous effects still require approval."""
     request = instruction.lower()
+    read_only = detail.get("read_only") or re.match(r"\s*(what|why|how|summari[sz]e|explain|describe|review|analy[sz]e|read)\b", request) or re.search(r"\bread.only\b|\bdo not (?:change|modify)\b", request)
+    if read_only and read_only_navigation(detail, operation):
+        return True
     if re.match(r'\s*(what|why|how|summari[sz]e|explain|describe|review|analy[sz]e|read)\b', request) and not re.search(r'\b(?:and|then)\s+(?:please\s+)?(?:upload|attach|send|configure|apply|fill|create|update)\b', request):
         return False
     target = str(detail.get('target') or '').lower()
+    if operation == 'close':
+        return bool(re.search(r'\bclose\b', request) and origin(detail.get('current_url')) in detail.get('authorized_origins', []))
+    if detail.get('target_type') == 'visual':
+        return bool(not read_only and origin(detail.get('current_url')) in detail.get('authorized_origins', [])
+                    and operation in {'click', 'dblclick'})
     if not target or detail.get('target_type') not in {'ref', 'locator'}:
         return False
     if re.search(r"\b(?:do not|don't|never)\s+(?:change|modify)\b|\bread.only\b", request):
@@ -30,12 +61,26 @@ def automatic_scope(instruction, detail, operation):
     for name, domain in [('gmail', 'mail.google.com'), ('outlook', 'outlook.live.com')]:
         if name in request:
             named_hosts.add(domain)
-    application = re.search(r'\b([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,4})\s+GUI\b', instruction)
+    application = re.search(r'\b([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,4})\s+(?:GUI|tab)\b', instruction)
     identity = (str(detail.get('application_title') or '') + ' ' + str(detail.get('current_url') or '')).casefold()
     app_words = application.group(1).split() if application else []
     while app_words and app_words[0].casefold() in {'from', 'in', 'inside', 'on', 'using', 'the', 'within'}:
         app_words.pop(0)
     app_matched = bool(app_words and host and all(word.casefold() in identity for word in app_words))
+    # Runtime callers supply task-bound origins. Legacy callers without task
+    # context can still resolve their initial explicit destination.
+    scoped_origins = detail.get('authorized_origins')
+    if scoped_origins is not None:
+        named_origins = {origin(url.rstrip('.,)')) for url in re.findall(r'https?://[^\s]+', instruction)}
+        allowed_origins = set(scoped_origins) | (named_origins - {None})
+        if origin(detail.get('current_url')) not in allowed_origins:
+            return False
+        observed = detail.get('observed_target') or {}
+        for destination in (observed.get('href'), observed.get('formAction')):
+            if destination and origin(urljoin(detail.get('current_url') or '', destination)) not in allowed_origins:
+                return False
+        app_matched = True
+        named_hosts.add(host)
     if not host or (host not in named_hosts and not app_matched):
         return False
     observed = detail.get('observed_target') or {}
@@ -48,7 +93,7 @@ def automatic_scope(instruction, detail, operation):
                             ('purchase', r'\bbuy\b|\bpurchase\b|\bcheckout\b')]:
         if re.search(pattern, target):
             return False
-    if operation in {'press', 'drag', 'type'}:
+    if operation in {'drag', 'type'} or (operation == 'press' and scoped_origins is None):
         return False  # keyboard/coordinate submission needs an explicit review
     if re.search(r'\b(to|cc|bcc|recipient)\b', target):
         value = str((detail.get('arguments') or {}).get('command', {}).get('value', ''))
@@ -58,6 +103,8 @@ def automatic_scope(instruction, detail, operation):
     if operation == 'upload':
         return bool(re.search(r'\b(upload|attach)\b', request))
     if app_matched:
+        if scoped_origins is not None:
+            return operation in {'click', 'dblclick', 'fill', 'check', 'uncheck', 'select', 'press'}
         return operation in {'click', 'dblclick', 'fill', 'check', 'uncheck', 'select'} and bool(
             re.search(r'\b(open|click|fill|enter|configure|apply|update|create|change|set|select|submit|perform)\b', request))
     if re.search(r'\b(draft|compose|gmail|outlook)\b', request):
@@ -152,12 +199,22 @@ class ExecutionApprovals:
             tab = getattr(getattr(runner.orchestrator, 'browser', None), 'tabs', {}).get(detail.get('tab'))
             if tab is not None:
                 detail = {**detail, 'application_title': getattr(tab, 'title', '')}
+            login = parse_login_intent(instruction)
+            login_state = getattr(runner.orchestrator, 'state', None)
+            if (login and login_state and login_state.login_auth_tab == detail.get('tab')
+                    and login_state.login_auth_url):
+                login = replace(login, auth_url=login_state.login_auth_url)
+            if (not mandatory and task.get('execution_mode', 'automatic') == 'automatic'
+                    and login and login_state
+                    and authorized_login_action(login, detail, operation)):
+                return True
             if not mandatory and upload_in_scope and task.get('execution_mode', 'automatic') == 'automatic' and automatic_scope(instruction, detail, operation):
                 return True
             reason = ('Policy requires approval for this action' if mandatory else
                       'Action is outside Automatic scope' if task.get('execution_mode') == 'automatic' else
                       'Task is in Approval mode')
-            data = {'tool': tool, 'operation': operation, **detail, 'plan_revision': revision,
+            safe_detail = detail
+            data = {'tool': tool, 'operation': operation, **safe_detail, 'plan_revision': revision,
                     'approval_reason': reason,
                     'files': files,
                     'task_id': task['id'], 'mode_revision': task.get('mode_revision', 0),
@@ -173,6 +230,7 @@ class ExecutionApprovals:
             task['current_activity'] = f'Approval needed for {operation} on {detail.get("target") or "the website"}'[:200]
             self.store.update_task(task, payload={'text': task['current_activity']})
         # This callback runs in the browser tool worker, not the service/event loop.
+        approval_started = time.perf_counter()
         while True:
             with runner.lock, self.store.transaction():
                 current = self.store.task(task['id'])
@@ -183,6 +241,9 @@ class ExecutionApprovals:
                     return False
                 if status != 'pending':
                     current.pop('pending_approval', None)
+                    timings = current.setdefault('timings', {})
+                    timings['approval_wait_ms'] = timings.get('approval_wait_ms', 0) + int(
+                        (time.perf_counter() - approval_started) * 1000)
                     current['current_activity'] = 'Applying approved action' if status == 'approved' else 'Action not approved; task paused'
                     self.store.update_task(current)
                     if status == 'approved':

@@ -1,5 +1,10 @@
 export function assertTaskTargetAllowed(params, element) {
   const forbidden = params.forbiddenActions || [];
+  if (params.readOnly && (!(element?.role === 'link' || element?.tagName === 'a') || /javascript:|data:|logout|log.out|signout|delete|remove|purchase|checkout|submit|download|\/send|[?&](?:action|do)=/i.test([element?.href, element?.text, element?.accessibleName].join(' ')))) {
+    const error = new Error('Read-only browsing permits ordinary links, not consequential changes.');
+    error.code = 'POLICY_DENIED';
+    throw error;
+  }
   const text = [element?.text, element?.accessibleName, element?.ariaLabel, element?.href].filter(Boolean).join(' ');
   const download = element?.download === true || /\bdownload\b|source code.*(?:zip|tar)|\.(?:zip|tar|gz|exe|msi|csv|xlsx)(?:[?#\s]|$)|\/archive\/refs\//i.test(text);
   const denied = (forbidden.includes('download') && download) ||
@@ -22,7 +27,7 @@ export function createLocatorHandlers({
   resolveFrameTarget,
   ensureContentScripts = async () => {},
   keyboardDispatcher,
-  sleep,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   defaultTimeoutMs,
   chromeApi = chrome,
   domA11ySource = null
@@ -186,22 +191,27 @@ export function createLocatorHandlers({
     const intervalMs = Number.isInteger(params.intervalMs) && params.intervalMs > 0 ? params.intervalMs : 250;
     const state = ['attached', 'visible', 'hidden', 'detached'].includes(params.state) ? params.state : 'visible';
     const started = Date.now();
-    const frameTarget = await resolveFrameTarget(tabId, params);
-
-    const result = await runLocatorScript(tabId, {
-      ...params,
-      wait: { kind: 'locatorState', state, timeoutMs, intervalMs }
-    }, 'query', frameTarget);
-    const visibleCount = result.visibleCount || 0;
-    const found = result.count > 0;
-    if (
-      (state === 'attached' && found) ||
-      (state === 'visible' && visibleCount > 0) ||
-      (state === 'hidden' && (!found || visibleCount === 0)) ||
-      (state === 'detached' && !found)
-    ) {
-      return { ok: true, state, elapsedMs: Date.now() - started, count: result.count, visibleCount: result.visibleCount, elements: result.elements, frame: frameTarget.frame };
-    }
+    let result;
+    do {
+      const frameTarget = await resolveFrameTarget(tabId, params);
+      try {
+        // Poll from the worker: a wait running inside a document dies on navigation.
+        result = await runLocatorScript(tabId, params, 'query', frameTarget);
+        const visibleCount = result.visibleCount || 0;
+        const found = result.count > 0;
+        if ((state === 'attached' && found) || (state === 'visible' && visibleCount > 0) ||
+            (state === 'hidden' && (!found || visibleCount === 0)) || (state === 'detached' && !found)) {
+          return { ok: true, state, elapsedMs: Date.now() - started, count: result.count,
+                   visibleCount: result.visibleCount, elements: result.elements, frame: frameTarget.frame };
+        }
+      } catch (error) {
+        if (!/frame identifier was removed|frame.*(?:removed|not found)|document.*unloaded|execution context.*destroyed/i.test(String(error?.message || error))) throw error;
+        injectedTargets.delete(tabId + ':' + (frameTarget?.frameId || 0));
+      }
+      const remaining = timeoutMs - (Date.now() - started);
+      if (remaining <= 0) break;
+      await sleep(Math.min(intervalMs, remaining));
+    } while (Date.now() - started <= timeoutMs);
 
     throw new Error(`Timed out waiting for locator ${describeLocator(params)} to be ${state}${result ? ` (last count: ${result.count})` : ''}`);
   }
@@ -384,16 +394,26 @@ export function createLocatorHandlers({
     const ref = parsed.ref;
     let frameTarget = await resolveFrameTarget(tabId, { ...params, frameId });
     await ensureContentScripts(tabId, frameId);
-    const response = await chromeApi.tabs.sendMessage(tabId, {
-      type: 'GET_ACCESSIBILITY_REF_TARGET',
-      ref,
-      snapshotId: typeof params.snapshotId === 'string' && params.snapshotId ? params.snapshotId : undefined
-    }, { frameId });
-    if (!response?.ok) throw new Error(response?.error || `Accessibility ref not found: ${ref}`);
-    const target = response.target;
-    if (params.force !== true && target?.actionability?.actionable !== true) {
-      throw createLocatorRefNotActionableError(params, frameTarget, target);
-    }
+    const timeout = params.timeoutMs ?? defaultTimeoutMs ?? 5000;
+    const deadline = Date.now() + timeout;
+    let target, previousRect = null;
+    do {
+      const response = await chromeApi.tabs.sendMessage(tabId, {
+        type: 'GET_ACCESSIBILITY_REF_TARGET', ref,
+        snapshotId: params.snapshotId || undefined, scrollIntoView: previousRect === null
+      }, { frameId });
+      if (!response?.ok) throw new Error(response?.error || `Accessibility ref not found: ${ref}`);
+      target = response.target;
+      assertTaskTargetAllowed(params, target?.element);
+      const rect = target?.element?.rect;
+      const stable = previousRect && rect && ['x', 'y', 'width', 'height'].every(key => Math.abs(rect[key] - previousRect[key]) < 0.5);
+      if (params.force === true || (target?.actionability?.actionable === true && (params.stable === false || stable))) break;
+      if (Date.now() >= deadline) throw createLocatorRefNotActionableError(params, frameTarget, {
+        ...target, actionability: { ...target?.actionability, reasons: [...(target?.actionability?.reasons || []), ...(target?.actionability?.actionable && !stable ? ['not stable'] : [])] }
+      });
+      previousRect = rect;
+      await sleep(50);
+    } while (true);
     if (!target?.element?.clickPoint) throw new Error(`Element has no clickable point for ref ${ref}`);
     assertTaskTargetAllowed(params, target.element);
     if (frameTarget.frameOffset) frameTarget = await resolveFrameTarget(tabId, { ...params, frameId });
@@ -1000,6 +1020,11 @@ export function createLocatorHandlers({
   }
 
   function applyFrameOffset(point, frameTarget) {
+    if ((frameTarget?.frameId || frameTarget?.frame?.frameId) > 0 && !frameTarget.frameOffset) {
+      const error = new Error('Frame owner geometry is unavailable; refusing a coordinate action');
+      error.code = 'FRAME_GEOMETRY_UNAVAILABLE';
+      throw error;
+    }
     if (!frameTarget?.frameOffset) return point;
     return {
       x: point.x + frameTarget.frameOffset.x,
@@ -1377,6 +1402,9 @@ export function createLocatorHandlers({
             return { ...base, value: element.getAttribute(options.attributeName), element: summarizeElement(element, options.index) };
           }
           if (options.action === 'actionability') {
+            if (options.scrollIntoView && (options.wait?.strict !== true || matches.length === 1)) {
+              element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            }
             const actionability = getActionability(element, options.actionKind);
             return {
               ...base,
@@ -1721,6 +1749,7 @@ export function createLocatorHandlers({
           const reasons = [];
           if (!visible) reasons.push('not visible');
           if (!enabled) reasons.push('disabled');
+          if (actionKind === 'click' && !clickPoint) reasons.push('outside viewport; scroll the target into view');
           if (actionKind === 'click' && !pointerEvents) reasons.push('pointer-events none');
           if (actionKind === 'click' && !hitTarget.receivesEvents) reasons.push(`covered by ${hitTarget.description || 'another element'}`);
           if (actionKind === 'fill' && !editable) reasons.push('not editable');
@@ -1753,7 +1782,7 @@ export function createLocatorHandlers({
             role: inferredRole(element),
             type: element.getAttribute('type') || '',
             text: visibleText(element).slice(0, 500),
-            value: 'value' in element ? String(element.value).slice(0, 500) : '',
+            value: (element.getAttribute('type') || '').toLowerCase() === 'password' ? undefined : 'value' in element ? String(element.value).slice(0, 500) : '',
             ariaLabel: element.getAttribute('aria-label') || '',
             placeholder: element.getAttribute('placeholder') || '',
             accessibleName: accessibleName(element, root).slice(0, 500),
@@ -1771,11 +1800,10 @@ export function createLocatorHandlers({
         }
 
         function clickablePoint(element, root) {
-          const rect = viewportRect(element, root);
-          if (rect.width <= 0 || rect.height <= 0) return null;
-          const x = Math.min(Math.max(rect.x + rect.width / 2, 0), window.innerWidth - 1);
-          const y = Math.min(Math.max(rect.y + rect.height / 2, 0), window.innerHeight - 1);
-          return { x, y };
+          const point = domA11y.clickablePoint(element);
+          if (!point) return null;
+          const local = element.getBoundingClientRect(), rect = viewportRect(element, root);
+          return { x: point.x + rect.x - local.x, y: point.y + rect.y - local.y };
         }
 
         function viewportRect(element, root) {

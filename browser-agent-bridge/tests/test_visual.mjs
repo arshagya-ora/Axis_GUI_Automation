@@ -19,13 +19,14 @@ async function setup({ imageWidth = 2400, imageHeight = 1600 } = {}) {
   const { createVisualHandlers } = await importModule('visual');
   let live = state();
   let id = 0;
+  let pixels = "cGl4ZWxz";
   const calls = [];
   const deps = {
     assertTabAllowed: async (tabId, method) => calls.push({ type: 'allowed', tabId, method }),
     attachDebugger: async tabId => calls.push({ type: 'attach', tabId }),
     cdp: async (tabId, method, params) => {
       calls.push({ type: 'cdp', tabId, method, params });
-      return { data: 'cGl4ZWxz' };
+      return { data: pixels };
     },
     chromeApi: { scripting: { executeScript: async ({ target }) => {
       calls.push({ type: 'probe', tabId: target.tabId });
@@ -39,7 +40,7 @@ async function setup({ imageWidth = 2400, imageHeight = 1600 } = {}) {
       convertToBlob: async () => new Blob(['small pixels'])
     })
   };
-  return { h: createVisualHandlers(deps), deps, calls, setState: value => { live = value; } };
+  return { h: createVisualHandlers(deps), deps, calls, setState: value => { live = value; }, setPixels: value => { pixels = value; } };
 }
 
 test('captures exact tab, retains CSS/HiDPI metadata, resizes longest edge to 1600', async () => {
@@ -176,4 +177,13 @@ test('page changes during capture discard the image before issuing a screenshot 
   const h = createVisualHandlers(deps);
   await assert.rejects(() => h.captureVisualScreenshot(7), { code: 'STALE_VISUAL_STATE' });
   await assert.rejects(() => h.validateVisualAction(7, { screenshotId: 'shot-1', expectedVisualState: state() }), { code: 'STALE_VISUAL_STATE' });
+});
+
+test('moving content invalidates pixels even when URL and scroll are unchanged', async () => {
+  const { h, setPixels } = await setup();
+  const capture = await h.captureVisualScreenshot(7);
+  setPixels('bW92ZWQtcGl4ZWxz');
+  await assert.rejects(() => h.validateVisualAction(7, {
+    screenshotId: capture.screenshotId, expectedVisualState: capture
+  }), { code: 'STALE_VISUAL_STATE' });
 });

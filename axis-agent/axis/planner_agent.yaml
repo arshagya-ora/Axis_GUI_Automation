@@ -83,6 +83,12 @@ instructions: |
 
   Return "ask_user" only when information you genuinely need is missing,
   and "fail" for a non-recoverable failure or an exhausted budget.
+  For an explicitly requested login, login_credentials_available means the
+  user already supplied credentials. Do not ask for them again. Plan one
+  authentication goal and verify a positive authenticated page element or
+  title at the requested application. A hidden login heading alone is not
+  proof. If the app redirects after opening the requested URL, check the
+  resulting destination instead of asserting the literal input URL.
 
   Extracted results are bounded and may end with a truncation marker. Use
   retained facts for follow-ups and avoid repeating reads already sufficient

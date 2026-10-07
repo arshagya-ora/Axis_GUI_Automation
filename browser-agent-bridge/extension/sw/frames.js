@@ -4,7 +4,7 @@ export function createFrameTargetResolver({ chromeApi = chrome } = {}) {
       const frames = await chromeApi.webNavigation.getAllFrames({ tabId }).catch(() => []);
       const frame = frames.find(item => item.frameId === params.frameId) || null;
       if (!frame && params.frameId !== 0) throw new Error(`Frame not found: ${params.frameId}`);
-      const frameOffset = params.frameId === 0 ? null : await computeFrameViewportOffset(tabId, frame, frames).catch(() => null);
+      const frameOffset = params.frameId === 0 ? null : await computeFrameViewportOffset(tabId, frame, frames);
       return {
         target: params.frameId === 0 ? { tabId } : { tabId, frameIds: [params.frameId] },
         frameId: params.frameId,
@@ -18,9 +18,11 @@ export function createFrameTargetResolver({ chromeApi = chrome } = {}) {
 
     if (typeof params.frameUrl === 'string' && params.frameUrl) {
       const frames = await chromeApi.webNavigation.getAllFrames({ tabId }).catch(() => []);
-      const frame = frames.find(item => frameUrlMatches(item.url || '', params.frameUrl));
+      const matches = frames.filter(item => frameUrlMatches(item.url || '', params.frameUrl));
+      if (matches.length > 1) throw frameError('FRAME_TARGET_AMBIGUOUS', 'Select a unique frameId');
+      const frame = matches[0];
       if (!frame) throw new Error(`Frame not found for URL: ${params.frameUrl}`);
-      const frameOffset = frame.frameId === 0 ? null : await computeFrameViewportOffset(tabId, frame, frames).catch(() => null);
+      const frameOffset = frame.frameId === 0 ? null : await computeFrameViewportOffset(tabId, frame, frames);
       return {
         target: frame.frameId === 0 ? { tabId } : { tabId, frameIds: [frame.frameId] },
         frameId: frame.frameId,
@@ -79,21 +81,24 @@ export function createFrameTargetResolver({ chromeApi = chrome } = {}) {
               srcdoc: frame.hasAttribute('srcdoc'),
               name: frame.getAttribute('name') || '',
               id: frame.id || '',
-              rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+              unsupportedTransform: Boolean(frame.offsetWidth && (Math.abs(rect.width - frame.offsetWidth) > 1 || Math.abs(rect.height - frame.offsetHeight) > 1)),
+              rect: { x: rect.x + (frame.clientLeft || 0), y: rect.y + (frame.clientTop || 0), width: rect.width, height: rect.height }
             };
           });
-          return candidates.find(item => item.currentUrl === childUrl)
-            || candidates.find(item => item.src === childUrl)
-            || candidates.find(item => item.srcdoc && childUrl === 'about:srcdoc')
-            || candidates.find(item => childName && (item.name === childName || item.id === childName))
-            || candidates.find(item => item.src && (item.src.startsWith(childUrl) || childUrl.startsWith(item.src)))
-            || (candidates.length === 1 ? candidates[0] : null)
-            || null;
+          const exact = candidates.filter(item => item.currentUrl === childUrl || item.src === childUrl || (item.srcdoc && childUrl === 'about:srcdoc'));
+          const named = exact.filter(item => childName && (item.name === childName || item.id === childName));
+          if (named.length === 1) return named[0];
+          if (exact.length === 1) return exact[0];
+          if (exact.length > 1) return { ambiguous: true };
+          const byName = candidates.filter(item => childName && (item.name === childName || item.id === childName));
+          if (byName.length === 1) return byName[0];
+          return candidates.length === 1 ? candidates[0] : null;
         },
         args: [child.url || '', child.name || ''],
         world: 'MAIN'
       });
-      if (!result?.rect) return null;
+      if (result?.ambiguous) throw frameError('FRAME_TARGET_AMBIGUOUS', 'Frame owner geometry is not unique');
+      if (!result?.rect || result.unsupportedTransform) return null;
       offset = { x: offset.x + result.rect.x, y: offset.y + result.rect.y };
     }
     return offset;
@@ -141,4 +146,10 @@ function buildFramePath(targetFrame, frames) {
     current = byId.get(current.parentFrameId) || null;
   }
   return chain;
+}
+
+function frameError(code, message) {
+  const error = new Error(`${code}: ${message}`);
+  error.code = code;
+  return error;
 }

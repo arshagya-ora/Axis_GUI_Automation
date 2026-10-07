@@ -73,12 +73,12 @@ class FakeBridge:
         return {}
 
 
-def test_dataset_has_twelve_concrete_cases_and_judge_is_lazy(monkeypatch):
+def test_dataset_has_thirteen_concrete_cases_and_judge_is_lazy(monkeypatch):
     import pydantic_evals.evaluators
     monkeypatch.setattr(pydantic_evals.evaluators, "LLMJudge",
                         lambda **kw: (_ for _ in ()).throw(AssertionError("judge constructed")))
     dataset = quality_dataset()
-    assert len(dataset.cases) == 12
+    assert len(dataset.cases) == 13
     for case in dataset.cases:
         assert run.fixture.quality_page(case.inputs.case_name) is not None
         assert case.inputs.initial_url.endswith("/eval/" + case.name)
@@ -341,3 +341,16 @@ def test_cli_default_repeat_and_unavailable_exit_are_explicit(monkeypatch, tmp_p
     assert payload["summary"]["measured_runs"] == 0
     with pytest.raises(SystemExit):
         run.main(["--repeat", "0"])
+
+
+def test_enterprise_oracle_rejects_skipped_steps_wrong_rows_and_false_save_claims():
+    expected = ['services', 'replication', 'back', 'configurations', 'operations', 'edit_operation', 'save_operation']
+    result = {'status': 'completed', 'answer': 'Replication unavailable: upstream returned 503. Operation 17; Server rule; saved.'}
+    state = {'action_order': expected, 'actions': dict.fromkeys(expected, 1),
+             'values': {'edit_operation': 17, 'save_operation': {'row': 17, 'rule': 'Server rule'}}}
+    pages = [{'text': 'Operation 17 saved successfully.'}]
+    assert run.check_fixture('autonomous_enterprise', result, state, pages, [])['success']
+    for bad in [{**state, 'action_order': expected[2:]}, {**state, 'values': {'edit_operation': 16}},
+                {**state, 'actions': {**state['actions'], 'save_operation': 2}}]:
+        verdict = run.check_fixture('autonomous_enterprise', result, bad, pages, [])
+        assert not verdict['success'] and verdict['false_completion']

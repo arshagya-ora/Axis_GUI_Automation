@@ -142,17 +142,35 @@ class PlanDecision(BaseModel):
         return clip_all(value)
 
 
+class BrowserStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    instruction: str = Field(max_length=4000)
+    result: str | None = Field(default=None, max_length=2000)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=16)
+
+
+class StepResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    step: int = Field(ge=1)
+    result: str = Field(min_length=1, max_length=2000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=16)
+
+
 class NavigatorOutcome(BaseModel):
-    """The navigator's typed step result. ``goal_reached`` is a claim about the
-    planner's *immediate* goal only, never about the whole task."""
+    """Browser-agent result. Direct task completion is a proposal checked by
+    the runtime; goal_reached applies to a planner-assigned immediate goal."""
 
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["continue", "goal_reached", "blocked", "ask_user", "failed"]
+    status: Literal["continue", "goal_reached", "task_complete", "needs_plan", "blocked", "ask_user", "failed"]
     summary: str = ""
     evidence: list[str] = Field(default_factory=list)
     reason: str = ""
+    final_answer: str | None = Field(default=None, max_length=64_000)
     needs_visual: bool = False
+    steps: list[str] = Field(default_factory=list, max_length=64)
+    completed_steps: list[StepResult] = Field(default_factory=list, max_length=64)
+    blocker: Literal["missing_information", "scope_change", "environment", "targeting"] | None = None
     evidence_ids: list[str] = Field(default_factory=list, max_length=16)
 
     @field_validator("summary", "reason")
@@ -189,6 +207,7 @@ class ActionRecord(BaseModel):
     extracted_data: str | None = None
     refs_invalidated: bool = False
     retain_in_memory: bool = False
+    duration_ms: int = 0
     meaningful_change: bool | None = None
     result_data: dict[str, Any] = Field(default_factory=dict, exclude=True)
     sequence: int = 0
@@ -198,6 +217,8 @@ class ActionRecord(BaseModel):
     evidence_id: str | None = None
     expected_value: Any = None
     key: str | None = None
+    postcondition_locator: dict[str, Any] | None = None
+    postcondition: GoalCheck | None = None
     upload_files: list[str] = Field(default_factory=list)
 
     @computed_field
@@ -248,6 +269,7 @@ class AssertionRecord(BaseModel):
     evidence_id: str | None = None
     match: str | None = None
     superseded_by: str | None = None
+    required: bool = False
 
 
 class Evidence(BaseModel):
@@ -295,6 +317,10 @@ class PendingChange(BaseModel):
     search_host: str | None = None
     search_submitted: bool = False
     verification: GoalCheck | None = None
+    verification_locator: dict[str, Any] | None = None
+    login_stage: Literal["input", "submit"] | None = None
+    navigation: bool = False
+    uncertain: bool = False
 
 
 class TaskRequirements(BaseModel):
@@ -330,6 +356,10 @@ class RunCounters(BaseModel):
     verified_mutation_count: int = 0
     repeated_observations: int = 0
     repeated_actions: int = 0
+    redundant_observations: int = 0
+    redundant_actions: int = 0
+    redundant_assertions: int = 0
+    recovery_actions: int = 0
     no_progress_steps: int = 0
 
 
@@ -385,6 +415,7 @@ class BrowserState(BaseModel):
     facts: list[TaskFact] = Field(default_factory=list)
     memory_truncated: bool = False
     pending_changes: list[PendingChange] = Field(default_factory=list)
+    browser_steps: list[BrowserStep] = Field(default_factory=list)
     remaining_model_requests: int = 0
     remaining_work: list[str] = Field(default_factory=list)
     source_register: list[dict[str, Any]] = Field(default_factory=list)
@@ -392,7 +423,13 @@ class BrowserState(BaseModel):
     @field_validator("snapshot")
     @classmethod
     def _snapshot(cls, value: str) -> str:
-        return clip(value, MAX_SNAPSHOT) or ""
+        lines, size = [], 0
+        for line in value.splitlines():
+            if size + len(line) + bool(lines) > MAX_SNAPSHOT:
+                continue
+            size += len(line) + bool(lines)
+            lines.append(line)
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +451,9 @@ class TaskRunState(BaseModel):
     follow_ups: list[str] = Field(default_factory=list)
     requirements: TaskRequirements = Field(default_factory=TaskRequirements)
     bound_tab: str | None = None
+    bound_application: str | None = None
+    authorized_origins: dict[str, list[str]] = Field(default_factory=dict)
+    browser_steps: list[BrowserStep] = Field(default_factory=list)
     task_tabs: list[str] = Field(default_factory=list)
     diagnostics_armed_tabs: set[str] = Field(default_factory=set)
     evidence: list[Evidence] = Field(default_factory=list)
@@ -451,6 +491,9 @@ class TaskRunState(BaseModel):
     pending_changes: dict[str, PendingChange] = Field(default_factory=dict)
     pending_uploads: dict[str, dict[str, Any]] = Field(default_factory=dict)
     visited_urls: list[str] = Field(default_factory=list)
+    login_auth_host: str | None = None
+    login_auth_url: str | None = None
+    login_auth_tab: str | None = None
     current_success_condition: str | None = None
     current_verification: GoalCheck | None = None
     completed_goal_summaries: list[str] = Field(default_factory=list)
@@ -462,8 +505,10 @@ class TaskRunState(BaseModel):
     last_page_fingerprint: str | None = None
     last_action_fingerprint: str | None = None
     direct_navigation_done: bool = False
+    load_recoveries: dict[str, int] = Field(default_factory=dict)
     completion_rejected: bool = False
     repair_attempted: bool = False
+    clarification_recovery: bool = False
     debug_telemetry_started: bool = False
     started_monotonic: float = Field(default_factory=time.monotonic, exclude=True)
     started_wallclock: float = Field(default_factory=time.time)
@@ -475,7 +520,12 @@ class TaskRunState(BaseModel):
     made_progress: bool = False
     model_ms: int = 0
     browser_ms: int = 0
+    preflight_ms: int = 0
+    authorization_ms: int = 0
+    assertion_ms: int = 0
     plan_ms: int = 0
+    direct_execution: bool = True
+    first_action_ms: int | None = None
     step_ms: int = 0
 
     # bounds, injected from MemoryConfig
@@ -545,7 +595,7 @@ class TaskRunState(BaseModel):
 
     @property
     def unverified_mutations(self) -> int:
-        return max(0, self.counters.mutation_count - self.counters.verified_mutation_count)
+        return sum(change.count for change in self.pending_changes.values())
 
     @property
     def original_task(self) -> str:
@@ -607,9 +657,17 @@ class AxisResult(BaseModel):
     # Wall-clock breakdown, so a slow run can be attributed rather than guessed
     # at: model time is provider latency, browser time is bridge/page latency,
     # and whatever is left is orchestration.
+    time_to_first_action_ms: int | None = None
     duration_ms: int = 0
     model_ms: int = 0
     browser_ms: int = 0
+    preflight_ms: int = 0
+    authorization_ms: int = 0
+    assertion_ms: int = 0
+    redundant_observations: int = 0
+    redundant_actions: int = 0
+    redundant_assertions: int = 0
+    recovery_actions: int = 0
 
 
 class AxisEvent(BaseModel):
@@ -667,9 +725,10 @@ class ProviderOverrides(BaseModel):
 class RunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    direct_browser_execution: bool = True
     planner_interval_steps: int = Field(default=5, ge=1)
     planner_max_interval_steps: int = Field(default=8, ge=1)
-    max_actions_per_step: int = Field(default=4, ge=1)
+    max_actions_per_step: int = Field(default=12, ge=2)
     max_total_steps: int = Field(default=30, ge=1)
     document_extra_steps: int = Field(default=30, ge=0, le=120)
     document_extension_steps: int = Field(default=5, ge=1, le=20)

@@ -341,3 +341,129 @@ test('SELECT_ACCESSIBILITY_REF_OPTIONS rejects a non-select ref', async () => {
   assert.equal(res.ok, false);
   assert.match(res.error, /not a <select>/);
 });
+
+test('containers and open shadow roots expose nested controls once', async () => {
+  const save = new FakeElement('button', { text: 'Save' });
+  const aside = new FakeElement('aside', { attrs: { 'aria-label': 'Sidebar' }, children: [save] });
+  const tab = new FakeElement('button', { attrs: { role: 'tab' }, text: 'Settings' });
+  const tablist = new FakeElement('div', { attrs: { role: 'tablist' }, children: [tab] });
+  const shadowButton = new FakeElement('button', { text: 'Shadow Save' });
+  const host = new FakeElement('custom-widget');
+  host.shadowRoot = new FakeElement('div', { children: [shadowButton] });
+  const doc = makeDocument([aside, tablist, host]);
+  assignDocument(host.shadowRoot, doc);
+  const tree = await runAccessibilityTree(doc);
+  for (const name of ['Save', 'Settings', 'Shadow Save'])
+    assert.equal(tree.nodes.filter(node => node.name === name).length, 1, name);
+  assert.match(tree.nodes.find(node => node.name === 'Save').context, /Sidebar/);
+});
+
+test('snapshot state, hidden filtering and password masking are consistent', async () => {
+  const checked = new FakeInput('input', { attrs: { type: 'checkbox', 'aria-label': 'Enabled' }, value: 'on' });
+  checked.checked = true;
+  const disabled = new FakeElement('button', { text: 'Unavailable', attrs: { 'aria-disabled': 'true' } });
+  const hidden = new FakeElement('button', { text: 'Hidden', attrs: { 'aria-hidden': 'true' } });
+  const password = new FakeInput('input', { attrs: { type: 'password' }, value: 'dummy-secret' });
+  const tree = await runAccessibilityTree(makeDocument([checked, disabled, hidden, password]));
+  assert.equal(tree.nodes.find(node => node.name === 'Enabled').checked, true);
+  assert.equal(tree.nodes.find(node => node.name === 'Unavailable').disabled, true);
+  assert.equal(tree.nodes.some(node => node.name === 'Hidden'), false);
+  assert.equal(JSON.stringify(tree).includes('dummy-secret'), false);
+});
+
+test('duplicate labels retain their dialog context', async () => {
+  const dialogs = ['Profile', 'Billing'].map(name => new FakeElement('dialog', {
+    attrs: { 'aria-label': name }, children: [new FakeElement('button', { text: 'Save' })]
+  }));
+  const tree = await runAccessibilityTree(makeDocument(dialogs));
+  const saves = tree.nodes.filter(node => node.name === 'Save');
+  assert.equal(saves.length, 2);
+  assert.deepEqual(Array.from(saves, node => node.context), ['dialog Profile', 'dialog Billing']);
+});
+
+test('actionable controls survive a long prose prefix and node budget', async () => {
+  const prose = Array.from({ length: 200 }, (_, i) => new FakeElement('p', { text: 'Paragraph ' + i }));
+  const doc = makeDocument([...prose, new FakeElement('button', { text: 'Continue' })]);
+  const { tree } = await runAccessibilitySession(doc, { maxNodes: 10 });
+  assert.equal(tree.nodes.length, 10);
+  assert.equal(tree.nodes[0].name, 'Continue');
+  assert.equal(tree.truncated, true);
+});
+
+test('same-origin iframe contents are not attributed to the parent frame', async () => {
+  const frame = new FakeElement('iframe');
+  frame.contentDocument = makeDocument([new FakeElement('button', { text: 'Frame Save' })]);
+  const tree = await runAccessibilityTree(makeDocument([frame]));
+  assert.equal(tree.nodes.some(node => node.name === 'Frame Save'), false);
+  assert.equal(tree.iframes.length, 1);
+});
+
+test('shadow controls receive deep hit tests; empty hit tests refuse clicks', async () => {
+  const button = new FakeElement('button', { text: 'Shadow action' });
+  const host = new FakeElement('custom-widget');
+  host.shadowRoot = new FakeElement('div', { children: [button] });
+  host.shadowRoot.elementFromPoint = () => button;
+  const doc = makeDocument([host]);
+  assignDocument(host.shadowRoot, doc);
+  doc.elementFromPoint = () => host;
+  const session = await runAccessibilitySession(doc);
+  const node = session.tree.nodes.find(node => node.name === 'Shadow action');
+  assert.equal(session.send({ type: 'GET_ACCESSIBILITY_REF_TARGET', ref: node.ref }).target.actionability.actionable, true);
+  doc.elementFromPoint = () => null;
+  assert.equal(session.send({ type: 'GET_ACCESSIBILITY_REF_TARGET', ref: node.ref }).target.actionability.actionable, false);
+});
+
+
+test('table observations number data rows excluding headers and retain edit-control row context', async () => {
+  const header = new FakeElement('tr', { children: [new FakeElement('th', { text: 'Operation' })] });
+  const rows = Array.from({ length: 17 }, (_, i) => new FakeElement('tr', { text: 'Operation ' + (i + 1), children: [
+    new FakeElement('td', { text: 'Operation ' + (i + 1) }),
+    new FakeElement('td', { children: [new FakeElement('button', { text: 'Edit' })] }),
+  ] }));
+  const table = new FakeElement('table', { children: [header, ...rows] });
+  const tree = await runAccessibilityTree(makeDocument([table]));
+  const dataRows = tree.nodes.filter(node => node.role === 'row' && !node.rowHeader);
+  assert.equal(dataRows.length, 17);
+  assert.equal(dataRows[16].rowIndex, 17);
+  assert.equal(dataRows[16].rowOrder, 'rendered');
+  const edit = tree.nodes.find(node => node.role === 'button' && node.rowIndex === 17);
+  assert.ok(edit);
+  assert.match(edit.context, /row 17 Operation 17/);
+});
+
+
+test('data rows with row header cells retain rendered ordinal and aria position', async () => {
+  const header = new FakeElement('tr', { children: [new FakeElement('th', { text: 'Name' }), new FakeElement('th', { text: 'Actions' })] });
+  const edit = new FakeElement('button', { text: 'Edit' });
+  const row = new FakeElement('tr', { attrs: { 'aria-rowindex': '42' }, children: [
+    new FakeElement('th', { attrs: { scope: 'row' }, text: 'Operation 41' }), new FakeElement('td', { children: [edit] })] });
+  const tree = await runAccessibilityTree(makeDocument([new FakeElement('table', { children: [header, row] })]));
+  const target = tree.nodes.find(n => n.name === 'Edit');
+  assert.equal(target.rowIndex, 1);
+  assert.equal(target.ariaRowIndex, 42);
+  assert.equal(target.rowOrder, 'rendered');
+  assert.equal(target.rowHeader, false);
+});
+
+test('manual target identity changes invalidate a ref instead of clicking its replacement meaning', async () => {
+  const button = new FakeElement('button', { text: 'Save' });
+  const session = await runAccessibilitySession(makeDocument([button]));
+  const node = session.tree.nodes.find(n => n.name === 'Save');
+  button.innerText = button.textContent = 'Delete';
+  const result = session.send({ type: 'GET_ACCESSIBILITY_REF_TARGET', ref: node.ref, snapshotId: node.snapshotId });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Stale accessibility ref identity/);
+});
+
+test('reference hit testing chooses an exposed point when the center is covered', async () => {
+  const button = new FakeElement('button', { text: 'Save' });
+  const overlay = new FakeElement('div', { text: 'Overlay' });
+  button.getBoundingClientRect = () => ({ x: 0, y: 0, width: 100, height: 100 });
+  const doc = makeDocument([button, overlay]);
+  doc.elementFromPoint = (x, y) => x > 40 && x < 60 && y > 40 && y < 60 ? overlay : button;
+  const session = await runAccessibilitySession(doc);
+  const node = session.tree.nodes.find(n => n.name === 'Save');
+  const result = session.send({ type: 'GET_ACCESSIBILITY_REF_TARGET', ref: node.ref, snapshotId: node.snapshotId });
+  assert.equal(result.target.actionability.actionable, true);
+  assert.equal(result.target.element.clickPoint.x, 20);
+});

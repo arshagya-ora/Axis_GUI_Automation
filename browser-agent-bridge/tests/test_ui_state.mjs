@@ -7,7 +7,21 @@ import {
   persistentState,
   ownsRuntime,
   mergeTask,
+  continuationContext,
 } from "../extension/ui/state.js";
+
+test('continue now retains a failed task in the selected conversation', () => {
+  const state = createState();
+  state.selected = 'c';
+  state.tasks = {
+    failed: {id: 'failed', conversation_id: 'c', status: 'failed', updated_at: 2},
+    other: {id: 'other', conversation_id: 'other', status: 'failed', updated_at: 3},
+  };
+  assert.equal(continuationContext(state, 'CONTINUE NOW, I HAVE FIXED THE PERMISSION'), 'failed');
+  assert.equal(continuationContext(state, 'Open another website'), null);
+  state.tasks.completed = {id: 'completed', conversation_id: 'c', status: 'completed', updated_at: 4};
+  assert.equal(continuationContext(state, 'Continue now'), null);
+});
 
 test("completion collapses activity once without overriding later user expansion", () => {
   const state = createState();

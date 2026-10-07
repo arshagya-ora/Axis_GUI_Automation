@@ -122,3 +122,22 @@ test('frameSelector targeting keeps a root framePath and records the selector', 
   assert.equal(result.frame.frameSelector, '#editor');
 });
 
+
+test('same-URL frame selection and owner geometry refuse ambiguity', async () => {
+  const { createFrameTargetResolver } = await importFramesModule();
+  const frames = [{ frameId: 0, parentFrameId: -1, url: 'https://host.test' },
+    { frameId: 7, parentFrameId: 0, url: 'https://embed.test' },
+    { frameId: 8, parentFrameId: 0, url: 'https://embed.test' }];
+  const elements = [10, 100].map(x => makeFrameElement({ src: 'https://embed.test',
+    href: 'https://embed.test', rect: { x, y: 0, width: 80, height: 40 } }));
+  const chromeApi = framesChromeApi(frames);
+  chromeApi.scripting.executeScript = async ({ func, args }) => {
+    const previous = globalThis.document;
+    globalThis.document = { querySelectorAll: () => elements };
+    try { return [{ result: func(...args) }]; }
+    finally { globalThis.document = previous; }
+  };
+  const resolver = createFrameTargetResolver({ chromeApi });
+  await assert.rejects(resolver.resolveFrameTarget(1, { frameUrl: 'https://embed.test' }), /FRAME_TARGET_AMBIGUOUS/);
+  await assert.rejects(resolver.resolveFrameTarget(1, { frameId: 7 }), /FRAME_TARGET_AMBIGUOUS/);
+});

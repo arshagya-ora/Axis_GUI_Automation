@@ -64,6 +64,10 @@ class FakeBridge:
                 "url": self.url,
                 "title": self.title,
             }
+        if method == 'locator.count' and method not in self.responses:
+            locator = (params or {}).get('locator', params or {})
+            name = locator.get('name') or locator.get('label') or locator.get('selector') or 'Control'
+            return {'count': 1, 'elements': [{'role': locator.get('role', 'textbox'), 'accessibleName': name}]}
         response = self.responses.get(method, {})
         result = response() if callable(response) else response
         if method == "tabs.create" and isinstance(result, dict):
@@ -82,6 +86,20 @@ class FakeBridge:
     @property
     def methods(self):
         return [method for method, _ in self.calls]
+
+
+class StalledLoadBridge(FakeBridge):
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = failures
+
+    def rpc(self, method, params=None, **kwargs):
+        if method == 'page.accessibilityTree' and self.failures:
+            self.calls.append((method, params or {}))
+            self.failures -= 1
+            raise bt.BrowserBridgeError('page.waitForLoad timed out',
+                                        {'code': 'PAGE_WAIT_FOR_LOAD_TIMEOUT'})
+        return super().rpc(method, params, **kwargs)
 
 
 class Script:
@@ -134,8 +152,9 @@ class Script:
         return ModelResponse(parts=[ToolCallPart(output_tool, dict(entry.get("outcome", {"status": "continue"})))])
 
 
-def make(script: Script, *, config: AxisConfig | None = None, bridge: FakeBridge | None = None, **kwargs):
+def make(script: Script, *, config: AxisConfig | None = None, bridge: FakeBridge | None = None, direct: bool = False, **kwargs):
     config = config or AxisConfig.load()
+    config.run.direct_browser_execution = direct
     bridge = bridge or FakeBridge()
     model = script.model()
     runtime = bt.BrowserRuntime(bridge, max_tabs=config.browser.max_open_tabs)
@@ -443,6 +462,7 @@ async def test_download_tool_is_added_only_for_download_tasks():
 
 async def test_at_most_three_browser_actions_execute_per_navigator_step():
     config = AxisConfig.load()
+    config.run.max_actions_per_step = 3
     config.run.planner_interval_steps = 1  # isolate a single navigator step
     script = Script(
         [browse(), done()],
@@ -820,8 +840,11 @@ async def test_three_successful_no_change_actions_terminate_as_no_progress():
     assert bridge.methods.count("locator.click") == 3
 
 
-async def test_literal_url_is_navigated_directly_before_first_observation():
-    target = "https://example.test/exact?a=1&b=two"
+@pytest.mark.parametrize('supplied,target', [
+    ('https://example.test/exact?a=1&b=two', 'https://example.test/exact?a=1&b=two'),
+    ('10.75.181.51:80', 'http://10.75.181.51:80'),
+])
+async def test_literal_url_is_navigated_directly_before_first_observation(supplied, target):
     script = Script(
         [browse("Inspect the target"), done("Target inspected.")],
         [{"calls": [], "outcome": {"status": "goal_reached"}}],
@@ -834,14 +857,128 @@ async def test_literal_url_is_navigated_directly_before_first_observation():
         return {"tab": {"url": target, "title": bridge.title}, "whatChanged": {"urlChanged": True}}
 
     bridge.responses["page.navigate"] = navigate
-    result = await orchestrator.start_task(f"Open {target} and report its title.")
+    result = await orchestrator.start_task(f"Open {supplied} and report its title.")
     assert result.status == "completed"
     navigate_index = bridge.methods.index("page.navigate")
     observe_index = bridge.methods.index("page.accessibilityTree")
     assert navigate_index < observe_index
     params = next(params for method, params in bridge.calls if method == "page.navigate")
     assert params["url"] == target
-    assert "https://example.test/exact?a=1&amp;b=two" in script.planner_prompts[0]
+    assert supplied.replace('&', '&amp;') in script.planner_prompts[0]
+
+
+@pytest.mark.parametrize('failures,expected_recovery', [
+    (1, ['page.reload']),
+    (2, ['page.reload', 'page.navigate']),
+])
+async def test_stalled_initial_load_recovers_before_planning(failures, expected_recovery):
+    bridge = StalledLoadBridge(failures)
+    app = 'http://10.75.181.51:80'
+    bridge.url = app
+    bridge.title = 'CNCC | Home'
+    script = Script([browse('Inspect CNCC'), done('CNCC opened.')],
+                    [{'calls': [], 'outcome': {'status': 'goal_reached'}}])
+    orchestrator, _, _ = make(script, bridge=bridge)
+    result = await orchestrator.start_task(f'Open {app} and report the title.')
+    assert result.status == 'completed'
+    recoveries = [method for method in bridge.methods if method in {'page.reload', 'page.navigate'}]
+    assert recoveries == expected_recovery
+    for method, params in bridge.calls:
+        if method in {'page.reload', 'page.navigate'}:
+            assert params['wait'] is False
+    assert script.planner_calls > 0
+
+
+async def test_stalled_load_recovery_is_bounded():
+    bridge = StalledLoadBridge(4)
+    bridge.url = 'https://example.test/'
+    orchestrator, _, _ = make(Script([browse()]), bridge=bridge)
+    result = await orchestrator.start_task('Inspect the current page.')
+    assert result.status == 'failed'
+    assert bridge.methods.count('page.reload') == 1
+    assert bridge.methods.count('page.navigate') == 0
+    assert bridge.methods.count('page.accessibilityTree') == 2
+
+
+async def test_stalled_load_recovery_stops_after_reopening_supplied_url():
+    bridge = StalledLoadBridge(4)
+    app = 'https://example.test/'
+    bridge.url = app
+    orchestrator, _, _ = make(Script([browse()]), bridge=bridge)
+    result = await orchestrator.start_task(f'Open {app} and inspect it.')
+    assert result.status == 'failed'
+    assert bridge.methods.count('page.reload') == 1
+    assert bridge.methods.count('page.navigate') == 1
+    assert bridge.methods.count('page.accessibilityTree') == 3
+
+
+async def test_observation_policy_denial_is_not_retried():
+    bridge = FakeBridge()
+
+    def denied():
+        raise bt.BrowserBridgeError('Access denied: page.accessibilityTree',
+                                    {'code': 'FIREWALL_DENIED'})
+
+    bridge.responses['page.accessibilityTree'] = denied
+    original_rpc = bridge.rpc
+
+    def rpc(method, params=None, **kwargs):
+        if method == 'page.accessibilityTree':
+            bridge.calls.append((method, params or {}))
+            return denied()
+        return original_rpc(method, params, **kwargs)
+
+    bridge.rpc = rpc
+    orchestrator, _, _ = make(Script([browse()]), bridge=bridge)
+    result = await orchestrator.start_task('Inspect the current page.')
+    assert result.status == 'failed'
+    assert bridge.methods.count('page.accessibilityTree') == 1
+    assert 'page.reload' not in bridge.methods
+
+
+async def test_explicit_login_enters_raw_credentials_through_observed_sso():
+    app = 'http://10.75.181.51:80'
+    auth = 'http://10.75.181.50/login'
+    script = Script(
+        [browse('Sign in', verification={'assertion': 'visible', 'expected': True,
+                                          'target': 'Welcome!'}), done('Signed in.')],
+        [
+            {'calls': [
+                ('browser_act', {'tab': 'tab_1', 'command': {'action': 'fill',
+                    'target': {'kind': 'locator', 'locator': {'role': 'textbox', 'name': 'Username'}},
+                    'value': 'fixture-user'}}),
+                ('browser_act', {'tab': 'tab_1', 'command': {'action': 'fill',
+                    'target': {'kind': 'locator', 'locator': {'role': 'textbox', 'name': 'Password'}},
+                    'value': 'fixture-secret'}}),
+                ('browser_act', {'tab': 'tab_1', 'command': {'action': 'click',
+                    'target': {'kind': 'locator', 'locator': {'role': 'button', 'name': 'Sign In'}}}}),
+            ], 'outcome': {'status': 'continue'}},
+            {'calls': [('browser_assert', {'tab': 'tab_1', 'command': {'assertion': 'visible',
+                'locator': {'role': 'heading', 'name': 'Welcome!'}}})],
+             'outcome': {'status': 'goal_reached'}},
+        ],
+    )
+    orchestrator, bridge, _ = make(script)
+
+    def navigate():
+        bridge.url, bridge.title = auth, 'Login to CNC Console'
+        return {'tab': {'url': auth, 'title': bridge.title}, 'whatChanged': {'urlChanged': True}}
+
+    def submit_login():
+        bridge.url, bridge.title = 'http://10.75.181.51/index.html', 'CNCC | Home'
+        return {'whatChanged': {'urlChanged': True}}
+
+    bridge.responses['page.navigate'] = navigate
+    bridge.responses['locator.click'] = submit_login
+    result = await orchestrator.start_task(
+        'Open 10.75.181.51:80 and login\nUser: fixture-user\nPassword: fixture-secret')
+    assert result.status == 'completed'
+    fills = [params['text'] for method, params in bridge.calls if method == 'locator.fill']
+    assert fills == ['fixture-user', 'fixture-secret']
+    assert any('fixture-secret' in prompt for prompt in script.navigator_prompts)
+    assert orchestrator.state.login_auth_url == auth
+    assert orchestrator.state.login_auth_tab == 'tab_1'
+    assert result.planner_passes == 2
 
 
 async def test_approval_callback_receives_target_origin_file_and_reason():
@@ -862,13 +999,13 @@ async def test_approval_callback_receives_target_origin_file_and_reason():
 
     orchestrator, bridge, _ = make(script, config=config, approval=deny)
     result = await orchestrator.start_task("Upload the report after asking for approval.")
-    assert result.status == "failed"
+    assert result.status == "paused"
     assert "locator.setInputFiles" not in bridge.methods
     tool, operation, detail = approvals[0]
     assert (tool, operation) == ("browser_act", "upload")
     assert detail["current_url"] == bridge.url
     assert detail["origin"] == "https://www.google.com"
-    assert detail["target"] == "Attach file"
+    assert "Attach file" in detail["target"]
     assert detail["target_type"] == "locator"
     assert detail["upload_filenames"] == ["C:/temp/report.csv"]
     assert detail["expected_effect"] == "upload"
@@ -979,7 +1116,9 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
         "native.sitePatterns",     # site-pattern preflight
         "tabs.list",              # bind to the focused tab, once
         "page.accessibilityTree",  # programmatic observation before step 1
+        "tabs.list",              # validate destination before an authorized action
         "locator.fillRef",
+        "tabs.list",
         "keyboard.press",
         "tabs.list",              # revalidate the bound tab before reuse
         "page.accessibilityTree",  # fresh observation before step 2
@@ -994,3 +1133,106 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
     everything = "\n".join(script.prompts).lower()
     for absent in ("intent", "effect", "lease", "workflow", "temporal", "projection"):
         assert absent not in everything, absent
+
+async def test_direct_read_completes_in_one_request_without_planner():
+    script = Script([], [{"outcome": {"status": "task_complete", "final_answer": "Google"}}])
+    orchestrator, bridge, _ = make(script, direct=True)
+    result = await orchestrator.start_task("Report the current page title.")
+    assert result.status == "completed"
+    assert result.answer == "Google"
+    assert result.model_requests == 1
+    assert result.planner_passes == script.planner_calls == 0
+    assert bridge.observations == 1
+
+
+async def test_direct_action_plus_check_completes_in_two_requests():
+    script = Script([], [{"calls": [
+        ("browser_act", {"tab": "tab_1", "command": {
+            "action": "fill", "target": {"kind": "locator", "locator": {"label": "Name"}}, "value": "Alice"},
+            "postcondition": {"assertion": "value", "locator": {"label": "Name"}, "expected": "Alice"}}),
+    ], "outcome": {"status": "task_complete", "final_answer": "Entered Alice."}}])
+    orchestrator, bridge, _ = make(script, direct=True)
+    result = await orchestrator.start_task("Fill Name with Alice and verify it.")
+    assert result.status == "completed"
+    assert result.model_requests == 2
+    assert result.planner_passes == script.planner_calls == 0
+    assert result.time_to_first_action_ms is not None
+    assert not orchestrator.memory.pending_changes
+    assert bridge.methods.count("locator.fill") == 1
+    assert bridge.methods.count("expect.locator.toHaveValue") == 1
+
+
+async def test_direct_browser_agent_can_request_planner_help():
+    script = Script([{"decision": "ask_user", "reason": "Which account?"}],
+                    [{"outcome": {"status": "needs_plan", "reason": "Account selection needs clarification."}}])
+    orchestrator, _, _ = make(script, direct=True)
+    result = await orchestrator.start_task("Choose an account and continue.")
+    assert result.status == "needs_user"
+    assert script.navigator_calls == script.planner_calls == 1
+
+
+async def test_ordered_batch_records_each_action_and_check():
+    script = Script([], [{"calls": [("browser_act", {"tab": "tab_1", "command": {
+        "action": "batch", "steps": [
+            {"command": {"action": "fill", "target": {"kind": "locator", "locator": {"label": "First"}}, "value": "Alice"},
+             "postcondition": {"assertion": "value", "locator": {"label": "First"}, "expected": "Alice"}},
+            {"command": {"action": "fill", "target": {"kind": "locator", "locator": {"label": "Last"}}, "value": "Smith"},
+             "postcondition": {"assertion": "value", "locator": {"label": "Last"}, "expected": "Smith"}},
+        ]}})], "outcome": {"status": "task_complete", "final_answer": "Both fields verified."}}])
+    config = AxisConfig.load()
+    config.run.max_actions_per_step = 4
+    orchestrator, bridge, _ = make(script, config=config, direct=True)
+    result = await orchestrator.start_task("Fill First with Alice and Last with Smith.")
+    assert result.status == "completed"
+    assert result.model_requests == 2
+    assert result.browser_actions == 4
+    assert not orchestrator.memory.pending_changes
+    assert [method for method in bridge.methods if method in {"locator.fill", "expect.locator.toHaveValue"}] == [
+        "locator.fill", "expect.locator.toHaveValue", "locator.fill", "expect.locator.toHaveValue"]
+
+
+async def test_batch_stops_before_next_action_on_navigation():
+    script = Script([], [{"calls": [("browser_act", {"tab": "tab_1", "command": {
+        "action": "batch", "steps": [
+            {"command": {"action": "click", "target": {"kind": "locator", "locator": {"role": "button", "name": "Continue"}}}},
+            {"command": {"action": "fill", "target": {"kind": "locator", "locator": {"label": "Name"}}, "value": "Alice"}},
+        ]}})], "outcome": {"status": "ask_user", "reason": "Navigation completed."}}])
+    orchestrator, bridge, _ = make(script, direct=True)
+    bridge.responses["locator.click"] = {"whatChanged": {"urlChanged": True, "toUrl": "https://example.test/next"}}
+    result = await orchestrator.start_task("Click Continue.")
+    assert result.status == "needs_user"
+    assert bridge.methods.count("locator.click") == 1
+    assert "locator.fill" not in bridge.methods
+
+async def test_already_correct_field_can_complete_without_rewriting_it():
+    script = Script([], [{"calls": [("browser_assert", {"tab": "tab_1", "command": {
+        "assertion": "value", "locator": {"label": "Name"}, "expected": "Alice"}})],
+        "outcome": {"status": "task_complete", "final_answer": "Name is already Alice."}}])
+    orchestrator, bridge, _ = make(script, direct=True)
+    result = await orchestrator.start_task("Set Name to Alice on the current page.")
+    assert result.status == "completed"
+    assert "locator.fill" not in bridge.methods
+    assert result.planner_passes == 0
+
+
+async def test_cross_origin_login_prompt_contains_exact_supplied_credentials():
+    script = Script([], [{'calls': [], 'outcome': {
+        'status': 'ask_user', 'reason': 'Establish trust for the identity provider.'}}])
+    orchestrator, bridge, _ = make(script, direct=True)
+
+    def navigate():
+        bridge.url = 'http://identity.test/auth?redirect_uri=http://app.test/callback'
+        bridge.title = 'Sign In'
+        return {'tab': {'url': bridge.url, 'title': bridge.title},
+                'whatChanged': {'urlChanged': True}}
+
+    bridge.responses['page.navigate'] = navigate
+    result = await orchestrator.start_task('Login to http://app.test\nUser: fixture-user\nPassword: fixture-secret')
+    assert result.status == 'needs_user'
+    prompt = script.navigator_prompts[0]
+    assert 'Enter the supplied credential values exactly.' in prompt
+    assert '{{axis_login_password}}' not in prompt
+    assert 'fixture-user' in prompt
+    assert 'fixture-secret' in prompt
+    assert 'identity.test' in prompt
+    assert 'locator.fill' not in bridge.methods

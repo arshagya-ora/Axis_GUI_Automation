@@ -84,22 +84,25 @@ export function mountSettings(
     bridgeActions = el("div", "row");
   connection.append(bridgeActions);
   let bridgeEnabled = false;
+  async function requestBrowserPermissions() {
+    // This must be called directly from a button click so Chrome can show its
+    // optional-permission prompt.  Keeping it separate also lets an existing
+    // bridge recover if a permission was removed in chrome://extensions.
+    const granted = await chrome.permissions.request({
+      permissions: ["tabs", "tabGroups", "downloads"],
+    });
+    if (!granted)
+      throw new Error("Chrome permissions are required to use the browser bridge.");
+  }
   const bridgeToggle = button("Start bridge", async () => {
     const action = bridgeEnabled ? "STOP_BRIDGE" : "START_BRIDGE";
     // Request directly inside the click gesture; no unrelated asynchronous work first.
     let permission;
     if (!bridgeEnabled)
-      permission = chrome.permissions.request({
-        permissions: ["tabs", "tabGroups", "downloads"],
-      });
+      permission = requestBrowserPermissions();
     await operation(
       async () => {
-        if (permission && !(await permission))
-          throw new Error(
-            "Chrome permissions are required to start the bridge.",
-          );
-        if (permission)
-          await chrome.storage.local.set({ optionalPermissionsGranted: true });
+        if (permission) await permission;
         const result = await chrome.runtime.sendMessage({
           type: action,
         });
@@ -118,6 +121,15 @@ export function mountSettings(
   });
   bridgeActions.append(
     bridgeToggle,
+    button("Grant browser permissions", async () => {
+      try {
+        await requestBrowserPermissions();
+        await refresh();
+        feedback(connectionMessage, "Browser permissions granted.");
+      } catch (error) {
+        feedback(connectionMessage, error.message, true);
+      }
+    }),
     button("Refresh", () => refresh()),
   );
   function renderBridge(status) {

@@ -965,69 +965,57 @@ export function createPageHandlers({
     const tabId = assertTabId(params.tabId);
     await assertTabAllowed(tabId, 'page.accessibilityTree');
   
-    await ensureContentScripts(tabId, 0);
     const snapshotId = `snap_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-    const mainResponse = await chromeApi.tabs.sendMessage(tabId, {
-      type: 'GET_ACCESSIBILITY_TREE',
-      maxNodes: params.maxNodes || 1000,
-      snapshotId,
-      frameId: 0
-    }, { frameId: 0 });
+    let mainResponse;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await ensureContentScripts(tabId, 0);
+      try {
+        mainResponse = await chromeApi.tabs.sendMessage(tabId, {
+          type: 'GET_ACCESSIBILITY_TREE',
+          maxNodes: params.maxNodes || 1000,
+          snapshotId,
+          frameId: 0
+        }, { frameId: 0 });
+        break;
+      } catch (error) {
+        // Retry this read once if navigation replaced the content-script receiver.
+        if (attempt || !/Receiving end does not exist|message port closed/i.test(error.message || '')) throw error;
+      }
+    }
   
     if (!mainResponse?.ok) throw new Error(mainResponse?.error || 'Failed to read accessibility tree');
   
     const tree = mainResponse.tree;
-    const collectedIframes = tree.iframes || [];
-  
-    try {
-      const frames = await chromeApi.webNavigation.getAllFrames({ tabId });
-      frames.sort((a, b) => a.frameId - b.frameId);
-    
-      for (const frame of frames) {
-        if (frame.frameId === 0) continue;
-      
-        const match = collectedIframes.find(sub => {
-          if (!sub.src || !frame.url) return false;
-          try {
-            const subUrl = new URL(sub.src, frame.url).href;
-            return subUrl === frame.url || frame.url.startsWith(subUrl) || subUrl.startsWith(frame.url);
-          } catch {
-            return sub.src.includes(frame.url) || frame.url.includes(sub.src);
-          }
-        });
-      
-        if (match) {
-          await ensureContentScripts(tabId, frame.frameId);
-          const subResponse = await chromeApi.tabs.sendMessage(tabId, {
-            type: 'GET_ACCESSIBILITY_TREE',
-            maxNodes: params.maxNodes || 1000,
-            snapshotId,
-            frameId: frame.frameId,
-            offsetX: match.x,
-            offsetY: match.y
-          }, { frameId: frame.frameId });
-        
-          if (subResponse?.ok && subResponse.tree?.nodes) {
-            tree.nodes.push(...subResponse.tree.nodes);
-            if (subResponse.tree.iframes) {
-              collectedIframes.push(...subResponse.tree.iframes);
-            }
-          }
-        }
+    tree.frameWarnings = [];
+    const frames = await chromeApi.webNavigation.getAllFrames({ tabId }).catch(() => []);
+    const seenFrames = new Set([0]);
+    for (const frame of frames.sort((a, b) => a.frameId - b.frameId)) {
+      if (seenFrames.has(frame.frameId)) continue;
+      seenFrames.add(frame.frameId);
+      try {
+        await ensureContentScripts(tabId, frame.frameId);
+        const response = await chromeApi.tabs.sendMessage(tabId, {
+          type: 'GET_ACCESSIBILITY_TREE', maxNodes: params.maxNodes || 1000,
+          snapshotId, frameId: frame.frameId
+        }, { frameId: frame.frameId });
+        if (!response?.ok) throw new Error(response?.error || 'Frame observation unavailable');
+        tree.nodes.push(...(response.tree?.nodes || []));
+        tree.truncated ||= response.tree?.truncated === true;
+      } catch (error) {
+        tree.frameWarnings.push({ frameId: frame.frameId, error: String(error.message || error) });
       }
-    } catch (e) {
-      console.warn('Subframe accessibility tree collection failed:', e);
     }
-  
+
     delete tree.iframes;
     if (params.format === 'compact') {
       return {
-        snapshot: renderCompactRefTree(tree.nodes || []),
+        snapshot: renderCompactRefTree(tree.nodes || [], params.maxChars || 12000),
         url: tree.url,
         title: tree.title,
         snapshotId: tree.snapshotId,
         nodeCount: (tree.nodes || []).length,
-        truncated: tree.truncated
+        truncated: tree.truncated || tree.nodes.some(node => typeof node.value === 'string' && node.value.length > 500) || renderCompactRefTree(tree.nodes || [], Infinity).length > (params.maxChars || 12000),
+        frameWarnings: tree.frameWarnings
       };
     }
     return tree;
@@ -1556,9 +1544,10 @@ function extractAriaProps(node) {
 // text snapshot: one line per node, interactive lines tagged with frame+ref so an
 // agent can act on them directly (clickRef/fillRef/...). Bounds are dropped — the
 // agent acts by ref, not coordinates.
-function renderCompactRefTree(nodes) {
+function renderCompactRefTree(nodes, maxChars = 12000) {
   const lines = [];
-  for (const node of nodes) {
+  const ordered = [...nodes].sort((a, b) => Number(Boolean(b.focused)) - Number(Boolean(a.focused)) || Number(Boolean(b.context?.includes('dialog'))) - Number(Boolean(a.context?.includes('dialog'))) || Number(typeof a.text === 'string') - Number(typeof b.text === 'string'));
+  for (const node of ordered) {
     if (typeof node.text === 'string') {
       const text = node.text.trim();
       if (text) lines.push(`  ${text}`);
@@ -1567,14 +1556,28 @@ function renderCompactRefTree(nodes) {
     const frameId = Number.isInteger(node.frameId) ? node.frameId : 0;
     const parts = [`[f${frameId}:${node.ref}]`, node.role || node.tag || 'element'];
     if (node.name) parts.push(JSON.stringify(node.name));
-    if (typeof node.value === 'string' && node.value) parts.push(`=${JSON.stringify(node.value)}`);
+    if (typeof node.value === 'string' && node.value) parts.push(`=${JSON.stringify(node.value.slice(0, 500))}`);
     else if (typeof node.value === 'boolean') parts.push(node.value ? '[checked]' : '[unchecked]');
+    if (typeof node.value === 'string' && node.value.length > 500) parts.push('[value-truncated]');
     if (node.type) parts.push(`type=${node.type}`);
     if (node.href) parts.push(`-> ${node.href}`);
     if (node.focused) parts.push('[focused]');
+    for (const state of ['checked', 'selected', 'expanded', 'disabled', 'readonly']) {
+      if (typeof node[state] === 'boolean' && (node[state] || !['disabled', 'readonly'].includes(state))) parts.push(`[${state}=${node[state]}]`);
+    }
+    if (node.rowIndex) parts.push(`[data-row=${node.rowIndex} order=${node.rowOrder || 'rendered'}]`);
+    if (node.rowHeader) parts.push('[header-row]');
+    if (node.ariaRowIndex) parts.push(`[aria-rowindex=${node.ariaRowIndex}]`);
+    if (node.context) parts.push(`context=${JSON.stringify(node.context)}`);
     lines.push(parts.join(' '));
   }
-  return lines.join('\n');
+  const retained = [];
+  let size = 0;
+  for (const line of lines) {
+    if (size + line.length + (retained.length ? 1 : 0) > maxChars) continue;
+    retained.push(line); size += line.length + (retained.length > 1 ? 1 : 0);
+  }
+  return retained.join('\n');
 }
 
 function renderAriaSnapshot(tree, indent = 0) {

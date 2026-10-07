@@ -108,6 +108,7 @@ def test_correcting_inferred_wording_preserves_other_target_failures():
     orchestrator, _, _ = ready()
     orchestrator._register_action(action(), True)
     assertion(orchestrator, target="#other", passed=False)
+    orchestrator.state.assertions[-1].required = True  # a separate explicit requirement
     assertion(orchestrator, passed=False)
     assertion(orchestrator, expected="Saved successfully")
     assert orchestrator._refine_verification(GoalCheck(assertion="text", expected="Saved successfully", target="#status"))
@@ -246,6 +247,7 @@ def test_arbitrary_assertion_without_declared_goal_check_does_not_verify_click()
 
 def test_assertion_identity_includes_locator_so_unrelated_success_cannot_hide_failure():
     orchestrator, _, _ = ready()
+    orchestrator.state.current_verification = GoalCheck(assertion="text", expected="Saved", target="#invoice-status")
     gate = StepGate(max_actions=3, remaining_total_actions=3, on_record=orchestrator._register_action)
     for selector, passed in [("#invoice-status", False), ("#delivery-status", True)]:
         gate.record("browser_assert", {"tab": "tab_1", "command": bt.TextAssertion(
@@ -457,6 +459,7 @@ async def test_different_ref_targets_do_not_collide_when_refs_are_reissued():
         "action": "click", "target": {"kind": "ref", "ref": ref}}})],
         "outcome": {"status": "continue"}} for ref in ("ref_1", "ref_4")])
     orchestrator, _, _ = ready(script=script, bridge=TwoControlBridge())
+    orchestrator.state.original_request = "Click Next and Previous."
     records = []
     for _ in range(2):
         observed = await orchestrator._browser_state()
@@ -604,3 +607,234 @@ def test_exact_url_assertion_verifies_the_declared_navigation_goal():
     gate = StepGate(max_actions=1, remaining_total_actions=1, on_record=orchestrator._register_action)
     gate.record("browser_assert", {"tab": "tab_1", "command": command}, result)
     assert orchestrator.state.unverified_mutations == 0
+
+def test_one_field_check_does_not_clear_another_requested_value():
+    orchestrator, _, _ = ready()
+    orchestrator.state.current_verification = GoalCheck(assertion="value", expected="Alice", target="First")
+    for name, value in [("First", "Alice"), ("Last", "Smith")]:
+        orchestrator._register_action(action(operation="fill", expected_value=value,
+            target=json.dumps({"kind": "locator", "locator": {"label": name}})), True)
+    assert len(orchestrator.state.pending_changes) == 2
+    check = action(tool="browser_assert", operation="value", semantic_success=True,
+        target=json.dumps({"locator": {"label": "First"}}),
+        result_data={"expected": "Alice", "passed": True})
+    orchestrator._register_action(check, False)
+    assert len(orchestrator.state.pending_changes) == 1
+    remaining = next(iter(orchestrator.state.pending_changes.values()))
+    assert remaining.verification.target == "Last"
+    assert remaining.verification.expected == "Smith"
+
+
+def test_duplicate_field_names_require_the_matching_scope():
+    orchestrator, _, _ = ready()
+    orchestrator.state.current_verification = GoalCheck(assertion="value", expected="Alice", target="Name")
+    for scope in ["#profile", "#billing"]:
+        orchestrator._register_action(action(operation="fill", expected_value="Alice",
+            target=json.dumps({"kind": "locator", "locator": {"label": "Name", "within": scope}})), True)
+    check = action(tool="browser_assert", operation="value", semantic_success=True,
+        target=json.dumps({"locator": {"label": "Name", "within": "#profile"}}),
+        result_data={"expected": "Alice", "passed": True})
+    orchestrator._register_action(check, False)
+    assert len(orchestrator.state.pending_changes) == 1
+    assert next(iter(orchestrator.state.pending_changes.values())).verification_locator["within"] == "#billing"
+
+
+def test_missing_required_approval_callback_refuses_before_execution():
+    gate = StepGate(max_actions=3, remaining_total_actions=3, approval_actions=frozenset({"upload"}))
+    refusal = gate.check("browser_act", {"tab": "tab_1", "command": bt.Upload(
+        action="upload", locator=bt.Locator(label="Attach"), files=["fixture.txt"])})
+    assert refusal["error"]["code"] == "APPROVAL_DENIED"
+    assert gate.actions_used == 0
+    assert not gate.records[-1].executed
+
+
+def test_read_only_gate_allows_navigation_and_rejects_field_changes():
+    gate = StepGate(max_actions=3, remaining_total_actions=3, mutation_allowed=False)
+    assert gate.check("browser_navigate", {"tab": "tab_1", "command": bt.Open(
+        operation="open", url="https://example.test/docs")}) is None
+    assert gate.check("browser_act", {"tab": "tab_1", "command": bt.Click(
+        action="click", target=bt.LocatorTarget(kind="locator", locator=bt.Locator(role="link", name="Docs")))},
+        {"target": 'link "Docs"'}) is None
+    refusal = gate.check("browser_act", {"tab": "tab_1", "command": bt.Fill(
+        action="fill", target=bt.LocatorTarget(kind="locator", locator=bt.Locator(label="Name")), value="Alice")})
+    assert refusal["error"]["code"] == "POLICY_DENIED"
+
+
+@pytest.mark.anyio
+async def test_direct_ref_login_completes_after_one_authenticated_assertion():
+    class LoginBridge(FakeBridge):
+        def rpc(self, method, params=None, **kwargs):
+            result = super().rpc(method, params, **kwargs)
+            if method == 'page.accessibilityTree' and '/auth' in self.url:
+                result['snapshot'] = ('[f0:user] textbox "Username or email"\n'
+                                      '[f0:password] textbox "Password"\n'
+                                      '[f0:submit] button "Sign In"')
+            return result
+
+    bridge = LoginBridge()
+    script = Script([], [
+        {'calls': [
+            ('browser_act', {'tab': 'tab_1', 'command': {'action': 'fill',
+                'target': {'kind': 'ref', 'ref': 'ref_1'}, 'value': 'fixture-user'}}),
+            ('browser_act', {'tab': 'tab_1', 'command': {'action': 'fill',
+                'target': {'kind': 'ref', 'ref': 'ref_2'}, 'value': 'fixture-secret'}}),
+            ('browser_act', {'tab': 'tab_1', 'command': {'action': 'click',
+                'target': {'kind': 'ref', 'ref': 'ref_3'}}}),
+        ], 'outcome': {'status': 'continue'}},
+        {'calls': [('browser_assert', {'tab': 'tab_1', 'command': {'assertion': 'visible',
+            'locator': {'role': 'button', 'name': 'Sign Out'}}})],
+         'outcome': {'status': 'task_complete', 'final_answer': 'Signed in.'}},
+    ])
+    orchestrator, _, _ = make(script, bridge=bridge, direct=True)
+
+    def navigate():
+        bridge.url = 'http://identity.test/auth'
+        return {'tab': {'url': bridge.url, 'title': 'Login'}}
+
+    def submit_login():
+        bridge.url = 'http://app.test/index.html'
+        return {'whatChanged': {'urlChanged': True}}
+
+    bridge.responses['page.navigate'] = navigate
+    bridge.responses['locator.clickRef'] = submit_login
+    result = await orchestrator.start_task('Login to http://app.test\nUser: fixture-user\nPassword: fixture-secret')
+    assert result.status == 'completed'
+    assert orchestrator.state.counters.total_steps == 2
+    assert result.planner_passes == 0
+    assert not orchestrator.state.pending_changes
+    assert orchestrator.state.unverified_mutations == 0
+
+
+@pytest.mark.parametrize('passed,url,tab', [
+    (False, 'http://app.test/index.html', 'tab_1'),
+    (True, 'http://identity.test/auth', 'tab_1'),
+    (True, 'http://app.test/index.html', 'tab_2'),
+])
+def test_login_checks_survive_failed_wrong_origin_or_other_tab_assertions(passed, url, tab):
+    orchestrator, bridge, _ = ready()
+    state = orchestrator.state
+    state.original_request = 'Login to http://app.test\nUser: fixture-user\nPassword: fixture-secret'
+    bridge.url = 'http://app.test/login'
+    orchestrator.browser.tabs['tab_1'].url = bridge.url
+    state.current_verification = None
+    orchestrator._register_action(action(operation='fill', target='textbox "Username"',
+        expected_value='fixture-user'), True)
+    orchestrator._register_action(action(target='button "Sign In"'), True)
+    if tab == 'tab_2':
+        orchestrator.browser._register({'id': 42, 'url': url})
+    orchestrator.browser.tabs[tab].url = url
+    record = action('browser_assert', 'visible', tab=tab, target='button "Sign Out"',
+                    semantic_success=passed, result_data={'passed': passed})
+    orchestrator._register_action(record, False)
+    assert len(state.pending_changes) == 2
+
+
+def test_successful_login_does_not_clear_unrelated_field_check():
+    orchestrator, bridge, _ = ready()
+    state = orchestrator.state
+    state.original_request = 'Login to http://app.test\nUser: fixture-user\nPassword: fixture-secret'
+    orchestrator.browser.tabs['tab_1'].url = 'http://app.test/login'
+    state.current_verification = None
+    orchestrator._register_action(action(operation='fill', target='textbox "Notes"',
+        expected_value='unrelated change'), True)
+    orchestrator._register_action(action(operation='fill', target='textbox "Username"',
+        expected_value='fixture-user'), True)
+    orchestrator._register_action(action(target='button "Sign In"'), True)
+    orchestrator.browser.tabs['tab_1'].url = 'http://app.test/index.html'
+    orchestrator._register_action(action('browser_assert', 'visible', target='button "Sign Out"',
+        semantic_success=True, result_data={'passed': True}), False)
+    assert len(state.pending_changes) == 1
+    assert next(iter(state.pending_changes.values())).verification.target == 'Notes'
+
+
+def test_oauth_entry_click_carries_login_trust_to_observed_provider():
+    from axis.login import authorized_login_action
+    orchestrator, _, _ = ready()
+    state = orchestrator.state
+    state.original_request = 'Login to http://app.test\nUser: fixture-user\nPassword: fixture-secret'
+    state.current_verification = None
+    orchestrator.browser.tabs['tab_1'].url = 'http://app.test/login'
+    entry = 'link "Enterprise SSO" -> http://app.test/oauth2/authorization/cncc-iam'
+    login = orchestrator._login_intent('tab_1')
+    assert authorized_login_action(login, {'current_url': 'http://app.test/login',
+        'target_type': 'ref', 'target': entry}, 'click')
+    orchestrator._register_action(action(target=entry, result_data={'whatChanged': {
+        'urlChanged': True, 'fromUrl': 'http://app.test/login',
+        'toUrl': 'http://identity.test/auth'}}), True)
+    assert state.login_auth_url == 'http://identity.test/auth'
+    provider = {'current_url': state.login_auth_url, 'target_type': 'ref', 'target': 'textbox "Password"',
+                'arguments': {'command': {'value': 'fixture-secret'}}}
+    assert authorized_login_action(orchestrator._login_intent('tab_1'), provider, 'fill')
+    assert not authorized_login_action(orchestrator._login_intent('tab_2'), provider, 'fill')
+    assert not next(iter(state.pending_changes.values())).login_stage
+    orchestrator._verify_navigation('tab_1', state.login_auth_url, state.next_sequence())
+    assert not state.pending_changes
+
+
+def test_visible_assertion_rejects_guessed_role_before_timeout():
+    from types import SimpleNamespace
+    from pydantic_ai import ModelRetry
+    from axis.agents import AxisDeps, guarded
+    orchestrator, bridge, _ = ready()
+    orchestrator.browser.observations['tab_1'] = SimpleNamespace(refs={'ref_1': (0, 'logout')})
+    orchestrator.browser.ref_descriptions['ref_1'] = 'link "Sign Out" -> /logout'
+    ctx = SimpleNamespace(deps=AxisDeps(browser=orchestrator.browser,
+        gate=StepGate(max_actions=3, remaining_total_actions=3)))
+    command = bt.StateAssertion(assertion='visible', locator=bt.Locator(role='button', name='Sign Out', exact=True))
+    before = list(bridge.calls)
+    with pytest.raises(ModelRetry, match='role link'):
+        guarded(bt.browser_assert)(ctx, tab='tab_1', command=command)
+    assert bridge.calls == before
+
+
+@pytest.mark.anyio
+async def test_explicit_failure_report_terminates_with_pending_changes():
+    script = Script([], [{'calls': [('browser_act', {'tab': 'tab_1', 'command': {
+        'action': 'click', 'target': {'kind': 'ref', 'ref': 'ref_1'}}})],
+        'outcome': {'status': 'failed', 'reason': 'The requested page returned an error.',
+                    'final_answer': 'Stopped at the page error; Save was not attempted.'}}])
+    orchestrator, _, _ = make(script, direct=True)
+    result = await orchestrator.start_task('Click the requested page. If it fails, stop and report what happened.')
+    assert result.status == 'failed'
+    assert result.answer == 'Stopped at the page error; Save was not attempted.'
+    assert orchestrator.state.counters.total_steps == 1
+    assert result.planner_passes == 0
+    assert orchestrator.state.pending_changes
+
+
+def test_bound_application_tab_survives_title_and_route_changes():
+    orchestrator, bridge, _ = ready()
+    state = orchestrator.state
+    state.original_request = 'Use the ACME tab and execute the requested steps.'
+    bridge.title = 'ACME | Home'
+    bridge.url = 'https://console.test/home'
+    first = orchestrator._ensure_tab()
+    bridge.title = 'Loading...'
+    bridge.url = 'https://console.test/settings'
+    bridge.extra_tabs = [{'id': 43, 'title': 'ACME | Other task', 'url': 'https://console.test/other', 'active': True}]
+    assert orchestrator._ensure_tab() == first
+    assert state.bound_application == 'ACME'
+
+
+@pytest.mark.anyio
+async def test_short_clarification_preserves_entire_direct_task():
+    script = Script([], [
+        {'calls': [], 'outcome': {'status': 'ask_user', 'reason': 'Which tab?'}},
+        {'calls': [], 'outcome': {'status': 'failed', 'final_answer': 'Stopped at the specified page error.', 'reason': 'Page error.'}},
+    ])
+    orchestrator, bridge, _ = make(script, direct=True)
+    request = 'Use the ACME tab. First inspect the error page. Then inspect the 17th record and save only if its rule matches.'
+    bridge.title = 'ACME | Home'
+    first = await orchestrator.start_task(request)
+    assert first.status == 'needs_user'
+    old_tab = orchestrator.tab
+    orchestrator.state.direct_navigation_done = True
+    bridge.title = 'Loading...'
+    second = await orchestrator.continue_task('current')
+    assert second.status == 'failed'
+    assert orchestrator.tab == old_tab
+    assert request in script.navigator_prompts[-1]
+    assert 'User updates to this task' in script.navigator_prompts[-1]
+    assert 'current' in script.navigator_prompts[-1]
+    assert orchestrator.state.direct_navigation_done is True
+    assert 'page.navigate' not in bridge.methods

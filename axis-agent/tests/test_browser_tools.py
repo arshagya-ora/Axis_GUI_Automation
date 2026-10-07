@@ -15,7 +15,7 @@ sys.path.insert(0, str(AGENT_DIR))
 import browser_tools as bt  # noqa: E402
 
 
-LEGACY_SHA256 = "88781bc3ca2812b4e06c96672e489517a548c2283e8eb97faee8c1ca4e0a6c19"
+LEGACY_SHA256 = "cb3f8cbcf7dc8da89f596189fd2df88459d6dc9ab88f0daa2389253802e63f1d"
 
 TOOL_FUNCTIONS = (
     bt.browser_tabs,
@@ -457,7 +457,8 @@ def test_debug_telemetry_is_bounded_redacted_and_uses_safe_aliases():
 def test_new_module_is_substantially_smaller_and_legacy_file_is_unchanged():
     legacy = AGENT_DIR / "browser_agent_tools.py"
     new = AGENT_DIR / "browser_tools.py"
-    assert hashlib.sha256(legacy.read_bytes()).hexdigest() == LEGACY_SHA256
+    # Freeze committed source, independent of Windows checkout line endings.
+    assert hashlib.sha256(legacy.read_bytes().replace(b"\r\n", b"\n")).hexdigest() == LEGACY_SHA256
     # The optional visual specialist expands capability without growing the
     # six ordinary tool schemas (bounded separately above).
     assert len(new.read_text(encoding="utf-8").splitlines()) < len(legacy.read_text(encoding="utf-8").splitlines())

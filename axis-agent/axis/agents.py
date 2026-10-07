@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from axis.login import LoginIntent
 
 from pydantic_ai import Agent, InstrumentationSettings, ModelRetry, Tool, ToolFailed, ToolReturn
 from pydantic_ai.capabilities import ToolSearch
@@ -30,7 +31,7 @@ from pydantic_ai.models import Model
 import browser_tools as bt
 from browser_tools import BrowserRuntime
 
-from .models import ActionRecord, AxisConfig, NavigatorOutcome, PlanDecision, clip
+from .models import ActionRecord, AxisConfig, GoalCheck, NavigatorOutcome, PlanDecision, clip
 
 # Pydantic AI emits model, tool, retry, and run spans through OpenTelemetry.
 # Browser/page content and Oracle prompts are deliberately excluded; operators
@@ -76,7 +77,9 @@ RECOVERY_POLICY = {
     "TAB_NOT_FOUND": "reconcile_tab",
     "TAB_CLOSED": "reconcile_tab",
     "INVALID_ARGUMENT": "model_retry",
-    "ASSERTION_FAILED": "replan",
+    "ASSERTION_FAILED": "inspect_result",
+    "FRAME_TARGET_AMBIGUOUS": "scope_frame",
+    "FRAME_GEOMETRY_UNAVAILABLE": "inspect_frame",
     "APPROVAL_DENIED": "replan",
     "POLICY_DENIED": "stop_retry",
     "FIREWALL_DENIED": "stop_retry",
@@ -198,14 +201,17 @@ class StepGate:
     max_actions: int
     remaining_total_actions: int
     approval_actions: frozenset[str] = frozenset()
+    login_intent: LoginIntent | None = None
     approval: Callable[[str, str | None, dict[str, Any]], bool] | None = None
     effect_authorizer: Callable[[str, str | None, dict[str, Any]], bool] | None = None
     forbidden_actions: frozenset[str] = frozenset()
     mutation_allowed: bool = True
+    uncertain_tabs: frozenset[str] = frozenset()
     is_paused: Callable[[], bool] = lambda: False
     is_cancelled: Callable[[], bool] = lambda: False
     on_action: Callable[[ActionRecord, int], None] | None = None
     on_record: Callable[[ActionRecord, bool], None] | None = None
+    on_dispatch: Callable[[], None] | None = None
     # Called for a call the gate refused before it ever reached the bridge
     # (budget, interruption, pause/cancel, denied approval) — never stored in
     # bounded TaskMemory, but essential for tracing a step's root cause.
@@ -230,11 +236,36 @@ class StepGate:
     committed: bool = False
     lock: Any = field(default_factory=RLock, repr=False)
     in_flight: tuple[str, dict[str, Any], float] | None = None
+    action_postcondition: Any = None
+    authorized_origins: dict[str, list[str]] | None = None
+    tool_ms: int = 0
+    authorization_ms: int = 0
+    preflight_ms: int = 0
+    assertion_ms: int = 0
+    timing_depth: int = 0
 
     def _interrupt(self, reason: str) -> None:
         if not self.interrupted:
             self.interrupted = True
             self.interrupt_reason = reason
+
+    def _safe_args(self, kwargs: dict[str, Any]) -> str | None:
+        return _describe_args(kwargs)
+
+    def reject(self, tool, kwargs, code, message):
+        """Record pre-dispatch failure without manufacturing a page mutation."""
+        operation = _command_operation(kwargs)
+        tab = kwargs.get('tab') or getattr(kwargs.get('command'), 'tab', None)
+        args = self._safe_args(kwargs)
+        self.records.append(ActionRecord(tool=tool, tab=tab, operation=operation, args=args,
+            executed=False, execution_success=False, semantic_success=False,
+            code=code, message=message, retain_in_memory=True))
+        self.effects.append((False, False))
+        self.refusals += 1
+        self._interrupt(message)
+        if self.on_refusal is not None:
+            self.on_refusal(tool, operation, code, message, args)
+        return _refusal(tab, code, message)
 
     def check(
         self, tool: str, kwargs: dict[str, Any], approval_detail: dict[str, Any] | None = None,
@@ -242,20 +273,10 @@ class StepGate:
         """Return a refusal envelope if this call must not reach the bridge."""
         tab = kwargs.get("tab")
         operation = _command_operation(kwargs)
-        args = _describe_args(kwargs)
+        args = self._safe_args(kwargs)
 
         def refuse(code: str, message: str) -> dict[str, Any]:
-            record = ActionRecord(
-                tool=tool, tab=tab if isinstance(tab, str) else None, operation=operation, args=args, executed=False,
-                execution_success=False, semantic_success=False, code=code, message=message,
-                retain_in_memory=True,
-            )
-            self.records.append(record)
-            self.effects.append((False, False))
-            self.refusals += 1
-            if self.on_refusal is not None:
-                self.on_refusal(tool, operation, code, message, args)
-            return _refusal(tab, code, message)
+            return self.reject(tool, kwargs, code, message)
 
         if self.is_cancelled():
             self.stopped = "cancelled"
@@ -281,6 +302,9 @@ class StepGate:
             self._interrupt("the total browser action budget was reached")
             return refuse("ACTION_BUDGET_EXHAUSTED", "The run's browser action budget is exhausted.")
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
+        if mutating and tab in self.uncertain_tabs:
+            self._interrupt("an earlier operation on this tab has an unknown outcome")
+            return refuse("OUTCOME_UNVERIFIED", "Inspect and verify the previous outcome before another change; do not replay the submission.")
         target_text = str((approval_detail or {}).get("target") or "").lower()
         patterns = {
             "download": r"\bdownload\b|source code.*(?:zip|tar)|\.(?:zip|tar|gz|exe|msi|csv|xlsx)(?:\b|$)|/archive/refs/",
@@ -302,14 +326,20 @@ class StepGate:
             self.non_retryable = True
             self._interrupt(f"the task forbids {forbidden!r}")
             return refuse("POLICY_DENIED", f"The current task explicitly forbids {forbidden!r}.")
-        if mutating and not self.mutation_allowed:
+        if mutating and not self.mutation_allowed and not (tool == 'browser_navigate' or (operation == 'click' and re.match(r'^link\b', target_text) and not re.search(r'logout|log out|delete|purchase|checkout|submit|download', target_text))):
             self.non_retryable = True
             self._interrupt("the task is read-only")
             return refuse("POLICY_DENIED", "The current task does not allow page mutations.")
         if self.effect_authorizer is not None:
-            if not self.effect_authorizer(tool, operation, {**(approval_detail or {}),
+            authorization_started = time.perf_counter()
+            try:
+                authorized = self.effect_authorizer(tool, operation, {**(approval_detail or {}),
                     'mandatory_approval': operation in self.approval_actions,
-                    'arguments': {key: value.model_dump(mode='json') if hasattr(value, 'model_dump') else value for key, value in kwargs.items()}}):
+                    'read_only': not self.mutation_allowed,
+                    'arguments': {key: value.model_dump(mode='json') if hasattr(value, 'model_dump') else value for key, value in kwargs.items()}})
+            finally:
+                self.authorization_ms += int((time.perf_counter() - authorization_started) * 1000)
+            if not authorized:
                 self.stopped = 'paused'
                 self._interrupt('the action requires authorization')
                 return refuse('APPROVAL_DENIED', 'Action not authorized; the task is paused.')
@@ -317,7 +347,7 @@ class StepGate:
                 self.stopped = 'cancelled' if self.is_cancelled() else 'paused'
                 return refuse('RUN_PAUSED', 'The task changed while approval was pending.')
         if operation in self.approval_actions and self.effect_authorizer is None:
-            approved = True
+            approved = False
             if self.approval is not None:
                 approved = bool(self.approval(tool, operation, approval_detail or {"tab": tab}))
             if not approved:
@@ -420,7 +450,7 @@ class StepGate:
                 result.get("tab") if tool == "browser_tabs" else None,
             operation=operation,
             upload_files=list(getattr(kwargs.get('command'), 'files', [])) if operation == 'upload' else [],
-            args=_describe_args(kwargs),
+            args=self._safe_args(kwargs),
             executed=True,
             execution_success=execution_success,
             semantic_success=semantic_success,
@@ -429,6 +459,7 @@ class StepGate:
                 error.get("message") or ("The assertion did not match the current page." if semantic_success is False else None)
             ),
             extracted_data=_extracted(tool, data) if success else None,
+            duration_ms=duration_ms,
             refs_invalidated=refs_invalidated,
             meaningful_change=meaningful_change,
             result_data=data,
@@ -443,7 +474,13 @@ class StepGate:
             ),
         )
         command = kwargs.get("command")
-        record.expected_value = getattr(command, "value", None)
+        expected_value = getattr(command, "value", None)
+        if isinstance(command, bt.Check):
+            expected_value = command.action == "check"
+        elif isinstance(command, bt.Select) and len(command.options) == 1:
+            selected = (data.get("result") or {}).get("selected") or []
+            expected_value = selected[0].get("value") if len(selected) == 1 else command.options[0]
+        record.expected_value = expected_value
         record.key = getattr(command, "key", None)
         locator = getattr(command, "locator", None) or kwargs.get("locator")
         if locator is not None:
@@ -456,6 +493,13 @@ class StepGate:
         else:
             target = getattr(command, "target", None)
             record.target = target.model_dump_json(exclude_none=True) if target is not None else operation
+        if tool == "browser_act" and self.action_postcondition is not None:
+            check = self.action_postcondition
+            locator = getattr(check, "locator", None)
+            target = next((getattr(locator, key, None) for key in ("name", "label", "text", "placeholder", "selector", "role") if getattr(locator, key, None)), None)
+            if check.assertion in {"text", "value", "checked", "title", "url", "visible", "hidden", "enabled", "disabled", "count"}:
+                record.postcondition_locator = locator.model_dump(exclude_none=True) if locator else None
+                record.postcondition = GoalCheck(assertion=check.assertion, expected=getattr(check, "expected", None), target=target)
         if self.on_record is not None:
             self.on_record(record, mutated)
             if record.evidence_id and isinstance(result.get("data"), dict):
@@ -469,6 +513,8 @@ class StepGate:
                     earlier.recovered = True
         self.actions_used += 1
         self.browser_ms += duration_ms
+        if tool == "browser_assert":
+            self.assertion_ms += duration_ms
         if self.on_action is not None:
             self.on_action(record, duration_ms)
         if tool == "browser_visual" and operation != "capture" and success:
@@ -488,12 +534,61 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
         ctx = args[0] if args else kwargs.pop("ctx")
         rest = args[1:]
         deps: AxisDeps = ctx.deps
+        if function is bt.browser_act:
+            command = kwargs.get("command")
+            postcondition = kwargs.pop("postcondition", None)
+            if isinstance(command, bt.ActionBatch):
+                results = []
+                for step in command.steps:
+                    if deps.gate.interrupted:
+                        break
+                    result = wrapper(ctx, *rest, **{**kwargs, "command": step.command, "postcondition": step.postcondition})
+                    results.append(result)
+                    if not result.get("ok"):
+                        break
+                complete = len(results) == len(command.steps) and all(result.get("ok") for result in results)
+                return {"ok": complete, "tab": kwargs.get("tab", rest[0] if rest else None),
+                        "data": {"results": results, "completed": len(results), "stopped": deps.gate.interrupt_reason},
+                        "error": None if complete else {"code": "BATCH_STOPPED", "message": deps.gate.interrupt_reason or "An action or postcondition failed."}}
+            if postcondition is not None:
+                # Never commit a change when its paired check cannot fit.
+                available = min(deps.gate.max_actions, deps.gate.remaining_total_actions) - deps.gate.actions_used
+                if available < 2:
+                    deps.gate._interrupt('the next complete action and check require two remaining calls')
+                    return _refusal(kwargs.get('tab'), 'ACTION_BUDGET_EXHAUSTED',
+                                    'Yield before this operation; neither the action nor its check executed.')
+                if isinstance(command, bt.Fill) and postcondition.assertion == "value" and postcondition.expected != command.value:
+                    raise ModelRetry("A fill postcondition must verify the requested value.")
+                if isinstance(command, bt.Check) and postcondition.assertion == "checked" and postcondition.expected != (command.action == "check"):
+                    raise ModelRetry("The postcondition must match the requested checked state.")
+                action_locator = getattr(getattr(command, "target", None), "locator", None) or getattr(command, "locator", None)
+                if postcondition.assertion in {"value", "checked"} and action_locator is not None and action_locator != postcondition.locator:
+                    raise ModelRetry("Use the same scoped locator for the action and its field postcondition.")
+                deps.gate.action_postcondition = postcondition.as_assertion()
+                try:
+                    result = wrapper(ctx, *rest, **kwargs)
+                finally:
+                    deps.gate.action_postcondition = None
+                if not result.get("ok") or deps.gate.interrupted:
+                    return {**result, "data": {**(result.get("data") or {}), "postconditionSkipped": True}}
+                check = guarded(bt.browser_assert)(ctx, tab=kwargs.get("tab", rest[0] if rest else None), command=postcondition.as_assertion())
+                passed = bool(check.get("ok") and (check.get("data") or {}).get("passed"))
+                return {**result, "ok": passed, "data": {**(result.get("data") or {}), "postcondition": check},
+                        "error": None if passed else check.get("error") or {"code": "ASSERTION_FAILED", "message": "Postcondition failed."}}
+        preflight_started = time.perf_counter()
+        previous_authorization_ms = deps.gate.authorization_ms
         named = dict(kwargs)
         # `tab` is the only positional the tools take after ctx.
         if rest:
             named.setdefault("tab", rest[0])
-        tab = named.get("tab")
         command = named.get("command")
+        tab = named.get("tab") or getattr(command, "tab", None)
+        if (function.__name__ == 'browser_assert' and deps.gate.login_intent
+                and isinstance(command, bt.StateAssertion) and command.assertion == 'hidden'
+                and command.timeout_ms > 3_000):
+            command = command.model_copy(update={'timeout_ms': 3_000})
+            kwargs['command'] = command
+            named['command'] = command
         if isinstance(command, bt.Upload) and deps.documents:
             try:
                 resolved = deps.documents.resolve_uploads(command.files)
@@ -503,6 +598,19 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             kwargs['command'] = command
             # Keep attachment IDs in model-visible action history. Only the
             # browser executor receives the resolved filesystem paths.
+        if (function.__name__ == 'browser_assert' and isinstance(command, bt.StateAssertion)
+                and command.assertion == 'visible' and command.locator.role and command.locator.name):
+            observation = deps.browser.observations.get(tab)
+            matches = []
+            if observation:
+                for ref in observation.refs:
+                    description = deps.browser.describe_ref(ref) or ''
+                    match = re.match(r'^([\w-]+)\s+"([^"]+)"', description)
+                    if match and match.group(2).casefold() == command.locator.name.casefold():
+                        matches.append(match.group(1))
+            if len(matches) == 1 and matches[0] != command.locator.role:
+                raise ModelRetry('The fresh snapshot identifies this name with role ' + matches[0]
+                                 + '. Use its observed semantic role instead of guessing from appearance.')
         target = getattr(command, "target", None)
         target_type = getattr(target, "kind", None)
         target_text = getattr(command, "url", None)
@@ -523,6 +631,10 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
                 (value for value in (locator.name, locator.label, locator.text, locator.placeholder, locator.selector) if value),
                 None,
             )
+        if isinstance(command, bt.Press) and not target_text:
+            previous = next((r for r in reversed(deps.gate.records) if r.tab == tab and r.success and r.operation == 'fill'), None)
+            if previous:
+                target_text, target_type = previous.target, 'ref'
         current_url = deps.browser.tabs[tab].url if tab in deps.browser.tabs else None
         detail = {
             "tab": tab,
@@ -535,12 +647,23 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             "expected_effect": _command_operation(named),
             "reason": "This action is configured to require user approval.",
         }
+        if function.__name__ == 'browser_visual' and _command_operation(named) != 'capture':
+            screenshot = deps.browser._visual_screenshot
+            if screenshot and screenshot.tab == tab and screenshot.alias == getattr(command, 'screenshot', None):
+                detail['target_type'] = 'visual'
+                detail['target'] = 'current screenshot interaction'
+        if deps.gate.authorized_origins is not None:
+            detail["authorized_origins"] = deps.gate.authorized_origins.get(tab, [])
         if isinstance(detail["origin"], list):
             detail["origin"] = "/".join(detail["origin"])
         effect_locator = None
         if deps.gate.effect_authorizer and target_type == 'locator' and function.__name__ == 'browser_act' and _command_operation(named) not in {'hover', 'scroll'}:
             effect_locator = getattr(target, 'locator', None) or getattr(command, 'locator', None)
-            detail['observed_target'] = _observed_effect_target(deps.browser, tab, effect_locator)
+            try:
+                detail['observed_target'] = _observed_effect_target(deps.browser, tab, effect_locator)
+            except (ToolFailed, bt.ToolFault) as error:
+                code = getattr(error, 'code', 'LOCATOR_STRICT_MODE_VIOLATION')
+                return deps.gate.reject(function.__name__, named, code, str(error))
             observed = detail['observed_target']
             detail['target'] = ' '.join(str(observed.get(key) or '') for key in ('role', 'accessibleName', 'ariaLabel', 'text', 'name', 'type')).strip()
         refusal = deps.gate.check(function.__name__, named, detail)
@@ -551,24 +674,32 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             return refusal
         if deps.gate.effect_authorizer is not None and tab and function.__name__ in {'browser_act', 'browser_visual'} and _command_operation(named) not in {'capture', 'scroll', 'hover'}:
             deps.browser.reconcile_tabs()
-            if deps.browser.tab(tab).url != current_url:
+            try:
+                live_url = deps.browser.tab(tab).url
+            except bt.ToolFault as error:
+                return deps.gate.reject(function.__name__, named, error.code, str(error))
+            if live_url != current_url:
                 deps.gate._interrupt('the destination changed while authorizing the action')
-                return _refusal(tab, 'STALE_STATE', 'The destination changed. Observe the current page and request a fresh approval.')
+                return deps.gate.reject(function.__name__, named, 'STALE_STATE', 'The destination changed. Observe the current page before continuing.')
             if effect_locator and _observed_effect_target(deps.browser, tab, effect_locator) != detail['observed_target']:
                 deps.gate._interrupt('the observed target changed while authorizing the action')
-                return _refusal(tab, 'STALE_STATE', 'The target changed. Observe the page and request a fresh approval.')
+                return deps.gate.reject(function.__name__, named, 'STALE_STATE', 'The target changed. Observe the page before continuing.')
             if isinstance(command, bt.Upload) and deps.documents:
                 try:
                     deps.documents.resolve_uploads(named['command'].files)
                 except ValueError as error:
                     deps.gate._interrupt(str(error))
-                    return _refusal(tab, 'UPLOAD_DENIED', str(error))
+                    return deps.gate.reject(function.__name__, named, 'UPLOAD_DENIED', str(error))
+        deps.gate.preflight_ms += max(0, int((time.perf_counter() - preflight_started) * 1000)
+                                      - (deps.gate.authorization_ms - previous_authorization_ms))
         browser_ctx = dataclasses.replace(ctx, deps=deps.browser)
         started = time.perf_counter()
         with deps.gate.lock:
             if deps.gate.committed:
                 return _refusal(tab, "RUN_CANCELLED", "The step ended before this call could execute.")
             deps.gate.in_flight = (function.__name__, named, started)
+        if deps.gate.on_dispatch is not None:
+            deps.gate.on_dispatch()
         result = function(browser_ctx, *rest, **kwargs)
         duration_ms = int((time.perf_counter() - started) * 1000)
         record = deps.gate.record(function.__name__, named, result, duration_ms)
@@ -589,7 +720,20 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             raise ToolFailed(record.error or "This browser operation cannot be retried.")
         return result
 
-    return wrapper
+    @functools.wraps(wrapper)
+    def timed(*args, **kwargs):
+        ctx = args[0] if args else kwargs.get('ctx')
+        started = time.perf_counter()
+        gate = ctx.deps.gate
+        gate.timing_depth += 1
+        try:
+            return wrapper(*args, **kwargs)
+        finally:
+            gate.timing_depth -= 1
+            if gate.timing_depth == 0:
+                gate.tool_ms += int((time.perf_counter() - started) * 1000)
+
+    return timed
 
 
 def validate_browser_args(function: Callable[..., Any]) -> Callable[..., None]:

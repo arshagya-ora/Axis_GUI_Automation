@@ -41,3 +41,31 @@ The optional `--judge` constructs an LLM judge using the configured AXIS model
 and writes its Pydantic Evals report to `pydantic-evals.json`. The judge does not
 replace deterministic checks. Screenshots and image bytes are removed from all
 persisted reports. No model judge is constructed during an ordinary run.
+
+Reports also include planner calls, time to first browser action, p50/p95
+latency, repeated unchanged observations/actions/assertions, and calls during
+local recovery. Repetition counts identify candidates for review; a repeated
+observation during a legitimate asynchronous wait can still be necessary.
+First-attempt target accuracy is reported only for fixtures with a known target
+ID and an attributable first action; unavailable target evidence is excluded.
+Verification accuracy is assessed with independent fixture state and false
+completion counts.
+
+For a matched Codex comparison, run the same fixture cases with identical user
+prompts, initial pages, permissions, action budgets, and independent outcome
+checks. Reset each case between agents, alternate run order, and keep model
+requests, first-action time, success rate and p50/p95 latency separate. Codex's
+internal planner request count may be unavailable; report that as unavailable,
+rather than zero. Use at least three repetitions per case for a smoke comparison
+and more repetitions before drawing conclusions about p95 latency.
+
+The one-response read and two-response stable form regressions use scripted
+FunctionModel responses. They prove orchestration request counts, not provider
+latency or model judgment. Live comparisons require the configured AXIS provider
+and a Codex browser session; do not claim parity from scripted runs.
+
+The `autonomous_enterprise` fixture exercises ordered error inspection, title changes,
+a delayed scrollable table with repeated Edit labels and row-header cells, selecting
+the 17th row, and conditional Save. Its server records action order and saved values
+independently of the agent report. Run it with `python -m evals.run --case autonomous_enterprise --repeat 3`
+(using the existing bridge and provider configuration).

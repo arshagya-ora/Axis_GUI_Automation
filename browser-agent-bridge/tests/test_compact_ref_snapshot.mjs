@@ -8,7 +8,7 @@ async function importPageModule() {
   return import(dataUrl);
 }
 
-function makeHandlers(nodes) {
+function makeHandlers(nodes, { frames = [], frameNodes = {}, messages = [] } = {}) {
   const tree = {
     url: 'https://example.test/',
     title: 'Form',
@@ -38,8 +38,16 @@ function makeHandlers(nodes) {
     dialogsByTab: new Map(),
     defaultTimeoutMs: 30,
     chromeApi: {
-      tabs: { async sendMessage() { return { ok: true, tree: structuredClone(tree) }; } },
-      webNavigation: { async getAllFrames() { return [{ frameId: 0, url: tree.url }]; } }
+      tabs: { async sendMessage(_, message, options) {
+        messages.push(message);
+        const result = structuredClone(tree);
+        if (options.frameId) {
+          result.frameId = options.frameId;
+          result.nodes = (frameNodes[options.frameId] || []).map(node => ({ ...node, frameId: options.frameId }));
+        }
+        return { ok: true, tree: result };
+      } },
+      webNavigation: { async getAllFrames() { return [{ frameId: 0, url: tree.url }, ...frames]; } }
     }
   }));
 }
@@ -55,10 +63,10 @@ test('format:compact renders a terse ref-tagged snapshot, no verbose nodes', asy
   const handlers = await makeHandlers(NODES);
   const res = await handlers.pageAccessibilityTree({ tabId: 1, format: 'compact' });
   assert.equal(res.snapshot, [
-    '  Billing',
     '[f0:ref_2] textbox "Email" ="a@b.com" type=email [focused]',
     '[f0:ref_3] checkbox "Subscribe" [checked]',
-    '[f0:ref_4] link "Home" -> https://x/'
+    '[f0:ref_4] link "Home" -> https://x/',
+    '  Billing'
   ].join('\n'));
   assert.equal(res.nodeCount, 4);
   assert.equal(res.snapshotId, 'snap_1');
@@ -118,7 +126,7 @@ test('action resolvers automatically parse f{frameId}:{ref} prefix format', asyn
       target: { tabId, frameIds: [params.frameId] },
       frameId: params.frameId,
       frame: { frameId: params.frameId },
-      frameOffset: null
+      frameOffset: { x: 0, y: 0 }
     }),
     ensureContentScripts: async () => {},
     chromeApi: {
@@ -129,7 +137,7 @@ test('action resolvers automatically parse f{frameId}:{ref} prefix format', asyn
           return {
             ok: true,
             target: {
-              element: { clickPoint: { x: 5, y: 6 } },
+              element: { clickPoint: { x: 5, y: 6 }, rect: { x: 0, y: 0, width: 10, height: 12 } },
               actionability: { actionable: true }
             }
           };
@@ -191,4 +199,32 @@ test('locatorSelectOptionRef automatically parses f{frameId}:{ref} prefix format
   assert.equal(res.ok, true);
   assert.equal(sentFrameId, 12);
   assert.equal(sentMessage.ref, 'ref_88');
+});
+
+test('snapshot budget retains complete controls with context and bounded values', async () => {
+  const handlers = await makeHandlers([
+    { ref: 'ref_1', frameId: 0, tag: 'p', text: 'z'.repeat(1000) },
+    { ref: 'ref_2', frameId: 0, tag: 'input', role: 'textbox', name: 'Notes', value: 'x'.repeat(20000), context: 'dialog Profile' },
+    { ref: 'ref_3', frameId: 0, tag: 'button', role: 'button', name: 'Save', disabled: true, context: 'dialog Profile' }
+  ]);
+  const result = await handlers.pageAccessibilityTree({ tabId: 1, format: 'compact', maxChars: 800 });
+  assert.ok(result.snapshot.length <= 800);
+  assert.match(result.snapshot, /textbox "Notes".*\[value-truncated\].*context="dialog Profile"/);
+  assert.match(result.snapshot, /button "Save".*\[disabled=true\]/);
+  assert.equal(result.truncated, true);
+});
+
+test('frame collection uses actual IDs once even when URLs are identical', async () => {
+  const messages = [];
+  const frames = [{ frameId: 7, url: 'https://embed.test/' },
+    { frameId: 8, url: 'https://embed.test/' }, { frameId: 7, url: 'https://embed.test/' }];
+  const nodes = [{ ref: 'ref_1', role: 'button', name: 'Save' }];
+  const handlers = await makeHandlers(nodes, { frames, messages,
+    frameNodes: { 7: nodes, 8: nodes } });
+  const result = await handlers.pageAccessibilityTree({ tabId: 1, format: 'compact' });
+  assert.equal(result.nodeCount, 3);
+  for (const frameId of [0, 7, 8]) {
+    assert.equal(messages.filter(message => message.frameId === frameId).length, 1);
+    assert.match(result.snapshot, new RegExp('\\[f' + frameId + ':ref_1\\]'));
+  }
 });

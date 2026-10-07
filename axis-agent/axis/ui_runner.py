@@ -52,6 +52,7 @@ def public_activity(event: AxisEvent) -> str | None:
             return f"Document issue ({detail.get('attempt', 1)}/3): {str(detail.get('error', 'Document operation failed'))[:600]}"
         return {'document_read': 'Read attachment or updated workflow progress',
                 'planner_started': 'Planning the next step', 'navigator_step_started': 'Working in the browser',
+                'action_started': 'Executing browser operation',
                 'observed': 'Read browser context', 'tab_selected': 'Selected a browser tab',
                 'tab_create': 'Opened a browser tab', 'vision_unavailable': 'Visual input unavailable'}.get(detail.get('phase'))
     return None  # final results are persisted authoritatively after the runner returns
@@ -166,7 +167,7 @@ class Runner:
                     if source['conversation_id'] != conversation_id:
                         raise ServiceError('invalid_input', 'Saved context must belong to this conversation.', 422)
                     outcome = (source.get('result') or {}).get('answer') or source.get('current_activity', '')
-                    if source['status'] in {'cancelled', 'interrupted'}:
+                    if source['status'] in {'failed', 'cancelled', 'interrupted'}:
                         original = source.get('instruction')
                         if not original:
                             row = self.store.db.execute("SELECT text FROM messages WHERE task_id=? AND intent='new_task' ORDER BY ordinal LIMIT 1", (source['id'],)).fetchone()
@@ -191,6 +192,8 @@ class Runner:
                                     row['evidence'], row['verification']))
                         task['attachment_uses'] = source.get('attachment_uses', {})
                         task['instruction'] = instruction
+                        if source.get('browser_checkpoint'):
+                            task['browser_checkpoint'] = source['browser_checkpoint']
                         self.store.save_task(task)
                         outcome = ''
                     available = max(0, 4000-len(instruction)-60)
@@ -275,7 +278,7 @@ class Runner:
     def control(self, task_id, action):
         with self.lock, self.store.lock:
             task = self.store.task(task_id)
-            recoverable = task.get('document_checkpoint') or task.get('workflow', {}).get('counts')
+            recoverable = task.get('browser_checkpoint') or task.get('document_checkpoint') or task.get('workflow', {}).get('counts')
             if action == 'resume' and recoverable and (task['status'] == 'interrupted' or
                     (task['status'] == 'failed' and task.get('result', {}).get('recoverable'))):
                 if self.active_id:
@@ -354,6 +357,10 @@ class Runner:
                     task['current_activity'] = text
                 task['updated_at'] = time.time()
                 if state:
+                    if hasattr(self.orchestrator, 'checkpoint_browser'):
+                        checkpoint = self.orchestrator.checkpoint_browser()
+                        if checkpoint:
+                            task['browser_checkpoint'] = checkpoint
                     task['counters'] = {key: getattr(state.counters, key) for key in ('browser_actions', 'total_steps')}
                     task['counters']['model_requests'] = int(state.usage.requests)
                     if self.attachments and getattr(self.orchestrator, 'documents', None):
@@ -368,6 +375,10 @@ class Runner:
                         timings['navigator_ms'] += int(duration)
                     elif event.kind == 'browser_action':
                         timings['browser_ms'] += int(duration)
+                        if event.detail.get('tool') == 'browser_assert':
+                            timings['assertion_ms'] = timings.get('assertion_ms', 0) + int(duration)
+                    elif event.kind == 'status' and event.detail.get('phase') == 'observed':
+                        timings['observation_ms'] = timings.get('observation_ms', 0) + int(duration)
                     browser = state.last_browser_state
                     if browser:
                         task['browser_context'] = {'tab': browser.tab, 'title': (browser.title or 'Browser tab')[:200]}
@@ -383,6 +394,7 @@ class Runner:
                 self.orchestrator = self.factory(config, on_event=self._event)
                 self.orchestrator.effect_authorizer = self.approvals.authorize
                 self.orchestrator.execution_mode = self.store.task(task_id).get('execution_mode', 'automatic')
+                self.orchestrator.browser_checkpoint = self.store.task(task_id).get('browser_checkpoint')
                 self.orchestrator.approval = lambda tool, operation, detail: self.approvals.authorize(tool, operation, detail, mandatory=True)
                 if self.attachments and self.attachments.catalog(task_id):
                     self._attach_documents(task_id)
@@ -485,6 +497,10 @@ class Runner:
             task['workflow'] = self.orchestrator.documents.workflow()
             task['document_coverage'] = self.orchestrator.documents.coverage()
         if state:
+            if hasattr(self.orchestrator, 'checkpoint_browser'):
+                checkpoint = self.orchestrator.checkpoint_browser()
+                if checkpoint:
+                    task['browser_checkpoint'] = checkpoint
             outputs = [item for item in state.evidence if item.kind in {'screenshot', 'download'}]
             outputs += state.downloads
             task['artifacts'] = [{'label': item.detail[:600], 'kind': item.kind} for item in outputs[-6:]]

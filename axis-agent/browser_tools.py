@@ -31,6 +31,7 @@ ScrollDelta = Annotated[float, Field(ge=-5_000, le=5_000)]
 NonEmpty = Annotated[str, Field(min_length=1)]
 
 MAX_TEXT = 20_000
+SNAPSHOT_MAX_CHARS = 12_000
 MAX_BODY = 4_000
 MAX_ITEMS = 200
 MAX_DEPTH = 8
@@ -430,6 +431,45 @@ AssertCommand = Annotated[
     StateAssertion | ValueAssertion | TextAssertion | CountAssertion |
     AttributeAssertion | TitleAssertion | AriaAssertion | URLAssertion,
     Field(discriminator="assertion"),
+]
+
+
+class Postcondition(Command):
+    assertion: Literal["value", "checked", "text", "visible", "hidden", "enabled", "disabled", "title", "url"]
+    expected: str | bool = True
+    locator: Locator | None = None
+    timeout_ms: Timeout = DEFAULT_ACTION_TIMEOUT_MS
+
+    @model_validator(mode="after")
+    def _valid(self):
+        self.as_assertion()
+        return self
+
+    def as_assertion(self) -> AssertCommand:
+        data = self.model_dump(exclude_none=True)
+        if self.assertion in {"title", "url"}:
+            data.pop("locator", None)
+            return (TitleAssertion if self.assertion == "title" else URLAssertion)(**data)
+        if self.assertion == "value":
+            return ValueAssertion(**data)
+        if self.assertion == "text":
+            return TextAssertion(**data)
+        return StateAssertion(**data)
+
+
+class ActionStep(Command):
+    command: Annotated[Click | Fill | Select | Check, Field(discriminator="action")]
+    postcondition: Postcondition | None = None
+
+
+class ActionBatch(Command):
+    action: Literal["batch"]
+    steps: list[ActionStep] = Field(min_length=1, max_length=6)
+
+
+BrowserActCommand = Annotated[
+    Click | Fill | Press | Hover | Select | Check | TypeSequentially | Upload | Scroll | Drag | Focus | DialogAction | ActionBatch,
+    Field(discriminator="action"),
 ]
 
 
@@ -937,10 +977,18 @@ class BrowserRuntime:
             lines.append(f"[{alias}]{match.group(3)}")
         if refs and not snapshot_id:
             raise ToolFault("BRIDGE_ERROR", "The bridge returned refs without a usable snapshot.")
-        public_snapshot = "\n".join(lines)
-        truncated = len(public_snapshot) > MAX_TEXT
+        retained, size = [], 0
+        for line in lines:
+            if size + len(line) + bool(retained) > SNAPSHOT_MAX_CHARS:
+                continue
+            size += len(line) + bool(retained)
+            retained.append(line)
+        public_snapshot = "\n".join(retained)
+        visible_refs = set(re.findall(r"\[(ref_\d+)\]", public_snapshot))
+        refs = {alias: value for alias, value in refs.items() if alias in visible_refs}
+        truncated = len(retained) < len(lines)
         self.observations[tab] = Observation(snapshot_id, refs)
-        return public_snapshot[:MAX_TEXT], truncated
+        return public_snapshot, truncated
 
     def observe(
         self,
@@ -960,14 +1008,14 @@ class BrowserRuntime:
         methods = {"compact": "page.accessibilityTree", "aria": "page.ariaSnapshot", "text": "page.readText"}
         params: dict[str, Any] = {"tabId": state.raw_id}
         if mode == "compact":
-            params.update(format="compact", maxNodes=max_nodes)
+            params.update(format="compact", maxNodes=max_nodes, maxChars=SNAPSHOT_MAX_CHARS)
         result = self._rpc(methods[mode], params, tab=tab) or {}
         self.observations.pop(tab, None)
         if mode == "compact":
             snapshot, truncated = self.observe_refs(tab, result.get("snapshot", ""), result.get("snapshotId"))
         else:
             raw = result.get("snapshot", "") if mode == "aria" else result.get("text", "")
-            snapshot, truncated = raw[:MAX_TEXT], len(raw) > MAX_TEXT
+            snapshot, truncated = raw[:SNAPSHOT_MAX_CHARS], len(raw) > SNAPSHOT_MAX_CHARS
         state.url = result.get("url", state.url)
         state.title = result.get("title", state.title)
         data: dict[str, Any] = {
@@ -1332,8 +1380,10 @@ def _act_target(rt: BrowserRuntime, tab: str, target: Target, command: Any) -> t
     return locator_methods[action], params
 
 
-def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: ActCommand) -> dict[str, Any]:
-    """Perform exactly one typed interaction in a tab."""
+def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: BrowserActCommand, postcondition: Postcondition | None = None) -> dict[str, Any]:
+    """Act, verify a result, or run up to six ordered form actions through existing guards."""
+    if isinstance(command, ActionBatch) or postcondition is not None:
+        return _error(tab, ToolFault("INVALID_ARGUMENT", "Composed actions require the guarded AXIS executor."))
     rt = ctx.deps
     try:
         state = rt.tab(tab)
@@ -1364,7 +1414,7 @@ def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: ActComm
         elif isinstance(command, Upload):
             method = "locator.setInputFiles"
             params = {
-                "tabId": state.raw_id, **_action_locator_params(command.locator),
+                "tabId": state.raw_id, **_locator_params(command.locator),
                 "files": rt.validated_files(command.files), "timeoutMs": command.timeout_ms,
                 "index": 0, "strict": True,
             }
@@ -1390,6 +1440,8 @@ def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: ActComm
                 params["promptText"] = command.prompt_text
         if rt.forbidden_actions:
             params["forbiddenActions"] = sorted(rt.forbidden_actions)
+        if getattr(rt, "read_only", False):
+            params["readOnly"] = True
         rt.invalidate_visual(tab)
         result = rt._rpc(method, params, tab=tab) or {}
         changed, popup_aliases = _public_action_change(rt, result.get("whatChanged"))

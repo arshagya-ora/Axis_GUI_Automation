@@ -34,7 +34,7 @@ export function createDomHandlers({
             role: element.getAttribute('role') || '',
             type: element.getAttribute('type') || '',
             text: (element.innerText || element.textContent || '').trim().slice(0, 500),
-            value: 'value' in element ? String(element.value).slice(0, 500) : '',
+            value: (element.getAttribute('type') || '').toLowerCase() === 'password' ? undefined : 'value' in element ? String(element.value).slice(0, 500) : '',
             ariaLabel: element.getAttribute('aria-label') || '',
             href: element.href || '',
             disabled: Boolean(element.disabled),
@@ -756,7 +756,7 @@ export function createDomHandlers({
             return {
               tagName: element.tagName.toLowerCase(),
               text: (element.innerText || element.textContent || '').trim().slice(0, 500),
-              value: 'value' in element ? String(element.value).slice(0, 500) : '',
+              value: (element.getAttribute('type') || '').toLowerCase() === 'password' ? undefined : 'value' in element ? String(element.value).slice(0, 500) : '',
               rect,
               clickPoint: clickablePoint(element, root)
             };
@@ -978,7 +978,7 @@ export function createDomHandlers({
           return {
             tagName: element.tagName.toLowerCase(),
             text: (element.innerText || element.textContent || '').trim().slice(0, 500),
-            value: 'value' in element ? String(element.value).slice(0, 500) : '',
+            value: (element.getAttribute('type') || '').toLowerCase() === 'password' ? undefined : 'value' in element ? String(element.value).slice(0, 500) : '',
             rect,
             clickPoint: clickablePoint(element, root)
           };

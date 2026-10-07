@@ -8,9 +8,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from axis.execution import automatic_scope
-from axis.orchestrator import gui_action_request, named_gui
+from axis.login import authorized_login_action, login_destination_matches, parse_login_intent
+from axis.orchestrator import AxisOrchestrator, extract_requirements, gui_action_request, named_gui, verify_completion
 from axis.attachments.parsing import parse
-from axis.models import AttachmentRef, AttachmentUse
+from axis.models import ActionRecord, AssertionRecord, AttachmentRef, AttachmentUse, BrowserState, TaskRunState
 from axis.attachments.models import DocumentRequest
 from axis.attachments.runtime import DocumentSession
 from axis.agents import StepGate
@@ -68,6 +69,95 @@ def test_automatic_scope_does_not_invent_recipients_or_send_drafts():
     assert not automatic_scope('Prepare a Gmail draft', detail('Account password', 'fill'), 'fill')
 
 
+def test_explicit_login_is_limited_to_supplied_credentials_and_trusted_origin():
+    instruction = 'Open 10.75.181.51:80 and login\nUser: test\nPassword: fixture-secret'
+    intent = parse_login_intent(instruction)
+    assert intent and intent.app_url == 'http://10.75.181.51:80'
+    login_url = ('http://10.75.181.50/auth?redirect_uri='
+                 'http%3A%2F%2F10.75.181.51%2Flogin%2Fcallback')
+    assert not login_destination_matches(intent, login_url)
+    login_url = 'http://10.75.181.51/auth'
+    assert login_destination_matches(intent, login_url)
+    assert not login_destination_matches(intent, 'http://10.75.181.50/auth?redirect_uri=http%3A%2F%2Fevil.test%2F')
+    action = {'current_url': login_url, 'target_type': 'ref', 'target': 'textbox Password',
+              'arguments': {'command': {'value': 'fixture-secret'}}}
+    assert authorized_login_action(intent, action, 'fill')
+    assert not authorized_login_action(intent, {**action, 'arguments': {'command': {'value': 'wrong'}}}, 'fill')
+    assert not authorized_login_action(intent, {**action, 'target': 'API key'}, 'fill')
+    assert authorized_login_action(intent, {**action, 'target': 'button Sign In'}, 'click')
+    assert not authorized_login_action(intent, {**action, 'target': 'button Grant access'}, 'click')
+
+
+def test_login_without_explicit_destination_or_credentials_has_no_automatic_scope():
+    assert parse_login_intent('Log in to the console\nUser: test') is None
+    assert parse_login_intent('Open http://app.test\nUser: test\nPassword: secret') is None
+
+
+def test_redirected_login_completes_after_positive_app_check():
+    instruction = 'Open 10.75.181.51:80 and login\nUser: test\nPassword: fixture-secret'
+    state = TaskRunState(original_request=instruction, requirements=extract_requirements(instruction))
+    state.actions = [
+        ActionRecord(tool='browser_navigate', operation='open', args="url='http://10.75.181.51:80'",
+                     execution_success=True, sequence=1),
+        ActionRecord(tool='browser_act', operation='click', target='button Sign In',
+                     execution_success=True, sequence=2),
+    ]
+    state.assertions = [
+        AssertionRecord(assertion='url', expected='http://10.75.181.51:80',
+                        passed=False, tab='tab_1', sequence=3),
+        AssertionRecord(assertion='url', expected='http://10.75.181.51/index.html',
+                        passed=True, tab='tab_1', sequence=4),
+        AssertionRecord(assertion='visible', target='Welcome!', expected=True,
+                        passed=True, tab='tab_1', sequence=5),
+    ]
+    page = BrowserState(url='http://10.75.181.51/index.html', snapshot='Welcome! Sign Out')
+    assert verify_completion(state, page).valid
+    assert not verify_completion(state, BrowserState(url='http://10.75.181.50/auth')).valid
+    state.assertions.pop()
+    assert not verify_completion(state, page).valid
+
+
+def test_login_values_remain_exact_in_debug_events():
+    emitted = []
+    orchestrator = AxisOrchestrator.__new__(AxisOrchestrator)
+    orchestrator.state = TaskRunState(original_request=(
+        'Open http://app.test and login\nUser: fixture-user\nPassword: fixture-secret'))
+    orchestrator.on_event = emitted.append
+    orchestrator._elapsed_ms = lambda: 0
+    orchestrator._emit('browser_action', args='fill fixture-user with fixture-secret')
+    assert emitted and 'fixture-secret' in str(emitted[0].detail)
+    assert 'fixture-user' in str(emitted[0].detail)
+
+
+def test_automatic_login_actions_do_not_create_per_field_approvals(service):
+    client, runner, _ = service
+    instruction = 'Open 10.75.181.51:80 and login\nUser: test\nPassword: fixture-secret'
+    task = submit(client, conversation(client), text=instruction,
+                  execution_mode='automatic').json()['task']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
+    runner.orchestrator.state.direct_navigation_done = False
+    auth = 'http://10.75.181.50/auth'
+    runner.orchestrator.state.login_auth_host = '10.75.181.50'
+    runner.orchestrator.state.login_auth_url = auth
+    runner.orchestrator.state.login_auth_tab = 'tab_1'
+    for operation, target, value in [('fill', 'textbox Username', 'test'),
+                                     ('fill', 'textbox Password', 'fixture-secret'),
+                                     ('click', 'button Sign In', None)]:
+        action = {'current_url': auth, 'target_type': 'ref', 'target': target,
+                  'arguments': {'command': {'value': value}}, 'tab': 'tab_1'}
+        assert runner.approvals.authorize('browser_act', operation, action)
+    assert not runner.active().get('pending_approval')
+    changed_host = {'current_url': auth.replace('10.75.181.50', '10.75.181.99'),
+                    'target_type': 'ref', 'target': 'textbox Password',
+                    'arguments': {'command': {'value': 'fixture-secret'}}, 'tab': 'tab_1'}
+    with ThreadPoolExecutor() as pool:
+        pending_call = pool.submit(runner.approvals.authorize, 'browser_act', 'fill', changed_host)
+        pending = wait_for(lambda: runner.active().get('pending_approval'))
+        assert 'fixture-secret' in str(pending)
+        client.post(f'/api/tasks/{task["id"]}/approvals/{pending["id"]}', json={'decision': 'deny'})
+        assert pending_call.result(2) is False
+
+
 def test_named_gui_action_routes_and_is_scoped_to_matching_tab():
     request = 'From CNCC Core GUI, configure the timeout.'
     assert gui_action_request(request)
@@ -117,7 +207,8 @@ def test_pending_approval_cannot_be_decided_from_another_task_or_without_auth(se
         assert call.result(2) is False
 
 
-def test_restart_carries_original_request_and_attachment_but_not_approval(service):
+@pytest.mark.parametrize('status', ['cancelled', 'failed'])
+def test_restart_carries_original_request_and_attachment_but_not_approval(service, status):
     client, runner, store = service
     runner.attachments.embeddings = TinyEmbeddings()
     cid = conversation(client)
@@ -127,6 +218,10 @@ def test_restart_carries_original_request_and_attachment_but_not_approval(servic
     wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
     client.post(f'/api/tasks/{task["id"]}/control',json={'action':'stop'})
     wait_for(lambda: runner.active() is None)
+    if status == 'failed':
+        prior = store.task(task['id'])
+        prior['status'] = status
+        store.save_task(prior)
     restarted = submit(client, cid, text='continue the same thing', context_task_id=task['id']).json()['task']
     assert restarted['id'] != task['id']
     assert original in restarted['instruction']
@@ -321,3 +416,28 @@ async def test_three_failed_document_attempts_stop_without_browser_actions(docum
     retried = await orchestrator.continue_task('Try the same request with different wording')
     assert retried.status == 'failed' and retried.planner_passes == 6
     assert all(method in {'extension.info','native.sitePatterns','tabs.list'} for method,_ in bridge.calls)
+
+
+def test_observed_sso_origin_preserves_port_and_submission_boundary():
+    from dataclasses import replace
+    intent = replace(parse_login_intent('Login to http://app.test\nUser: fixture-user\nPassword: fixture-secret'),
+                     auth_url='https://identity.test:8443/auth')
+    assert login_destination_matches(intent, 'https://identity.test:8443/submit')
+    assert not login_destination_matches(intent, 'https://identity.test/submit')
+    assert not login_destination_matches(intent, 'http://identity.test:8443/submit')
+    assert not login_destination_matches(intent, 'https://other.test/?redirect_uri=http://app.test')
+    action = {'current_url': intent.auth_url, 'target_type': 'ref', 'target': 'button Sign In',
+              'observed_target': {'formAction': 'https://other.test/collect'}}
+    assert not authorized_login_action(intent, action, 'click')
+
+
+def test_named_existing_application_tab_authorizes_normal_task_actions():
+    instruction = 'You are operating the ACME tab already open. Click Settings, select the 17th option, and click Save if the rule matches.'
+    d = {'current_url': 'https://console.test/settings', 'application_title': 'ACME | Settings',
+         'target_type': 'locator', 'target': 'menuitem Settings'}
+    assert automatic_scope(instruction, d, 'click')
+    assert automatic_scope(instruction, {**d, 'target': 'button Save'}, 'click')
+    assert not automatic_scope(instruction, {**d, 'application_title': 'Other Console'}, 'click')
+    assert not automatic_scope(instruction, {**d, 'observed_target': {'href': 'https://other.test/settings'}}, 'click')
+    assert not automatic_scope(instruction, {**d, 'target': 'button Delete'}, 'click')
+    assert named_gui(instruction) == 'ACME'

@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import math
 import re
 import statistics
 import threading
@@ -256,6 +257,14 @@ def check_fixture(case_name: str, result: dict, state: dict, pages: list[dict], 
         checks = {"file_requested": actions.get("download", 0) > 0,
                   "completed_file_observed": any(item.get("state") == "complete"
                       and "axis-eval-report.csv" in item.get("filename", "") for item in downloads)}
+    elif case_name == "autonomous_enterprise":
+        checks = {
+            "ordered_actions": state.get("action_order") == ["services", "replication", "back", "configurations", "operations", "edit_operation", "save_operation"],
+            "correct_row": values.get("edit_operation") == 17,
+            "correct_save": values.get("save_operation") == {"row": 17, "rule": "Server rule"},
+            "observed_confirmation": "Operation 17 saved successfully." in text,
+            "grounded_report": all(value in answer for value in ("Replication unavailable: upstream returned 503.", "Operation 17", "Server rule")),
+        }
     elif case_name == "canvas_interaction":
         checks = {"tile_confirmed": values.get("canvas_confirm") is True and "Canvas confirmed" in text,
                   "visual_used": any(method.startswith("computer.") for method in methods)}
@@ -264,7 +273,14 @@ def check_fixture(case_name: str, result: dict, state: dict, pages: list[dict], 
     duplicates = sum(max(0, count - 1) for count in actions.values())
     valid = all(checks.values()) and duplicates == 0
     completed = result.get("status") == "completed"
-    return {"checks": checks, "success": completed and valid,
+    expected_target = {"correct_tool_selection": "country", "ref_first_interaction": "continue",
+                       "unexpected_ui_recovery": "settings", "changing_spa_content": "advance"}.get(case_name)
+    targeted = [call for call in calls if call["method"].startswith(("locator.click", "locator.selectOption", "locator.check", "locator.uncheck"))]
+    first = targeted[0] if targeted else None
+    target_id = ((((first or {}).get("result") or {}).get("element")) or {}).get("id")
+    first_correct = (target_id == expected_target) if expected_target and target_id else (
+        False if expected_target and first and first.get("error_code") else None)
+    return {"first_attempt_correct_target": first_correct, "checks": checks, "success": completed and valid,
             "false_completion": completed and not valid, "duplicate_actions": duplicates}
 
 
@@ -363,9 +379,18 @@ def write_reports(rows: list[dict], output: Path, *, judge_report: Any = None) -
         "duplicate_actions": sum(row.get("duplicate_actions", 0) for row in measured),
         "median_latency_ms": statistics.median([row.get("latency_ms", 0) for row in measured]) if measured else None,
     }
+    latencies = sorted(row.get("latency_ms", 0) for row in measured)
+    summary["p95_latency_ms"] = latencies[max(0, math.ceil(len(latencies) * .95) - 1)] if latencies else None
+    first_actions = [row["result"]["time_to_first_action_ms"] for row in measured
+                     if row.get("result", {}).get("time_to_first_action_ms") is not None]
+    summary["median_time_to_first_action_ms"] = statistics.median(first_actions) if first_actions else None
     summary["success_rate"] = summary["successful_runs"] / len(measured) if measured else None
-    for metric in ("model_requests", "browser_actions", "input_tokens", "output_tokens"):
+    for metric in ("model_requests", "planner_passes", "browser_actions", "input_tokens", "output_tokens", "redundant_observations", "redundant_actions", "redundant_assertions", "recovery_actions"):
         summary[metric] = sum(row.get("result", {}).get(metric, 0) for row in measured)
+    target_trials = [row["first_attempt_correct_target"] for row in measured
+                     if row.get("first_attempt_correct_target") is not None]
+    summary["first_attempt_target_trials"] = len(target_trials)
+    summary["first_attempt_correct_target_rate"] = sum(target_trials) / len(target_trials) if target_trials else None
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "summary": summary, "runs": rows}
     (output / "results.json").write_text(json.dumps(_report_value(payload), indent=2, ensure_ascii=False), encoding="utf-8")
     lines = ["# AXIS local workflow evaluation", "", f"Measured runs: {len(measured)} / {len(rows)}. "

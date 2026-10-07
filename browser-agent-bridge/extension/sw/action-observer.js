@@ -69,7 +69,7 @@ async function captureFocusedElement(tabId, chromeApi) {
           tag: el.tagName ? el.tagName.toLowerCase() : '',
           role: (el.getAttribute && el.getAttribute('role')) || '',
           name: (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('name'))) || '',
-          value: 'value' in el ? String(el.value).slice(0, 200) : ''
+          value: (el.getAttribute('type') || '').toLowerCase() === 'password' ? undefined : 'value' in el ? String(el.value).slice(0, 200) : ''
         };
       }
     });

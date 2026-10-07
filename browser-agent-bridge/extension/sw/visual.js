@@ -76,7 +76,7 @@ export function createVisualHandlers({
     if (!sameVisualState(before, after)) throw staleVisualError('Page changed while capturing; capture again');
     const metadata = { ...after, image: { width, height }, screenshotId: cryptoApi.randomUUID() };
     // Only metadata stays in memory. Closed tabs cannot accumulate image bytes.
-    captures.set(tabId, metadata);
+    captures.set(tabId, { ...metadata, fingerprint: await screenshotFingerprint(captured.data), captureOptions: { format, fromSurface: true, captureBeyondViewport: false, ...(format === 'jpeg' && Number.isFinite(options.quality) ? { quality: Math.max(0, Math.min(100, Math.round(options.quality))) } : {}) } });
     while (captures.size > 64) captures.delete(captures.keys().next().value);
     return { dataUrl, ...metadata };
   }
@@ -94,6 +94,13 @@ export function createVisualHandlers({
     if (captures.get(tabId) !== capture || !sameVisualState(capture, live)) {
       captures.delete(tabId);
       throw staleVisualError('Tab URL, viewport, zoom, or scroll changed; capture again');
+    }
+    // Pixel comparison also catches moving DOM, animations and canvas updates
+    // whose URL, scroll and viewport have not changed.
+    const fresh = await cdp(tabId, 'Page.captureScreenshot', capture.captureOptions);
+    if (!fresh?.data || await screenshotFingerprint(fresh.data) !== capture.fingerprint) {
+      captures.delete(tabId);
+      throw staleVisualError('Rendered content changed; capture again');
     }
     // Consume before dispatch: an unknown input outcome must never reuse pixels.
     captures.delete(tabId);
@@ -120,4 +127,9 @@ async function blobBase64(blob) {
   let binary = '';
   for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(binary);
+}
+
+async function screenshotFingerprint(data) {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
 }

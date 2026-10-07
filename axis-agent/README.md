@@ -6,7 +6,8 @@ Python browser-control layers that let an LLM-based agent drive Chrome tabs
 through [Browser Agent Bridge](../browser-agent-bridge) without exposing
 the bridge's ~150-method raw JSON-RPC surface.
 
-The active runtime pairs a tool-free planner with a browser navigator. A shared
+Browser tasks start directly with the browser navigator. It can request the
+tool-free planner when strategic help is needed; document workflows use the planner. A shared
 orchestrator handles tasks from either the Chrome side panel or the CLI, and
 `BrowserRuntime` guards every browser tool call. Start with the
 [project overview](../README.md) or inspect the
@@ -92,6 +93,45 @@ configurable values are documented inline in [axis.yaml](axis.yaml).
 
 ### Active runtime behavior
 
+`run.direct_browser_execution: true` bypasses mandatory planner handoffs for
+browser work. The navigator receives the user goal and fresh observation, then
+returns `task_complete` with `final_answer` and verified evidence IDs, or
+`needs_plan` with a concrete reason. Completion still goes through runtime
+validation. Set the option to `false` to retain the planner-first path.
+
+`browser_act` accepts an optional exact `postcondition` and
+`command={"action":"batch","steps":[...]}` for up to six ordered click/fill/select/
+check actions. Each step contains `command` and an optional `postcondition`;
+each action/check pair reserves two calls before either executes. The default
+step budget is 12 calls (six pairs). Execution stops on failure, denial, navigation,
+popup, invalidated refs or budget exhaustion, before starting an incomplete pair.
+For example:
+
+```json
+{"tab":"tab_1","command":{"action":"fill","target":{"kind":"locator","locator":{"label":"Name"}},"value":"Alice"},"postcondition":{"assertion":"value","locator":{"label":"Name"},"expected":"Alice"}}
+```
+
+Automatic execution binds permission to the selected tab's origin, not its changing
+title. UI and CLI share the same scope policy; explicit restrictions, approval mode
+and configured mandatory approvals still apply. A new origin is a boundary change.
+
+Numbered browser instructions are retained as ordered task steps. The navigator
+records results with runtime evidence IDs; incomplete steps prevent a completion
+claim. UI task history checkpoints these results and pending outcomes for restart,
+without restoring live refs or screenshots. Failed exploratory assertions remain
+in history but are not automatically promoted to required task conditions.
+
+Ordinary CDP attachment does not activate the task tab. Ref and locator clicks share
+visible-point selection, including scroll-container clipping and hit testing. Ref
+identity changes require a fresh observation. Foreground-only screenshot fallbacks
+may still activate their target window.
+
+Snapshots share a 12,000-character budget, retain complete entries, prioritize
+focused/dialog controls over prose, and include state and ancestor context.
+Scoped observation reads omitted content. Open shadow roots and frames are
+collected under their actual identities; ambiguous frame-owner geometry refuses
+coordinate dispatch. Password values are omitted from ordinary observations.
+
 The planner declares a goal's expected result with `PlanDecision.verification`
 (`GoalCheck`). After a page-state mutation, a matching passing `browser_assert` on the
 affected tab must occur before the goal completes. Assertions retain their
@@ -115,7 +155,7 @@ The optional `browser_visual` tool captures images and supports click, drag,
 hover, scroll, and type; keyboard presses still use the ordinary action tool.
 Images reach the model as pixels, bounded to 1,600 pixels on their longest edge.
 Coordinate actions require the newest screenshot for that tab and unchanged
-viewport, URL, and scroll state, and consume the screenshot after use. Existing
+viewport, URL, scroll state and rendered pixels, and consume the screenshot after use. Existing
 firewall, approval, cancellation, mutation, and budget gates still apply.
 
 `browser.allow_coordinate_fallback: true` now enables those coordinate actions
@@ -129,8 +169,9 @@ for that run and receives one text-only retry.
 Planner cadence starts at three navigator steps and can extend to six while
 fresh evidence shows progress (`run.planner_interval_steps` and
 `run.planner_max_interval_steps`). Set both to three for fixed cadence.
-Completion, blockers, verification failures, unknown outcomes, and follow-ups
-still trigger replanning. Progress compares meaningful page content and action
+In direct mode, ordinary targeting repairs and verification remain local; the
+browser agent requests strategic replanning. In planned mode, completion and
+blockers return to the planner. Progress compares meaningful page content and action
 results, ignoring regenerated reference IDs; missing change metadata is
 unknown rather than evidence of failure. Results include input/output token
 totals alongside action, request, and timing counts.
@@ -175,7 +216,7 @@ axis-agent/
 | --- | --- | --- |
 | `browser_tabs` | List, create, activate, or close tabs through opaque handles | Reading or interacting with page content |
 | `browser_observe` | Read the page; mint `ref`s | Modifying the page, verifying success |
-| `browser_act` | One interaction (click/fill/press/hover/select/check/uncheck/upload/drag/scroll) | Discovery, navigation, verification |
+| `browser_act` | Interaction, exact postcondition, or bounded form batch | Discovery, navigation |
 | `browser_navigate` | Open a URL / reload / back / forward | Clicking a link, verifying the destination |
 | `browser_wait` | Wait for a browser condition | Proving a business outcome |
 | `browser_assert` | Verify an expected condition | Discovery, mutation |
@@ -507,3 +548,17 @@ python -m pytest tests/test_browser_agent_tools.py -v
 
 No Chrome instance or running bridge is required — `BrowserBridgeClient.rpc`
 is mocked throughout.
+
+### Supplied login credentials
+
+AXIS passes supplied usernames and passwords unchanged to its model and browser
+actions. It does not substitute credential tokens or redaction markers in prompts,
+action history, approval details, or debug events. These records can contain the
+supplied values.
+
+In Automatic mode, an explicit login authorizes credential fields and Sign In on
+the application origin. A successful task-initiated navigation to that application
+also records the resulting SSO login origin for the same task tab. Matching a
+redirect query parameter alone does not grant this authorization. Origin checks
+include scheme and port, and form submission must stay within the authorized
+application or login origin.

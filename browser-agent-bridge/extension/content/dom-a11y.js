@@ -1,7 +1,7 @@
 (() => {
   if (globalThis.__browserAgentBridgeDomA11y) return;
 
-  function accessibleName(el, root = document) {
+  function accessibleName(el, root = el?.getRootNode?.() || document) {
     if (isAriaHidden(el)) return '';
     return accessibleNameInternal(el, root, new Set()).trim().replace(/\s+/g, ' ').slice(0, 500);
   }
@@ -46,7 +46,7 @@
       el.getAttribute('title'),
       el.getAttribute('placeholder'),
       visibleText(el),
-      'value' in el ? String(el.value) : ''
+      'value' in el && type !== 'password' ? String(el.value) : ''
     ].filter(Boolean).join(' ').trim();
   }
 
@@ -156,6 +156,54 @@
       !isAriaHidden(element);
   }
 
+  // Shared by semantic locators and snapshot refs. Prefer an exposed point in
+  // a real client rect; account for scroll-container clipping before hit tests.
+  function clickablePoint(element) {
+    const doc = element.ownerDocument || document;
+    const view = doc.defaultView || window;
+    const boxes = element.getClientRects ? Array.from(element.getClientRects()) : [element.getBoundingClientRect()];
+    let fallback = null;
+    for (const box of boxes) {
+      let left = Math.max(0, box.x), top = Math.max(0, box.y);
+      let right = Math.min(view.innerWidth ?? Infinity, box.x + box.width);
+      let bottom = Math.min(view.innerHeight ?? Infinity, box.y + box.height);
+      const visited = new Set();
+      for (let parent = element.parentElement || element.getRootNode?.().host;
+           parent && !visited.has(parent); parent = parent.parentElement || parent.getRootNode?.().host) {
+        visited.add(parent);
+        const style = getComputedStyle(parent), rect = parent.getBoundingClientRect();
+        if (/(auto|scroll|hidden|clip)/.test(style.overflowX || style.overflow || '')) {
+          left = Math.max(left, rect.x); right = Math.min(right, rect.x + rect.width);
+        }
+        if (/(auto|scroll|hidden|clip)/.test(style.overflowY || style.overflow || '')) {
+          top = Math.max(top, rect.y); bottom = Math.min(bottom, rect.y + rect.height);
+        }
+      }
+      if (right <= left || bottom <= top) continue;
+      for (const [fx, fy] of [[.5,.5],[.2,.2],[.8,.2],[.2,.8],[.8,.8]]) {
+        const point = { x: left + (right-left)*fx, y: top + (bottom-top)*fy };
+        fallback ||= point;
+        if (receivesEvents(element, point)) return point;
+      }
+    }
+    return fallback;
+  }
+
+  function receivesEvents(element, point) {
+    const doc = element.ownerDocument || document;
+    if (!point) return false;
+    if (typeof doc.elementFromPoint !== 'function') return true;
+    let hit = doc.elementFromPoint(point.x, point.y);
+    const visited = new Set();
+    while (hit?.shadowRoot?.elementFromPoint && !visited.has(hit)) {
+      visited.add(hit);
+      const inner = hit.shadowRoot.elementFromPoint(point.x, point.y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    return Boolean(hit && (hit === element || element.contains?.(hit)));
+  }
+
   function isHiddenForRole(element) {
     return !isVisible(element) || isAriaHidden(element);
   }
@@ -229,6 +277,8 @@
     querySelectorAllDeep,
     getElementByIdDeep,
     isVisible,
+    clickablePoint,
+    receivesEvents,
     isHiddenForRole,
     isEnabled,
     isEditable,

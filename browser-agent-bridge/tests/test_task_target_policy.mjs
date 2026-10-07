@@ -38,3 +38,12 @@ test('ref action checks the resolved DOM target before dispatching input', async
   }), error => error.code === 'POLICY_DENIED');
   assert.deepEqual(dispatched, []);
 });
+
+test('read-only target policy permits links and refuses consequential controls', () => {
+  assert.doesNotThrow(() => assertTaskTargetAllowed({ readOnly: true },
+    { role: 'link', href: 'https://example.test/docs', text: 'Documentation' }));
+  for (const element of [{ role: 'button', text: 'Save' },
+      { role: 'link', href: 'javascript:send()', text: 'Continue' },
+      { role: 'link', href: 'https://example.test/delete/1', text: 'Continue' }])
+    assert.throws(() => assertTaskTargetAllowed({ readOnly: true }, element), error => error.code === 'POLICY_DENIED');
+});

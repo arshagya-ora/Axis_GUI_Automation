@@ -318,7 +318,7 @@ async def test_browser_upload_resolves_attachment_id_to_original_file(documents)
     assertion = ('browser_assert', {'tab': 'tab_1', 'command': {'assertion': 'text', 'locator': {'selector': '.attachment-chip'}, 'expected': 'config.txt'}})
     script = Script([browse('Upload the attached file', verification={'assertion': 'text', 'expected': 'config.txt'}), done('Uploaded.')],
                     [{'calls': [upload, assertion], 'outcome': {'status': 'goal_reached', 'summary': 'Receipt checked'}}])
-    orchestrator, bridge, _ = make(script)
+    orchestrator, bridge, _ = make(script, approval=lambda *_: True)
     orchestrator.documents = DocumentSession(files, task)
     orchestrator.browser.upload_roots = (files.path(item['id']).parent,)
     result = await orchestrator.start_task('Upload the attached file.', task_id=task)

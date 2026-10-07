@@ -867,19 +867,7 @@ async function indicatorSet(params) {
 
 async function attachDebugger(tabId) {
   await waitForSessionState();
-  // Ensure the tab window is focused and the tab is active
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab) {
-      if (!tab.active) {
-        await chrome.tabs.update(tabId, { active: true });
-      }
-      await chrome.windows.update(tab.windowId, { focused: true });
-    }
-  } catch (err) {
-    console.error('Error focusing tab/window:', err);
-  }
-
+  // CDP targets this tab directly; attaching must not steal user focus.
   if (attachedTabs.has(tabId)) return;
   await withTimeout(chrome.debugger.attach({ tabId }, CDP_VERSION), DEFAULT_TIMEOUT_MS, 'debugger.attach');
   attachedTabs.add(tabId);
@@ -927,6 +915,10 @@ async function cdp(tabId, method, params = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
 }
 
 async function ensureContentScripts(tabId, frameId = 0) {
+  // A newly created/navigating tab can replace the document during injection.
+  if ((await chrome.tabs.get(tabId)).status === 'loading') {
+    await waitForTabComplete(tabId);
+  }
   try {
     const response = await chrome.tabs.sendMessage(tabId, { type: 'PING_AGENT_BRIDGE_CONTENT' }, { frameId });
     if (response?.ok) return;

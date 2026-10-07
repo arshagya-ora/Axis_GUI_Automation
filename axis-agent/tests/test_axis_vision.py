@@ -65,6 +65,7 @@ def vision_bridge():
 
 def make_vision(script, *, config=None, bridge=None):
     config = config or AxisConfig.load()
+    config.run.direct_browser_execution = False
     bridge = bridge or vision_bridge()
     events, rebuilt = [], []
     model = script.model()
@@ -123,7 +124,7 @@ async def test_two_recoverable_targeting_failures_trigger_visual_recovery():
 
     bridge.responses["locator.click"] = missing_target
     orchestrator, bridge, _, rebuilt = make_vision(script, bridge=bridge)
-    result = await orchestrator.run("Read the chart on the current page.")
+    result = await orchestrator.run("Click Continue to inspect the chart on the current page.")
     assert result.status == "completed"
     assert bridge.methods.count("locator.click") == 2
     assert bridge.methods.count("page.screenshot") == 1
@@ -142,7 +143,7 @@ async def test_visual_recovery_cannot_repeatedly_reset_the_failure_budget():
 
     bridge.responses["locator.click"] = missing_target
     orchestrator, bridge, _, _ = make_vision(script, bridge=bridge)
-    result = await orchestrator.run("Read the current chart.")
+    result = await orchestrator.run("Click Continue to inspect the current chart.")
     assert result.status == "failed"
     assert bridge.methods.count("locator.click") <= 4
     assert orchestrator.state.counters.consecutive_failures >= 3
@@ -181,7 +182,7 @@ async def test_bridge_policy_denials_cannot_activate_visual_recovery(message, co
 
     bridge.responses["locator.click"] = denied
     orchestrator, bridge, _, rebuilt = make_vision(script, bridge=bridge)
-    result = await orchestrator.run("Read the current page.")
+    result = await orchestrator.run("Click Continue on the current page.")
     assert result.status == "failed"
     denied_records = [record for record in orchestrator.state.actions if record.tool == "browser_act"]
     assert len(denied_records) == 1 and denied_records[0].code == expected

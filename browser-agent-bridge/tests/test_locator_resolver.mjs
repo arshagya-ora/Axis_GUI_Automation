@@ -267,7 +267,7 @@ test('locator.clickRef dispatches CDP click at a snapshot ref target', async () 
   assert.equal(result.element.accessibleName, 'Save');
   assert.deepEqual(messages[0], {
     tabId: 1,
-    message: { type: 'GET_ACCESSIBILITY_REF_TARGET', ref: 'ref_1', snapshotId: 'snap_1' },
+    message: { type: 'GET_ACCESSIBILITY_REF_TARGET', ref: 'ref_1', snapshotId: 'snap_1', scrollIntoView: true },
     options: { frameId: 7 }
   });
   assert.deepEqual(cdpCalls.map(call => call.params), [
@@ -306,7 +306,7 @@ test('locator.clickRef rejects non-actionable refs with structured diagnostics',
   });
 
   await assert.rejects(
-    () => handlers.locatorClickRef({ tabId: 1, ref: 'ref_2', snapshotId: 'snap_1' }),
+    () => handlers.locatorClickRef({ tabId: 1, ref: 'ref_2', snapshotId: 'snap_1', timeoutMs: 1 }),
     error => {
       assert.equal(error.code, 'LOCATOR_REF_NOT_ACTIONABLE');
       assert.equal(error.diagnostic.ref, 'ref_2');
@@ -450,4 +450,90 @@ test('locator.selectOptionRef rejects a non-actionable ref', async () => {
     handlers.locatorSelectOptionRef({ tabId: 1, frameId: 0, ref: 'ref_1', value: 'us' }),
     /not actionable for locator\.selectOptionRef/
   );
+});
+
+test('ref click waits through movement and dispatches at the final point', async () => {
+  const createLocatorHandlers = await getCreateLocatorHandlers();
+  let probes = 0;
+  const cdpCalls = [];
+  const handlers = createLocatorHandlers({
+    assertTabId: id => id, assertTabAllowed: async () => {}, assertString: () => {},
+    recordAction: async () => {}, attachDebugger: async () => {},
+    cdp: async (_, method, params) => cdpCalls.push({ method, params }),
+    resolveFrameTarget: async () => ({ frameId: 0, frame: { frameId: 0 }, frameOffset: null }),
+    ensureContentScripts: async () => {}, sleep: async () => {}, defaultTimeoutMs: 100,
+    chromeApi: { tabs: { sendMessage: async () => {
+      const x = ++probes === 1 ? 20 : 30;
+      return { ok: true, target: { element: { tagName: 'button',
+        rect: { x, y: 0, width: 10, height: 10 }, clickPoint: { x: x + 5, y: 5 } },
+        actionability: { actionable: probes > 1, reasons: probes > 1 ? [] : ['disabled'] } } };
+    } } }
+  });
+  await handlers.locatorClickRef({ tabId: 1, ref: 'ref_1', stable: true });
+  assert.equal(probes, 3);
+  assert.equal(cdpCalls.find(call => call.params.type === 'mousePressed').params.x, 35);
+});
+
+
+test('hidden wait re-resolves after a removed document without treating the error as success', async () => {
+  const createLocatorHandlers = await getCreateLocatorHandlers();
+  let queries = 0, resolutions = 0;
+  const handlers = createLocatorHandlers({
+    assertTabId: id => id, assertTabAllowed: async () => {},
+    assertString: () => {}, recordAction: async () => {},
+    resolveFrameTarget: async tabId => { resolutions++; return { target: { tabId }, frameId: 0, frame: {} }; },
+    sleep: async () => {}, defaultTimeoutMs: 100,
+    chromeApi: { scripting: { executeScript: async () => {
+      queries++;
+      if (queries === 1) throw new Error('frame identifier was removed.');
+      return [{ result: { count: 0, visibleCount: 0, elements: [] } }];
+    } } },
+  });
+  const result = await handlers.locatorWaitFor({ tabId: 1, role: 'button', name: 'Sign In', state: 'hidden' });
+  assert.equal(result.ok, true);
+  assert.equal(queries, 2);
+  assert.equal(resolutions, 2);
+});
+
+
+test('off-screen target has no click point instead of a point on another viewport row', async () => {
+  const { els, doc } = buildDom();
+  els.btnSave.getBoundingClientRect = () => ({ x: 276, y: 1060, width: 198, height: 48 });
+  const handlers = await makeHandlers(doc);
+  const result = await handlers.locatorCount({ tabId: 1, role: 'button', name: 'Save' });
+  assert.equal(result.elements[0].clickPoint, null);
+});
+
+
+test('actionability wait scrolls an off-screen target before hit testing and clicking', async () => {
+  const createLocatorHandlers = await getCreateLocatorHandlers();
+  const { els, doc } = buildDom();
+  let rect = { x: 20, y: 1060, width: 100, height: 30 }, scrolls = 0;
+  els.btnSave.getBoundingClientRect = () => rect;
+  els.btnSave.scrollIntoView = () => { scrolls++; rect = { ...rect, y: 100 }; };
+  els.btnSave.contains = el => el === els.btnSave;
+  doc.elementFromPoint = (x, y) => y >= 100 && y <= 130 ? els.btnSave : null;
+  const events = [];
+  const chromeApi = { scripting: { executeScript: async ({ func, args }) => {
+    const previous = { document: globalThis.document, window: globalThis.window,
+      getComputedStyle: globalThis.getComputedStyle, MutationObserver: globalThis.MutationObserver };
+    globalThis.document = doc;
+    globalThis.window = { innerWidth: 1024, innerHeight: 768 };
+    globalThis.getComputedStyle = () => ({ visibility: 'visible', display: 'block', opacity: '1', pointerEvents: 'auto' });
+    globalThis.MutationObserver = class { observe() {} disconnect() {} };
+    try { return [{ result: await func(...args) }]; }
+    finally { Object.assign(globalThis, previous); }
+  } } };
+  const handlers = createLocatorHandlers({
+    assertTabId: id => id, assertTabAllowed: async () => {}, assertString: () => {},
+    recordAction: async () => {}, attachDebugger: async () => {},
+    cdp: async (tab, method, params) => events.push({ method, params }),
+    resolveFrameTarget: async tabId => ({ target: { tabId }, frameId: 0, frame: {} }),
+    domA11ySource: await loadDomA11ySource(), chromeApi, defaultTimeoutMs: 1000,
+  });
+  await handlers.locatorClick({ tabId: 1, role: 'button', name: 'Save', timeoutMs: 1000 });
+  assert.ok(scrolls > 0);
+  const click = events.find(event => event.params.type === 'mousePressed');
+  assert.ok(click);
+  assert.equal(click.params.y, 115);
 });
