@@ -53,6 +53,9 @@ class GoalCheck(BaseModel):
     assertion: Literal["text", "value", "checked", "title", "url", "visible", "hidden", "enabled", "disabled", "count", "download"]
     expected: str | bool | int | None = None
     target: str | None = None
+    # Runtime binding chosen explicitly by the navigator after observing a unique target.
+    locator: dict[str, Any] | None = None
+    tab: str | None = None
 
     @model_validator(mode="after")
     def _concrete_check(self) -> GoalCheck:
@@ -272,6 +275,25 @@ class AssertionRecord(BaseModel):
     required: bool = False
 
 
+def accepted_goal_assertions(state, matches):
+    """The shared runtime acceptance rule for goals and source-linked workflow steps."""
+    accepted = []
+    for assertion in state.assertions:
+        if (not assertion.passed or assertion.superseded_by or assertion.goal_id != state.current_goal_id
+                or not matches(state.current_verification, ActionRecord(tool='browser_assert',
+                    operation=assertion.assertion, target=assertion.target, tab=assertion.tab,
+                    result_data={'expected': assertion.expected, 'match': assertion.match}))):
+            continue
+        if state.last_interaction_by_tab.get(assertion.tab, 0) > assertion.sequence:
+            continue
+        if not any(r.goal_id == assertion.goal_id and r.tab == assertion.tab and r.executed
+                   and r.sequence > assertion.sequence
+                   and r.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
+                   and r.operation != 'capture' for r in state.actions):
+            accepted.append(assertion)
+    return accepted
+
+
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -443,6 +465,9 @@ class TaskRunState(BaseModel):
 
     task_id: str = Field(default_factory=lambda: uuid4().hex)
     original_request: str = ""
+    reference_context: dict[str, Any] = Field(default_factory=dict)
+    change_history: list[dict[str, Any]] = Field(default_factory=list)
+    field_observations: dict[str, dict[str, Any]] = Field(default_factory=dict, exclude=True)
     attachments: list[AttachmentRef] = Field(default_factory=list, max_length=8)
     execution_kind: Literal["browser", "document"] = "browser"
     document_coverage: dict[str, dict[str, list[list[int]]]] = Field(default_factory=dict)
@@ -517,6 +542,7 @@ class TaskRunState(BaseModel):
     vision_disabled: bool = False
     visual_failures: dict[str, int] = Field(default_factory=dict)
     progress_by_tab: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    last_interaction_by_tab: dict[str, int] = Field(default_factory=dict)
     made_progress: bool = False
     model_ms: int = 0
     browser_ms: int = 0
@@ -728,7 +754,7 @@ class RunConfig(BaseModel):
     direct_browser_execution: bool = True
     planner_interval_steps: int = Field(default=5, ge=1)
     planner_max_interval_steps: int = Field(default=8, ge=1)
-    max_actions_per_step: int = Field(default=12, ge=2)
+    max_actions_per_step: int = Field(default=16, ge=2)
     max_total_steps: int = Field(default=30, ge=1)
     document_extra_steps: int = Field(default=30, ge=0, le=120)
     document_extension_steps: int = Field(default=5, ge=1, le=20)

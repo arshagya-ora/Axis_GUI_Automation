@@ -12,13 +12,13 @@ AXIS pairs a **planner** with a **navigator**. The planner decides what to do; t
 
 ## The interface
 
-The Chrome side panel keeps the task, its progress, and the next action together. These are illustrative captures from the repository's local UI fixture.
+The Oracle Redwood side panel puts answers first, with activity on demand and one current-task control strip above the composer. These are illustrative captures from the repository's local UI fixture.
 
 | Completed answer | Dark appearance | Connection and settings |
 | :---: | :---: | :---: |
 | <img src="docs/images/axis-answer.png" alt="AXIS side panel showing a completed answer and task activity" width="260"> | <img src="docs/images/axis-answer-dark.png" alt="AXIS completed answer in dark appearance" width="260"> | <img src="docs/images/axis-settings.png" alt="AXIS settings showing service and bridge connections" width="260"> |
 
-The workspace also supports [action-sized approval prompts](docs/images/axis-approval.png), attachments, conversation history, pause/resume, and light or dark appearance. The [UI guide](docs/AXIS_UI.md) covers these flows in detail.
+The workspace also supports [action-sized approval prompts](docs/images/axis-approval.png), attachments, searchable history with row menus, and light, dark, or system appearance. Connection and Appearance lead Settings; technical controls live under Advanced. The [UI guide](docs/AXIS_UI.md) covers these flows in detail.
 
 ## How AXIS works
 

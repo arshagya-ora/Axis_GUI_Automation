@@ -149,7 +149,7 @@ def test_workflow_requires_reading_order_and_verified_browser_postcondition(docu
     assert len(steps) == 2
     with pytest.raises(ValueError, match='first pending'):
         session.begin(steps[1]['id'], 'goal_2')
-    session.begin(steps[0]['id'], 'goal_1')
+    session.begin(steps[0]['id'], 'goal_1', GoalCheck(assertion='value', expected='30', target='Timeout'))
     assert session.context()['current_source']['items'][0]['text'] == 'Set timeout to 30.'
     state = AxisConfig.load().new_memory('Configure')
     state.current_goal_id = 'goal_1'
@@ -341,8 +341,10 @@ def test_recovery_cannot_weaken_saved_postcondition(documents):
     recovered = DocumentSession(files, task)
     assert recovered.workflow()['next_steps'][0]['status'] == 'running'
     with pytest.raises(ValueError, match='Retain the saved'):
-        recovered.begin(step['id'], 'goal_2', GoalCheck(assertion='title', expected='Settings'))
-    recovered.begin(step['id'], 'goal_2', check)
+        recovered.begin(step['id'], 'goal_1', GoalCheck(assertion='title', expected='Settings'))
+    with pytest.raises(ValueError, match='goal identity'):
+        recovered.begin(step['id'], 'goal_2', check)
+    recovered.begin(step['id'], 'goal_1', check)
 
 
 def test_original_files_removed_when_conversation_is_deleted(tmp_path):

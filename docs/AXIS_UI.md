@@ -83,7 +83,7 @@ errors end as recoverable failures and release the active task.
 
 Attachment cards scroll independently so the prompt and Send stay visible.
 Choosing files restores prompt focus; Enter submits once upload finishes.
-Pause/Resume and Stop are available beside the composer. A new conversation while
+Pause/Resume and Stop are available in one status strip above the composer. A new conversation while
 a task is active offers Return, Stop and start new task, or Cancel. Clarification
 choices supplement free text when the planner needs a real user decision.
 
@@ -125,10 +125,12 @@ limits, retrieval, original-file uploads, and verification commands.
 
 ## Controls and continuity
 
-- **New conversation** creates a separate workspace. **New task** creates fresh
+- **New conversation** creates a separate workspace. **Task options → Start new task** creates fresh
   agent task state in the selected conversation. Only one task owns the runtime.
   Paused, needs-input, and exhausted tasks retain ownership until resumed or stopped.
-- **Current task** explicitly targets the live task. One pending follow-up is
+- The composer defaults to **Follow-up** when this conversation owns the live task;
+  otherwise it starts a new task. **Task options → Follow up on current task**
+  explicitly returns to that target. One pending follow-up is
   accepted at a time. AXIS closes the action gate, waits for the running entry point
   to return, and then calls the existing continuation. The UI distinguishes
   accepted, applied, and not-applied instructions. Stop takes precedence.
@@ -142,14 +144,15 @@ limits, retrieval, original-file uploads, and verification commands.
   `/extend REQUESTS [STEPS ACTIONS]`. Extensions have durable request IDs so retries
   cannot grant the same budget twice. They preserve accumulated usage and source
   evidence. A follow-up alone never grants more budget.
-- **Use saved outcome** starts a fresh task with at most 800 characters of the
+- **Task actions → Use saved outcome** starts a fresh task with at most 800 characters of the
   chosen outcome as context, bounded together with the new instruction. Historical
   tasks never continue an unrelated live orchestrator. For cancelled/interrupted
   work, restarting instead carries the original request, attachments, inferred
   uses, restrictions and verified workflow progress, with fresh approvals.
   A bare “continue the same thing” targets the latest cancelled/interrupted task
   in the current conversation when there is no live task.
-- History supports title search, paging, load, rename, and delete. Deleting an
+- History supports title search, date groups, paging, and loading. Each row's
+  **Actions** menu contains Rename and Delete; deletion still requires confirmation. Deleting an
   owned conversation requires stopping its task first. Deletion removes the chat
   and events; request-ID tombstones prevent an old network retry from executing
   deleted work again.
@@ -175,8 +178,12 @@ filesystem download links.
 
 ## Settings and approvals
 
-Light, Dark, and System appearance have their own save action. The options tab
-reuses the same settings code and Chrome storage. Model identity is read-only.
+Connection and Appearance appear first. Light, Dark, and System changes apply and
+save immediately, with visible feedback and rollback if saving fails. Appearance
+stays synchronized across the panel, options tab, and approval popup. System follows
+the operating system's preference. The options tab reuses the same settings code
+and Chrome storage. **Advanced settings** holds read-only model identity, run
+limits, runtime approval preferences, port configuration, and CSP controls.
 The finite editable allowlist is maximum steps, browser actions, and model
 requests, validated through `AxisConfig` and persisted for future tasks only.
 
@@ -186,7 +193,12 @@ port and reload**. The Python bridge port must then match. Appearance changes do
 not reload the extension. Generic provider keys, OCI credentials, shell commands,
 and arbitrary YAML are not UI settings.
 
-The panel and fallback popup share approval rendering. Pending prompts are restored
+Approval cards show readable action, destination, target, proposed content/files,
+and verification fields when supplied. Complete technical data remains expandable;
+decision buttons stay outside the scrollable content. Execution approvals lead
+with the target and complete proposed text when supplied, and explicitly cue the
+scrollable full review. The panel and fallback popup
+share bridge approval rendering. Pending prompts are restored
 through `GET_PENDING_PERMISSION_PROMPTS`; decisions use original prompt IDs and
 existing allow/deny/session semantics. Approvals appear in the current panel view,
 including Settings or History, and reconcile decisions made in another window.
@@ -195,16 +207,25 @@ approval**. Agent-side configured gates retain their existing policy; the UI doe
 not create a blanket bypass. Task execution approvals described above are an
 additional gate and cannot override bridge decisions.
 
-## Sidebar polish
+## Redwood conversation workspace
 
-The sidebar uses a unified light/dark header, compact task cards, consistent spacing,
-and quieter history controls. Task titles are not repeated inside the activity view,
-and empty workflow counters are omitted. Cards place a plain status indicator and
-timing above the current action, group activity into a quiet inset, and separate
-task controls in the footer. The composer has one focus border, with
-the attachment button, task selector, and send button in one bottom row; its hint
-sits below the input surface. Running uses a mint badge; completed uses a neutral
-badge with a green indicator. Existing task controls and conversation flows remain.
+The Oracle Redwood direction uses warm neutral surfaces, charcoal text, restrained
+red actions, and consistent rectangular controls. The compact charcoal header keeps
+the AXIS mark, History, New conversation, Settings, and one connection indicator.
+Select the indicator for service, bridge, and stream diagnostics. Typography uses
+locally available Oracle Sans with Segoe UI/system fallbacks; no font is downloaded.
+
+Answers lead the timeline. Activity starts collapsed, with counters and execution
+details inside the disclosure. The current status, action, Pause/Resume, and Stop
+live in a single strip above the composer. The composer keeps attachment and Send
+actions prominent, shows Approval/Automatic explicitly, and replaces the permanent
+task selector with a contextual label and Task options menu. Retry guidance is one
+notice, retaining the original retry target and any newer draft.
+
+Menus support arrow keys, Home/End, Escape, outside dismissal, and focus restoration.
+Controls have visible keyboard focus; task updates preserve focused controls.
+Short transitions respect reduced-motion preferences. Design tokens and the product
+constraints are recorded in [DESIGN.md](../DESIGN.md) and [PRODUCT.md](../PRODUCT.md).
 
 Expanded task activity is grouped into collapsible Planning, Browsing, Evidence,
 and Result sections. Other lifecycle events appear under Activity. Each section
@@ -223,7 +244,7 @@ and unsupported link protocols remain text. Stored answer content is unchanged.
 The HTML, JavaScript, and CSS were already valid UTF-8; the reported mojibake was
 PowerShell decoding output incorrectly. Extension editor settings now explicitly
 specify UTF-8. Source checks reject invalid UTF-8 and common mojibake sequences;
-the browser check also asserts actual arrows, ellipses, separators, and apostrophes.
+the browser check also asserts SVG navigation icons, ellipses, separators, and apostrophes.
 
 ## Verification
 
@@ -243,11 +264,16 @@ dependency; install its Chromium with `uv run playwright install chromium`, or
 pass `--executable PATH_TO_CHROMIUM` to the browser scripts to reuse an installed
 binary. No frontend build step is needed.
 
+The browser checks use Playwright's full `chromium` channel, as required for
+headless extensions; the default headless shell cannot load this MV3 extension.
 The browser check loads the actual unpacked MV3 extension in a temporary profile,
 uses a temporary authenticated service and a deterministic runner, and captures
 workspace/history/settings at 320, 360, 400, and 480 pixels, at both 640 and 900
-pixels tall. It also exercises 200% extension zoom, themes, shared options,
-draft restoration, task controls, budget extension, and inert untrusted text.
+pixels tall in light and dark system preferences. It also exercises 200% extension
+zoom, immediate theme saving and failure rollback, shared options, menu keyboard
+focus, task-switch cancellation, draft restoration, single task controls, budget
+extension, approval routing, and inert untrusted text. Completed-answer captures
+come from a persisted fixture in the disposable service, using the real panel.
 The native check uses a disposable manifest copy with the existing optional
 permissions pre-granted because headless Chrome cannot display its permission
 dialog. Its worker, native host, approval routing, and all UI code are real; the

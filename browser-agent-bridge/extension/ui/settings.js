@@ -3,6 +3,7 @@ import { el, icon, button, feedback } from "./dom.js";
 export async function applyAppearance() {
   const { axisTheme = "system" } = await chrome.storage.local.get("axisTheme");
   document.documentElement.dataset.theme = axisTheme;
+  document.querySelectorAll('.segmented input[name="theme"]').forEach(input => { input.checked = input.value === axisTheme; });
 }
 export function mountSettings(
   root,
@@ -27,10 +28,10 @@ export function mountSettings(
     );
   const content = el("div", "settings-content");
   root.append(toolbar, content);
-  function group(title) {
+  function group(title, parent = content) {
     const section = el("section", "settings-group");
     section.append(el("h2", "", title));
-    content.append(section);
+    parent.append(section);
     return section;
   }
   function row(parent, symbol, title, description, end) {
@@ -81,7 +82,7 @@ export function mountSettings(
     bridgeStatus,
   );
   const connectionMessage = report(connection),
-    bridgeActions = el("div", "row");
+    bridgeActions = el("div", "connection-actions");
   connection.append(bridgeActions);
   let bridgeEnabled = false;
   async function requestBrowserPermissions() {
@@ -211,21 +212,33 @@ export function mountSettings(
   }
   row(appearance, "sun", "Theme", "", segment);
   const appearanceMessage = report(appearance);
-  appearance.append(
-    button(
-      "Save appearance",
-      () =>
-        operation(async () => {
-          const axisTheme = segment.querySelector(":checked").value;
-          await chrome.storage.local.set({ axisTheme });
-          await applyAppearance();
-          feedback(appearanceMessage, "Appearance saved.");
-        }, appearanceMessage),
-      "",
-      "primary full-width",
-    ),
-  );
-  const bridge = group("Browser bridge"),
+  let savingTheme = false;
+  segment.addEventListener("change", async event => {
+    if (savingTheme) return;
+    const previous = document.documentElement.dataset.theme || "system";
+    const axisTheme = event.target.value;
+    const hadFocus = document.activeElement === event.target;
+    savingTheme = true;
+    segment.querySelectorAll("input").forEach(input => { input.disabled = true; });
+    document.documentElement.dataset.theme = axisTheme;
+    try {
+      await chrome.storage.local.set({ axisTheme });
+      feedback(appearanceMessage, "Appearance saved.");
+    } catch (error) {
+      document.documentElement.dataset.theme = previous;
+      segment.querySelectorAll("input").forEach(input => { input.checked = input.value === previous; });
+      feedback(appearanceMessage, "Appearance could not be saved. Try again. " + error.message, true);
+    } finally {
+      savingTheme = false;
+      segment.querySelectorAll("input").forEach(input => { input.disabled = false; });
+      if (hadFocus && document.activeElement === document.body && !root.hidden)
+        segment.querySelector("input:checked")?.focus({ preventScroll: true });
+    }
+  });
+  const advanced = el("details", "advanced-settings");
+  advanced.append(el("summary", "", "Advanced settings"), el("p", "metadata", "Model, run limits, browser permissions, and diagnostics."));
+  content.append(advanced);
+  const bridge = group("Browser permissions", advanced),
     approval = el("input");
   approval.type = "checkbox";
   approval.setAttribute("aria-label", "Runtime approvals");
@@ -254,7 +267,7 @@ export function mountSettings(
       approval,
     ),
   );
-  const agent = group("Agent"),
+  const agent = group("Agent", advanced),
     identity = el("span", "setting-value", "Service unavailable");
   row(agent, "cube", "Model", "Configured provider · read only", identity);
   const limits = el("span", "setting-value", "Service unavailable");
@@ -294,8 +307,7 @@ export function mountSettings(
       }, limitMessage),
     ),
   );
-  const advanced = group("Advanced"),
-    advancedDetails = el("details");
+  const advancedDetails = el("details");
   advancedDetails.append(el("summary", "", "Port and diagnostics"));
   advanced.append(advancedDetails);
   const advancedForm = el("div", "settings-form");

@@ -151,6 +151,45 @@ async function runAccessibilityTree(document) {
   return (await runAccessibilitySession(document)).tree;
 }
 
+test('field observations preserve original values, row identity and display-only values', async () => {
+  const input = new FakeInput('input', { attrs: { 'aria-label': 'Limit' }, value: '0' });
+  const display = new FakeElement('div', { attrs: { role: 'textbox', 'aria-label': 'Saved Limit' }, text: '10' });
+  delete display.value;
+  const password = new FakeInput('input', { attrs: { type: 'password', 'aria-label': 'Password' }, value: 'secret' });
+  const row = new FakeElement('tr', { text: '310 14', children: [new FakeElement('td', { text: '310' }), new FakeElement('td', { text: '14' })] });
+  const doc = makeDocument([input, display, password, new FakeElement('table', { children: [row] })]);
+  const tree = await runAccessibilityTree(doc);
+  assert.equal(tree.fields.find(field => field.name === 'Limit').value, '0');
+  assert.equal(tree.fields.find(field => field.name === 'Saved Limit').display, '10');
+  assert.equal(tree.nodes.find(node => node.name === 'Saved Limit').hasValue, false);
+  assert.ok(tree.fields.some(field => field.role === 'row' && field.name.includes('310')));
+  assert.ok(!JSON.stringify(tree.fields).includes('secret'));
+  input.value = '150';
+  const updated = await runAccessibilityTree(doc);
+  assert.equal(updated.fields.find(field => field.name === 'Limit').value, '150');
+  assert.equal(tree.fields.find(field => field.name === 'Limit').value, '0');
+});
+
+test('ref actionability accepts its associated label and rejects unrelated overlays', async () => {
+  const input = new FakeInput('input', { attrs: { id: 'commit', type: 'checkbox' } });
+  const label = new FakeElement('label', { attrs: { for: 'commit' }, text: 'Commit' });
+  label.control = input;
+  input.labels = [label];
+  const overlay = new FakeElement('div', { text: 'Overlay' });
+  const doc = makeDocument([input, label, overlay]);
+  doc.elementFromPoint = () => label;
+  const session = await runAccessibilitySession(doc);
+  const ref = session.tree.nodes.find(node => node.role === 'checkbox').ref;
+  const target = () => session.send({ type: 'GET_ACCESSIBILITY_REF_TARGET', ref, snapshotId: 'snap_test' }).target;
+  assert.equal(target().actionability.actionable, true);
+  doc.elementFromPoint = () => overlay;
+  assert.equal(target().actionability.actionable, false);
+  const link = new FakeAnchor('a', { attrs: { href: '/help' }, text: 'Help' });
+  link.parentElement = label;
+  doc.elementFromPoint = () => link;
+  assert.equal(target().actionability.actionable, false);
+});
+
 async function locatorCount(document, params) {
   const { createLocatorHandlers } = await importLocatorModule();
   const domA11ySource = await readFile(new URL('../extension/content/dom-a11y.js', import.meta.url), 'utf8');
@@ -334,13 +373,36 @@ test('SELECT_ACCESSIBILITY_REF_OPTIONS matches options by label', async () => {
 });
 
 test('SELECT_ACCESSIBILITY_REF_OPTIONS rejects a non-select ref', async () => {
-  const button = new FakeElement('button', { text: 'Go' });
+  const button = new FakeElement('div', { attrs: { role: 'combobox', 'aria-label': 'Feature Status' }, text: 'DISABLED' });
+  const interactions = [];
+  button.focus = () => interactions.push('focus');
+  button.dispatchEvent = event => interactions.push(event.type);
   const document = makeDocument([button]);
   const session = await runAccessibilitySession(document);
   const node = session.tree.nodes.find(n => n.ref);
   const res = session.send({ type: 'SELECT_ACCESSIBILITY_REF_OPTIONS', ref: node.ref, snapshotId: node.snapshotId, values: [{ value: 'x' }] });
   assert.equal(res.ok, false);
+  assert.equal(res.code, 'INVALID_ARGUMENT');
   assert.match(res.error, /not a <select>/);
+  const { createLocatorHandlers } = await importLocatorModule();
+  const handlers = createLocatorHandlers({
+    assertTabId: id => id, assertTabAllowed: async () => {}, assertString: () => {},
+    ensureContentScripts: async () => {},
+    resolveFrameTarget: async tabId => ({ target: { tabId }, frame: {} }),
+    recordAction: async () => assert.fail('Rejected selection must not be recorded as an action'),
+    chromeApi: { tabs: { sendMessage: async (_, message) => session.send(message) } }
+  });
+  const worker = await readFile(new URL('../extension/service-worker.js', import.meta.url), 'utf8');
+  const errorData = vm.runInNewContext(worker.slice(worker.indexOf('function errorData(error)'),
+    worker.indexOf('async function assertOptionalPermissions')) + '\nerrorData;');
+  await assert.rejects(handlers.locatorSelectOptionRef({ tabId: 1, ref: node.ref,
+    snapshotId: node.snapshotId, value: 'Enabled' }), error => {
+    assert.equal(error.message, res.error);
+    assert.equal(JSON.parse(JSON.stringify(errorData(error))).code, 'INVALID_ARGUMENT');
+    return true;
+  });
+  assert.deepEqual(interactions, []);
+  assert.equal(button.textContent, 'DISABLED');
 });
 
 test('containers and open shadow roots expose nested controls once', async () => {

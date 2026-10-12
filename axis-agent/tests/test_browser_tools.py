@@ -85,6 +85,59 @@ def test_url_assertion_timeout_is_a_failed_assertion_instead_of_success_or_trans
     assert result["data"]["detail"]["code"] == "PAGE_WAIT_FOR_URL_TIMEOUT"
 
 
+def test_text_assertion_keeps_actual_value_and_ambiguity_is_not_a_value_mismatch():
+    bridge, runtime, tab = runtime_with_tab()
+    command = bt.TextAssertion(assertion='text', locator=bt.Locator(role='combobox', name='Status'), expected='ENABLED')
+
+    def mismatch():
+        raise bt.BrowserBridgeError('Text did not match', data={'code': 'LOCATOR_EXPECT_TIMEOUT',
+            'diagnostic': {'actual': 'Status DISABLED', 'count': 1}})
+
+    bridge.responses['expect.locator.toHaveText'] = mismatch
+    result = bt.browser_assert(context(runtime), tab, command)
+    assert result['ok'] and not result['data']['passed']
+    assert result['data']['actual'] == 'Status DISABLED'
+    assert result['data']['count'] == 1
+    assert result['data']['match'] == 'exact'
+
+    def ambiguous():
+        raise bt.BrowserBridgeError('Multiple controls match', data={'code': 'LOCATOR_STRICT_MODE_VIOLATION',
+            'diagnostic': {'count': 3}})
+
+    bridge.responses['expect.locator.toHaveText'] = ambiguous
+    result = bt.browser_assert(context(runtime), tab, command)
+    assert not result['ok']
+    assert result['error']['code'] == 'LOCATOR_STRICT_MODE_VIOLATION'
+    assert 'passed' not in (result.get('data') or {})
+
+
+def test_attribute_extraction_keeps_attribute_separate_from_locator_name():
+    bridge, runtime, tab = runtime_with_tab()
+    locator = bt.Locator(role='textbox', name='Default Load', exact=True)
+    bridge.responses['locator.getAttribute'] = {'value': '10'}
+    result = bt.browser_observe(context(runtime), tab, locator=locator, extract='attribute', attribute='value')
+    assert result['ok']
+    params = bridge.calls[-1][1]
+    assert params['locator']['name'] == 'Default Load'
+    assert params['attribute'] == 'value'
+    assert 'name' not in params
+
+
+def test_field_observations_exclude_sensitive_fields_and_remain_bounded():
+    bridge, runtime, tab = runtime_with_tab()
+    bridge.responses['page.accessibilityTree'] = {'snapshot': '', 'fields': [
+        {'name': 'Password', 'value': 'hidden'}, {'name': 'Limit', 'value': '0'},
+        *[{'name': str(i), 'value': 'x' * 500} for i in range(40)],
+    ]}
+    result = bt.browser_observe(context(runtime), tab)
+    assert result['ok']
+    assert 'hidden' not in json.dumps(result['data']['fields'])
+    assert result['data']['fields'][0]['value'] == '0'
+    assert len(json.dumps(result['data']['fields'])) < 8200
+    assert not result['data']['fields_complete']
+    assert 'Earlier snapshot refs have been replaced' in result['data']['ref_notice']
+
+
 def test_all_nine_functions_are_independently_selectable():
     names = [function.__name__ for function in TOOL_FUNCTIONS]
     assert names == [
@@ -491,3 +544,43 @@ def test_reading_another_format_does_not_discard_document_refs():
     assert runtime.observations[tab] is previous
     runtime.invalidate(tab)
     assert tab not in runtime.observations
+
+
+@pytest.mark.parametrize('capabilities, warning', [
+    ({'valuePropertyEvidence': True, 'attributeParameter': True}, False),
+    ({'valuePropertyEvidence': True}, True),
+    ({}, True),
+])
+def test_bridge_handshake_reports_control_protocol_compatibility(capabilities, warning):
+    bridge, runtime, tab = runtime_with_tab()
+    bridge.responses['extension.info'] = {'version': '1.0', 'capabilities': capabilities}
+    bridge.responses['page.accessibilityTree'] = {'snapshotId': 's', 'snapshot': '', 'url': 'https://example.test'}
+    result = bt.browser_observe(context(runtime), tab)
+    assert result['ok']
+    assert bool(result['data'].get('runtimeWarning')) == warning
+    assert runtime.bridge_capabilities == frozenset(k for k, v in capabilities.items() if v is True)
+
+
+def test_legacy_attribute_protocol_failure_is_actionable_and_not_retried():
+    bridge, runtime, tab = runtime_with_tab()
+
+    def legacy():
+        raise bt.BrowserBridgeError('name must be a non-empty string')
+
+    bridge.responses['locator.getAttribute'] = legacy
+    result = bt.browser_observe(context(runtime), tab, locator=bt.Locator(role='textbox', name='Status'),
+                                extract='attribute', attribute='title')
+    assert result['error']['code'] == 'BRIDGE_PROTOCOL_MISMATCH'
+    assert 'Reload or upgrade' in result['error']['message']
+    assert len([method for method, _ in bridge.calls if method == 'locator.getAttribute']) == 1
+
+
+def test_text_assertion_retains_property_metadata_without_changing_expected_result():
+    bridge, runtime, tab = runtime_with_tab()
+    bridge.responses['expect.locator.toHaveText'] = {
+        'ok': True, 'actual': 'ENABLED', 'count': 1, 'element': {'hasValue': False}}
+    result = bt.browser_assert(context(runtime), tab, bt.TextAssertion(
+        assertion='text', locator=bt.Locator(role='textbox', name='Status'), expected='Enabled'))
+    assert result['data']['passed']
+    assert result['data']['expected'] == 'Enabled'
+    assert result['data']['actual']['element']['hasValue'] is False

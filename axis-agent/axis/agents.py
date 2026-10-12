@@ -64,7 +64,7 @@ MUTATING_TOOLS = frozenset({"browser_act", "browser_navigate", "browser_visual"}
 UNKNOWN_OUTCOME_CODES = frozenset({"TIMEOUT", "BRIDGE_UNAVAILABLE", "BRIDGE_ERROR"})
 NON_RETRYABLE_CODES = frozenset({
     "POLICY_DENIED", "FIREWALL_DENIED", "SENSITIVE_OPERATION_BLOCKED", "UPLOAD_DENIED",
-    "APPROVAL_DENIED", "TAB_LIMIT",
+    "APPROVAL_DENIED", "TAB_LIMIT", "BRIDGE_PROTOCOL_MISMATCH",
 })
 STOP_CODES = frozenset({"RUN_PAUSED", "RUN_CANCELLED"})
 
@@ -89,6 +89,7 @@ LOCAL_RECOVERY_CODES = frozenset({
     'TARGET_NOT_FOUND', 'TARGET_AMBIGUOUS', 'TARGET_DISABLED', 'TARGET_EVIDENCE_UNAVAILABLE',
     'OUTCOME_UNVERIFIED', 'OBSERVATION_REQUIRED', 'STALE_REFERENCE', 'REF_NOT_FOUND', 'STALE_SCREENSHOT',
     'LOCATOR_STRICT_MODE_VIOLATION', 'LOCATOR_REF_NOT_ACTIONABLE',
+    'UNSUPPORTED_ELEMENT_PROPERTY',
 })
 MODEL_RETRY_CODES = frozenset({"INVALID_ARGUMENT", "STALE_REFERENCE", "REF_NOT_FOUND"})
 TOOL_FAILED_CODES = frozenset({
@@ -226,6 +227,7 @@ class StepGate:
     is_cancelled: Callable[[], bool] = lambda: False
     on_action: Callable[[ActionRecord, int], None] | None = None
     on_record: Callable[[ActionRecord, bool], None] | None = None
+    bind_verification: Callable[[str, Any, str], None] | None = None
     on_dispatch: Callable[[], None] | None = None
     # Called for a call the gate refused before it ever reached the bridge
     # (budget, interruption, pause/cancel, denied approval) — never stored in
@@ -711,6 +713,13 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             if error.get("code") in TOOL_FAILED_CODES:
                 raise ToolFailed(error.get("message") or "This browser operation is not retryable.")
             return refusal
+        if function is bt.browser_assert and named.get("goal_target"):
+            if deps.gate.bind_verification is None:
+                raise ModelRetry("No active planner verification is available to bind.")
+            try:
+                deps.gate.bind_verification(tab, command, named["goal_target"])
+            except ValueError as error:
+                raise ModelRetry(str(error)) from error
         if deps.gate.effect_authorizer is not None and tab and function.__name__ in {'browser_act', 'browser_visual'} and _command_operation(named) not in {'capture', 'scroll', 'hover'}:
             deps.browser.reconcile_tabs()
             try:

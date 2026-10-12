@@ -19,9 +19,10 @@ from evals.run import fixture_server
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--executable',default=None)
+    parser.add_argument('--output',type=Path,default=AGENT.parent/'artifacts'/'axis-ui')
     args=parser.parse_args()
     from playwright.sync_api import sync_playwright
-    output=AGENT.parent/'artifacts'/'axis-ui'
+    output=args.output
     output.mkdir(parents=True,exist_ok=True)
     extension=AGENT.parent/'browser-agent-bridge'/'extension'
     identifier=extension_id()
@@ -38,7 +39,7 @@ def main():
         manifest['permissions']+=manifest.pop('optional_permissions')
         (test_extension/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
         report['permission_fixture']='Existing optional permissions pre-granted in a disposable test manifest; production manifest unchanged.'
-        context=playwright.chromium.launch_persistent_context(str(Path(directory)/'profile'),headless=True,executable_path=args.executable,
+        context=playwright.chromium.launch_persistent_context(str(Path(directory)/'profile'),headless=True,channel='chromium',executable_path=args.executable,
             args=[f'--disable-extensions-except={test_extension}',f'--load-extension={test_extension}'],viewport={'width':400,'height':900})
         try:
             worker=context.service_workers[0] if context.service_workers else context.wait_for_event('serviceworker')
@@ -46,6 +47,7 @@ def main():
             worker.evaluate("()=>chrome.storage.local.get('bridgeEnabled')")
             worker.evaluate('(port)=>chrome.storage.local.set({bridgePort:port})',native_port)
             panel=context.new_page();panel.goto(f'chrome-extension://{identifier}/sidepanel.html')
+            panel.get_by_role('heading',name='Your browser workspace',exact=True).wait_for()
             panel.evaluate("""()=>{window.commandLog=[];const send=chrome.runtime.sendMessage.bind(chrome.runtime);chrome.runtime.sendMessage=(message,...rest)=>{window.commandLog.push(message.type);return send(message,...rest);};}""")
             panel.get_by_role('button',name='Settings',exact=True).click()
             panel.get_by_role('button',name='Start bridge',exact=True).click()
@@ -68,6 +70,12 @@ def main():
                     if pending.done():pending.result()
                     if time.monotonic()>deadline:raise RuntimeError('No in-panel approval appeared.')
                     panel.wait_for_timeout(100)
+                panel.get_by_role('button',name='Settings',exact=True).click()
+                assert panel.locator('#settings-view #approval-region').is_visible()
+                panel.get_by_role('button',name='Back to workspace').click()
+                panel.get_by_role('button',name='Conversation history').click()
+                assert panel.locator('#history-drawer #approval-region').is_visible()
+                panel.keyboard.press('Escape')
                 panel.get_by_role('button',name='Allow once',exact=True).click()
                 pending.result(timeout=10)
                 report['checks'].append('In-panel approval resolved the real bridge prompt by its original ID')
@@ -76,6 +84,17 @@ def main():
                     pending=pool.submit(client.rpc,'cookies.get',{'tabId':tab_id})
                 popup=popup_event.value
                 popup.get_by_role('heading',name='Browser bridge approval',exact=True).wait_for()
+                for theme in ('light','dark'):
+                    worker.evaluate('(axisTheme)=>chrome.storage.local.set({axisTheme})',theme)
+                    popup.wait_for_function('(theme)=>document.documentElement.dataset.theme===theme',arg=theme)
+                    for width in (320,360,400,480):
+                        for height in (640,900):
+                            popup.set_viewport_size({'width':width,'height':height})
+                            assert popup.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                            for label in ('Allow once','Allow for session','Deny'):
+                                popup.get_by_role('button',name=label,exact=True).click(trial=True)
+                    popup.set_viewport_size({'width':320,'height':640})
+                    popup.screenshot(path=str(output/f'approval-popup-{theme}-320x640.png'),animations='disabled')
                 report['checks'].append('Existing fallback approval popup opened while panel was closed')
                 panel=context.new_page();panel.goto(f'chrome-extension://{identifier}/sidepanel.html')
                 panel.get_by_role('heading',name='Browser bridge approval',exact=True).wait_for()

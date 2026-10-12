@@ -205,6 +205,34 @@ def test_unresolved_submission_refuses_further_changes_but_allows_verification()
         assertion='text', locator=bt.Locator(selector='#status'), expected='Saved')}) is None
 
 
+@pytest.mark.parametrize('target_kind', ['ref', 'locator'])
+def test_rejected_native_selection_allows_a_corrected_click(target_kind):
+    from pydantic_ai import ModelRetry
+    controller, bridge, _ = ready()
+    controller.browser.observe('tab_1')
+    gate = StepGate(max_actions=12, remaining_total_actions=20, effect_authorizer=lambda *args: True,
+                    on_record=controller._register_action)
+    ctx = Context(AxisDeps(controller.browser, gate))
+    target = (bt.RefTarget(kind='ref', ref='ref_1') if target_kind == 'ref' else
+              bt.LocatorTarget(kind='locator', locator=bt.Locator(role='combobox', name='Feature Status')))
+
+    def rejected():
+        raise bt.BrowserBridgeError('Control is not a <select>', {'code': 'INVALID_ARGUMENT'})
+
+    method = 'locator.selectOptionRef' if target_kind == 'ref' else 'locator.selectOption'
+    bridge.responses[method] = rejected
+    with pytest.raises(ModelRetry, match='not a <select>'):
+        guarded(bt.browser_act)(ctx, tab='tab_1', command=bt.Select(action='select', target=target, options=['Enabled']))
+    assert method in bridge.methods
+    assert gate.records[-1].code == 'INVALID_ARGUMENT'
+    assert not gate.unknown_outcome and not gate.interrupted
+    assert not controller.state.pending_changes
+    assert controller.state.counters.mutation_count == 0
+    result = guarded(bt.browser_act)(ctx, tab='tab_1', command=bt.Click(action='click', target=target))
+    assert result['ok']
+    assert gate.records[0].recovered
+
+
 def test_preflight_failure_does_not_create_an_uncertain_mutation():
     controller, bridge, _ = ready()
     controller.browser.observe('tab_1')
@@ -262,10 +290,11 @@ def test_target_recovery_is_local_bounded_and_keeps_diagnostics():
     assert gate.interrupted
 
 
-def test_unknown_submission_can_be_inspected_but_not_replayed():
+@pytest.mark.parametrize('code', ['TIMEOUT', 'BRIDGE_UNAVAILABLE', 'BRIDGE_ERROR'])
+def test_unknown_submission_can_be_inspected_but_not_replayed(code):
     gate = StepGate(max_actions=12, remaining_total_actions=30)
     kwargs = {'tab': 'tab_1', 'command': bt.Click(action='click', target=bt.RefTarget(kind='ref', ref='ref_1'))}
-    gate.record('browser_act', kwargs, {'ok': False, 'error': {'code': 'TIMEOUT'}})
+    gate.record('browser_act', kwargs, {'ok': False, 'error': {'code': code}})
     assert gate.check('browser_observe', {'tab': 'tab_1'}) is None
     gate.record('browser_observe', {'tab': 'tab_1'}, {'ok': True, 'data': {'snapshot': 'Receipt'}})
     assert gate.check('browser_act', kwargs)['error']['code'] == 'OUTCOME_UNVERIFIED'

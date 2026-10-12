@@ -12,6 +12,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // `result` is what the (mocked) in-page script returns for runLocatorScript.
 async function makeHandlers(result) {
+  result = { count: 1, ...result };
   const { createLocatorHandlers } = await importLocatorModule();
   return createLocatorHandlers({
     assertTabId: (v) => v,

@@ -1000,6 +1000,8 @@ export function createPageHandlers({
         }, { frameId: frame.frameId });
         if (!response?.ok) throw new Error(response?.error || 'Frame observation unavailable');
         tree.nodes.push(...(response.tree?.nodes || []));
+        tree.fields = [...(tree.fields || []), ...(response.tree?.fields || [])];
+        tree.fieldsTruncated ||= response.tree?.fieldsTruncated === true;
         tree.truncated ||= response.tree?.truncated === true;
       } catch (error) {
         tree.frameWarnings.push({ frameId: frame.frameId, error: String(error.message || error) });
@@ -1010,6 +1012,8 @@ export function createPageHandlers({
     if (params.format === 'compact') {
       return {
         snapshot: renderCompactRefTree(tree.nodes || [], params.maxChars || 12000),
+        fields: tree.fields || [],
+        fieldsTruncated: Boolean(tree.fieldsTruncated || tree.truncated || tree.frameWarnings.length),
         url: tree.url,
         title: tree.title,
         snapshotId: tree.snapshotId,
@@ -1561,6 +1565,8 @@ export function renderCompactRefTree(nodes, maxChars = 12000, hierarchical = fal
     else if (typeof node.value === 'boolean') parts.push(node.value ? '[checked]' : '[unchecked]');
     if (typeof node.value === 'string' && node.value.length > 500) parts.push('[value-truncated]');
     if (node.type) parts.push(`type=${node.type}`);
+    if (node.tag && ['combobox', 'listbox'].includes(node.role)) parts.push(`[native-select=${node.tag === 'select'}]`);
+    if (node.hasValue === false && ['textbox', 'combobox', 'spinbutton'].includes(node.role)) parts.push('[value-property=false]');
     if (node.href) parts.push(`-> ${node.href}`);
     if (node.focused) parts.push('[focused]');
     for (const state of ['checked', 'selected', 'expanded', 'disabled', 'readonly']) {

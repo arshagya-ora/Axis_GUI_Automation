@@ -7,7 +7,7 @@ async function importDevtoolsModule() {
   const devtoolsSource = await readFile(new URL('../extension/sw/devtools.js', import.meta.url), 'utf8');
   const source = [
     networkSource.replaceAll('export ', ''),
-    devtoolsSource.replace("import { fetchPatternsForRules, harEntriesToRules } from './network-interceptors.js';\n\n", '')
+    devtoolsSource.replace(/\r\n/g, '\n').replace("import { fetchPatternsForRules, harEntriesToRules } from './network-interceptors.js';\n\n", '')
   ].join('\n');
   const dataUrl = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
   return import(dataUrl);

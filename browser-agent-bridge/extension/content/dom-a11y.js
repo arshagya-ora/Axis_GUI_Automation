@@ -161,29 +161,31 @@
   function clickablePoint(element) {
     const doc = element.ownerDocument || document;
     const view = doc.defaultView || window;
-    const boxes = element.getClientRects ? Array.from(element.getClientRects()) : [element.getBoundingClientRect()];
     let fallback = null;
-    for (const box of boxes) {
-      let left = Math.max(0, box.x), top = Math.max(0, box.y);
-      let right = Math.min(view.innerWidth ?? Infinity, box.x + box.width);
-      let bottom = Math.min(view.innerHeight ?? Infinity, box.y + box.height);
-      const visited = new Set();
-      for (let parent = element.parentElement || element.getRootNode?.().host;
-           parent && !visited.has(parent); parent = parent.parentElement || parent.getRootNode?.().host) {
-        visited.add(parent);
-        const style = getComputedStyle(parent), rect = parent.getBoundingClientRect();
-        if (/(auto|scroll|hidden|clip)/.test(style.overflowX || style.overflow || '')) {
-          left = Math.max(left, rect.x); right = Math.min(right, rect.x + rect.width);
+    for (const candidate of [element, ...Array.from(element.labels || []).filter(label => label.control === element && isVisible(label))]) {
+      const boxes = candidate.getClientRects ? Array.from(candidate.getClientRects()) : [candidate.getBoundingClientRect()];
+      for (const box of boxes) {
+        let left = Math.max(0, box.x), top = Math.max(0, box.y);
+        let right = Math.min(view.innerWidth ?? Infinity, box.x + box.width);
+        let bottom = Math.min(view.innerHeight ?? Infinity, box.y + box.height);
+        const visited = new Set();
+        for (let parent = candidate.parentElement || candidate.getRootNode?.().host;
+             parent && !visited.has(parent); parent = parent.parentElement || parent.getRootNode?.().host) {
+          visited.add(parent);
+          const style = getComputedStyle(parent), rect = parent.getBoundingClientRect();
+          if (/(auto|scroll|hidden|clip)/.test(style.overflowX || style.overflow || '')) {
+            left = Math.max(left, rect.x); right = Math.min(right, rect.x + rect.width);
+          }
+          if (/(auto|scroll|hidden|clip)/.test(style.overflowY || style.overflow || '')) {
+            top = Math.max(top, rect.y); bottom = Math.min(bottom, rect.y + rect.height);
+          }
         }
-        if (/(auto|scroll|hidden|clip)/.test(style.overflowY || style.overflow || '')) {
-          top = Math.max(top, rect.y); bottom = Math.min(bottom, rect.y + rect.height);
+        if (right <= left || bottom <= top) continue;
+        for (const [fx, fy] of [[.5,.5],[.2,.2],[.8,.2],[.2,.8],[.8,.8]]) {
+          const point = { x: left + (right-left)*fx, y: top + (bottom-top)*fy };
+          fallback ||= point;
+          if (receivesEvents(element, point)) return point;
         }
-      }
-      if (right <= left || bottom <= top) continue;
-      for (const [fx, fy] of [[.5,.5],[.2,.2],[.8,.2],[.2,.8],[.8,.8]]) {
-        const point = { x: left + (right-left)*fx, y: top + (bottom-top)*fy };
-        fallback ||= point;
-        if (receivesEvents(element, point)) return point;
       }
     }
     return fallback;
@@ -201,7 +203,10 @@
       if (!inner || inner === hit) break;
       hit = inner;
     }
-    return Boolean(hit && (hit === element || element.contains?.(hit)));
+    if (hit && (hit === element || element.contains?.(hit))) return true;
+    const label = hit?.closest?.('label');
+    const interactive = hit?.closest?.('a[href],button,input,select,textarea');
+    return Boolean(label?.control === element && !interactive);
   }
 
   function isHiddenForRole(element) {

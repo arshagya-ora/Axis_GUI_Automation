@@ -12,6 +12,7 @@
         <div class="brand">
           <span class="axis-mark" aria-hidden="true"></span
           ><strong>AXIS</strong>
+          <button id="connection-button" class="connection" aria-label="Connection details" aria-expanded="false" aria-controls="connection-details">Service offline</button>
         </div>
         <nav aria-label="Workspace">
           <button
@@ -37,43 +38,43 @@
       <div class="conversation-heading">
         <h1 id="conversation-title">New conversation</h1>
         <div class="context-line">
-          <span id="browser-context" class="tab-context"></span
-          ><button
-            id="connection-button"
-            class="connection"
-            aria-label="Connection details"
-          >
-            Service offline
-          </button>
+          <span id="browser-context" class="tab-context" hidden></span>
         </div>
         <div id="connection-details" class="notice" hidden></div>
       </div>
       <button id="return-active" class="active-strip" hidden>
-        Return to active task <span aria-hidden="true">→</span>
+        Return to active task <span data-icon="forward"></span>
       </button>
+      <div id="approval-stack" class="approval-stack">
       <section
         id="approval-region"
         aria-label="Browser bridge approvals"
         hidden
       ></section>
       <section id="execution-approval" aria-label="Task action approval" aria-live="polite" hidden></section>
+      </div>
       <main id="conversation" tabindex="-1" aria-label="Conversation">
         <div id="timeline"></div>
       </main>
       <button id="new-activity" class="new-activity" hidden>
-        ↓ New activity
+        <span data-icon="down"></span><span id="new-activity-label">New activity</span>
       </button>
       <div class="composer-wrap">
         <div id="pending-instruction" class="notice" role="status" hidden>
-          <p>Delivery of a previous instruction is unconfirmed.</p>
+          <p><strong>Check the previous instruction</strong></p>
           <p id="pending-preview"></p>
+          <p>Delivery is unconfirmed. Retry safely; your current draft is kept.</p>
+          <p id="pending-feedback" role="status" hidden></p>
           <button id="retry-instruction" type="button">Retry previous instruction</button>
         </div>
         <p id="workspace-error" class="feedback error" role="alert" hidden></p>
+        <section id="active-task-strip" class="task-strip" aria-label="Current task" hidden>
+          <div class="task-strip-copy"><span id="task-status" class="badge" role="status"></span><p id="task-action"></p></div>
+          <div id="composer-task-controls" class="composer-task-controls"></div>
+        </section>
         <form id="composer" class="composer">
           <div id="attachment-composer"></div>
           <div id="context-chip" class="context-chip" hidden></div>
-          <div id="composer-task-controls" class="composer-task-controls"></div>
           <label class="sr-only" for="instruction">Instruction</label
           ><textarea
             id="instruction"
@@ -88,11 +89,9 @@
               <option value="approval">Approval</option>
               <option value="automatic">Automatic</option>
             </select>
-            <label class="sr-only" for="message-mode">Message target</label
-            ><select id="message-mode">
-              <option value="new_task">New task</option>
-              <option value="follow_up">Current task</option></select
-            ><button
+            <span id="composer-target" class="composer-target">New task</span>
+            <span id="composer-menu"></span>
+            <button
               id="send"
               class="send-button"
               aria-label="Send instruction"

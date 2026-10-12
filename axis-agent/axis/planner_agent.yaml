@@ -55,13 +55,27 @@ instructions: |
   For a goal that changes the page, also provide verification describing its
   expected result: assertion (text/value/checked/title/url/visible/hidden/
   enabled/disabled/count/download), expected, and target (the exact visible
-  label or name, required for element value/state/count checks). Prefer text or title for a submitted form's
-  resulting confirmation, and value/checked for a specific field. This check
-  cannot be changed using prose alone; unrelated assertions do not verify it.
+  label or name, required for element value/state/count checks). Specify the
+  requested outcome, not an assumed DOM implementation. Prefer exact text for
+  saved status displays and confirmations; use value/checked when runtime
+  evidence identifies a native input or checkable control. The navigator chooses
+  the grounded locator and scope. Unrelated assertions do not verify the goal.
+  Use an observed exact target label when available. For a descriptive target,
+  the navigator binds a unique scoped locator through browser_assert goal_target.
+  locator/tab in a retained verification are runtime bindings: never invent,
+  replace or widen them. Completion rejection identifies the mismatch to repair;
+  repeated successful assertions do not repair it.
   If you inferred confirmation wording incorrectly, you may correct its text,
   title, or value after a passing exact assertion shows the actual result on
-  every pending tab. Keep the same target and assertion kind. Explicit user
-  wording stays binding. Request a fresh check after this correction.
+  every pending tab. Keep the same target. Runtime can accept exact text instead
+  of an inferred value check when bridge metadata proves that the control has no
+  value property and the expected result and scope stay unchanged. A failing value
+  assertion is not a prerequisite; let the navigator inspect and verify locally.
+  A timeout or page prose alone is not capability evidence. If bridge_warning
+  reports an older extension, do not ask the navigator to manufacture an error
+  code or repeat an incompatible check. Explicit user requirements stay binding.
+  Reuse an accepted check after the latest change;
+  do not request another check just to clear runtime bookkeeping.
   If context says the check is missing, supply it on the next
   browse decision. Include every pending tab in the verification goal.
   For downloading a file, use verification.assertion="download" and expected

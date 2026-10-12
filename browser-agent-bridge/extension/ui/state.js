@@ -87,7 +87,7 @@ export function applySnapshot(state, snapshot) {
   for (const task of snapshot.tasks) mergeTask(state, task);
   for (const task of snapshot.tasks)
     if (!(task.id in state.expanded))
-      state.expanded[task.id] = !TERMINAL.has(task.status);
+      state.expanded[task.id] = false;
 }
 export function applyEvent(state, event) {
   if (!Number.isSafeInteger(event.sequence) || event.sequence <= state.cursor)
@@ -99,7 +99,7 @@ export function applyEvent(state, event) {
     return false;
   if (task) {
     if (!(task.id in state.expanded))
-      state.expanded[task.id] = !TERMINAL.has(task.status);
+      state.expanded[task.id] = false;
   }
   const message = event.payload?.message;
   if (message) {

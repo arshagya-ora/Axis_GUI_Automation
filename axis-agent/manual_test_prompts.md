@@ -147,9 +147,10 @@ planner should run immediately and reuse the tab it already has.
 > ordinary link in the body of each article five times in a row. Tell me the
 > chain of five article titles you ended up visiting, in order.
 
-**Stresses:** planner cadence over a long run — a planner pass every 3 navigator
-steps, repeated goal completion, and `completed_goal_summaries` accumulating.
-**Watch for:** roughly 2 planner passes per 3 navigator steps. Also a good
+**Stresses:** planner cadence over a long run — five navigator steps, extending
+to eight with fresh progress, plus immediate replanning at goal completion.
+**Watch for:** fewer planner calls during sustained progress; each navigator step
+can use up to 16 browser calls. Goal completion can shorten this window. Also a good
 wall-clock benchmark: check the final `time:` line for `model=` dominance.
 
 ---

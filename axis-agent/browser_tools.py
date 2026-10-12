@@ -97,7 +97,7 @@ class Command(BaseModel):
 
 
 class Locator(Command):
-    """One semantic way to locate an element."""
+    """Scoped locator."""
 
     selector: str | None = None
     text: str | None = None
@@ -776,6 +776,7 @@ class BrowserRuntime:
         self.recordings: dict[str, str] = {}
         self.advertised_methods: frozenset[str] | None = None
         self.capability_warning: str | None = None
+        self.bridge_capabilities: frozenset[str] = frozenset()
         self.site_patterns: dict[str, dict[str, Any]] = {}
         self._capabilities_checked = False
         self._ui_failures: dict[str, int] = {}
@@ -863,6 +864,10 @@ class BrowserRuntime:
                     True,
                 ) from exc
             text = _safe_bridge_message(raw_text)
+            if method == 'locator.getAttribute' and raw_text == 'name must be a non-empty string':
+                raise ToolFault('BRIDGE_PROTOCOL_MISMATCH',
+                    'The loaded extension expects an older attribute protocol. Reload or upgrade '
+                    'the browser extension; repeating this read cannot repair it.', False, data) from exc
             # These are the bridge's explicit pre-dispatch policy messages.
             # Preserve denials as denials: classifying them as an unknown input
             # outcome could incorrectly activate coordinate recovery.
@@ -902,12 +907,22 @@ class BrowserRuntime:
             methods = info.get("methods", info.get("tools")) if isinstance(info, dict) else None
             if isinstance(methods, list) and methods:
                 self.advertised_methods = frozenset(item for item in methods if isinstance(item, str))
+            capabilities = info.get('capabilities', {}) if isinstance(info, dict) else {}
+            if isinstance(capabilities, dict):
+                self.bridge_capabilities = frozenset(k for k, v in capabilities.items() if v is True)
+            if isinstance(info, dict) and (methods or info.get('version')) and not {
+                    'valuePropertyEvidence', 'attributeParameter'}.issubset(self.bridge_capabilities):
+                self.capability_warning = (
+                    'The connected extension lacks current control-verification capabilities. '
+                    'Reload or upgrade the browser extension before relying on custom-control value checks. '
+                    'A value timeout is not evidence that a property is unsupported.')
             patterns = self.client.rpc("native.sitePatterns", {}) or {}
             for item in patterns.get("patterns", []) if isinstance(patterns, dict) else []:
                 if isinstance(item, dict) and isinstance(item.get("domain"), str):
                     self.site_patterns[item["domain"].lower()] = item
-        except BrowserBridgeError as exc:
-            self.capability_warning = str(exc)
+        except BrowserBridgeError:
+            self.capability_warning = self.capability_warning or (
+                'Bridge capability negotiation was unavailable; compatibility mode is active.')
 
     def site_pattern_for(self, url: str | None) -> dict[str, Any] | None:
         host = (urlsplit(url).hostname or "").lower() if url else ""
@@ -948,6 +963,12 @@ class BrowserRuntime:
         state = self.tabs[alias]
         return {"tab": alias, "title": state.title, "url": self.safe_url(state.url),
                 "active": state.active, "task_created": state.task_created}
+
+    def focused_tab(self) -> str | None:
+        result = self._rpc("tabs.list", {"query": {"active": True, "lastFocusedWindow": True}}) or {}
+        tabs = [tab for tab in result.get("tabs", [])
+                if isinstance(tab, dict) and isinstance(tab.get("id"), int)]
+        return self._register(tabs[0]) if len(tabs) == 1 else None
 
     @staticmethod
     def safe_url(url: str | None) -> str | None:
@@ -1026,6 +1047,20 @@ class BrowserRuntime:
             "url": self.safe_url(state.url), "title": state.title,
             "snapshot": snapshot, "truncated": bool(result.get("truncated")) or truncated,
         }
+        fields, size = [], 0
+        for field in result.get('fields', []):
+            if not isinstance(field, dict) or _SENSITIVE.search(str(field.get('name', ''))):
+                continue
+            size += len(json.dumps(field))
+            if size > 8000:
+                break
+            fields.append(field)
+        if fields:
+            data['fields'] = fields
+            data['fields_complete'] = (locator is None and len(fields) == len(result.get('fields', []))
+                                       and not result.get('fieldsTruncated', result.get('truncated', False)))
+        if mode == 'compact' or locator is not None:
+            data['ref_notice'] = 'Only refs in this snapshot are current for this tab. Earlier snapshot refs have been replaced.'
         scroll = result.get("scroll") if isinstance(result.get("scroll"), dict) else result
         x, y = scroll.get("x", scroll.get("scrollX")), scroll.get("y", scroll.get("scrollY"))
         if isinstance(x, (int, float)) or isinstance(y, (int, float)):
@@ -1047,7 +1082,7 @@ class BrowserRuntime:
                 "notes": content[:4_000] if isinstance(content, str) else None,
             }
         if self.capability_warning:
-            data["runtimeWarning"] = "Bridge capability negotiation was unavailable; compatibility mode is active."
+            data["runtimeWarning"] = self.capability_warning
         return data
 
     def resolve_ref(self, tab: str, ref: str) -> tuple[int, str, str]:
@@ -1346,7 +1381,7 @@ def browser_observe(
         if extract == "attribute":
             if not attribute:
                 raise ToolFault("INVALID_ARGUMENT", "Attribute extraction requires attribute.")
-            params["name"] = attribute
+            params["attribute"] = attribute
         result = rt._rpc(methods[extract], params, tab=tab)
         return _ok(tab, {"mode": "locator", "extract": extract, "result": result})
     except ToolFault as fault:
@@ -1673,8 +1708,11 @@ def browser_wait(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: WaitCo
         return _error(tab, fault)
 
 
-def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: AssertCommand) -> dict[str, Any]:
-    """Verify one expected page or element condition."""
+def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: AssertCommand,
+                   goal_target: NonEmpty | None = None) -> dict[str, Any]:
+    """Verify a condition. In AXIS, goal_target explicitly binds the declared target
+    to this scoped locator after a fresh count=1 check; omit for ordinary checks.
+    """
     rt = ctx.deps
     try:
         state = rt.tab(tab)
@@ -1723,7 +1761,14 @@ def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Asse
         except ToolFault as fault:
             if fault.code not in {"ASSERTION_FAILED", "PAGE_WAIT_FOR_URL_TIMEOUT"}:
                 raise
-            return _ok(tab, {"assertion": command.assertion, "passed": False, "expected": expected, "detail": fault.detail})
+            detail = fault.detail if isinstance(fault.detail, dict) else {}
+            diagnostic = detail.get("diagnostic") or detail
+            return _ok(tab, {"assertion": command.assertion, "passed": False, "expected": expected,
+                             "actual": diagnostic.get("actual"), "count": diagnostic.get("count"),
+                             "message": str(fault) + (' ' + rt.capability_warning
+                                  if command.assertion == 'value' and rt.capability_warning else ''),
+                             "detail": fault.detail,
+                             "match": "regex" if getattr(command, "regex", False) else "contains" if getattr(command, "contains", False) else "exact"})
         return _ok(tab, {"assertion": command.assertion, "passed": True, "expected": expected, "actual": actual,
                          "match": "regex" if getattr(command, "regex", False) else "contains" if getattr(command, "contains", False) else "exact"})
     except ToolFault as fault:

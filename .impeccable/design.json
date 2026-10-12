@@ -1,0 +1,342 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-12T18:25:51.601488Z",
+  "title": "Design System: AXIS Redwood",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Warm paper"
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Surface"
+      },
+      "shell": {
+        "role": "neutral",
+        "displayName": "Charcoal shell"
+      },
+      "shell-text": {
+        "role": "neutral",
+        "displayName": "Shell foreground"
+      },
+      "shell-hover": {
+        "role": "neutral",
+        "displayName": "Shell hover"
+      },
+      "shell-ready": {
+        "role": "neutral",
+        "displayName": "Shell ready"
+      },
+      "shell-warning": {
+        "role": "neutral",
+        "displayName": "Shell warning"
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Primary text"
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted text"
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Warm border"
+      },
+      "soft": {
+        "role": "neutral",
+        "displayName": "Soft fill"
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Redwood red"
+      },
+      "accent-hover": {
+        "role": "primary",
+        "displayName": "Redwood red hover"
+      },
+      "on-accent": {
+        "role": "primary",
+        "displayName": "On accent"
+      },
+      "accent-soft": {
+        "role": "primary",
+        "displayName": "Soft red"
+      },
+      "green": {
+        "role": "neutral",
+        "displayName": "Success green"
+      },
+      "danger": {
+        "role": "neutral",
+        "displayName": "Danger"
+      },
+      "warning": {
+        "role": "neutral",
+        "displayName": "Warning"
+      },
+      "focus": {
+        "role": "primary",
+        "displayName": "Focus red"
+      },
+      "overlay": {
+        "role": "neutral",
+        "displayName": "Modal overlay"
+      },
+      "dark-canvas": {
+        "role": "neutral",
+        "displayName": "Dark warm paper"
+      },
+      "dark-surface": {
+        "role": "neutral",
+        "displayName": "Dark surface"
+      },
+      "dark-shell": {
+        "role": "neutral",
+        "displayName": "Dark charcoal shell"
+      },
+      "dark-text": {
+        "role": "neutral",
+        "displayName": "Dark primary text"
+      },
+      "dark-muted": {
+        "role": "neutral",
+        "displayName": "Dark muted text"
+      },
+      "dark-border": {
+        "role": "neutral",
+        "displayName": "Dark warm border"
+      },
+      "dark-soft": {
+        "role": "neutral",
+        "displayName": "Dark soft fill"
+      },
+      "dark-accent": {
+        "role": "primary",
+        "displayName": "Dark redwood red"
+      },
+      "dark-accent-hover": {
+        "role": "primary",
+        "displayName": "Dark redwood red hover"
+      },
+      "dark-on-accent": {
+        "role": "primary",
+        "displayName": "Dark on accent"
+      },
+      "dark-accent-soft": {
+        "role": "primary",
+        "displayName": "Dark soft red"
+      },
+      "dark-green": {
+        "role": "neutral",
+        "displayName": "Dark success green"
+      },
+      "dark-danger": {
+        "role": "neutral",
+        "displayName": "Dark danger"
+      },
+      "dark-warning": {
+        "role": "neutral",
+        "displayName": "Dark warning"
+      },
+      "dark-focus": {
+        "role": "primary",
+        "displayName": "Dark focus red"
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Empty-state and history titles."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Conversation, settings, review, and answer subheadings."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default interface copy."
+      },
+      "answer": {
+        "displayName": "Answer",
+        "purpose": "Response prose with increased leading and a 72ch maximum."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Metadata and compact control copy."
+      },
+      "status": {
+        "displayName": "Status",
+        "purpose": "Badges and compact phase labels."
+      }
+    },
+    "shadows": [
+      {
+        "name": "menu",
+        "value": "0 8px 24px rgb(32 30 28 / 0.16)",
+        "purpose": "Floating action menus in the light theme."
+      },
+      {
+        "name": "menu-dark",
+        "value": "0 8px 24px rgb(0 0 0 / 0.3)",
+        "purpose": "Floating action menus in the dark theme."
+      }
+    ],
+    "motion": [
+      {
+        "name": "button-state",
+        "value": "background-color 160ms ease-out, border-color 160ms ease-out",
+        "purpose": "Button state transitions only with prefers-reduced-motion: no-preference."
+      },
+      {
+        "name": "history-enter",
+        "value": "180ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "History enters from translateX(-16px) to translateX(0), only with prefers-reduced-motion: no-preference."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "narrow-panel-max-width",
+        "value": "360px"
+      },
+      {
+        "name": "compact-panel-max-width",
+        "value": "280px"
+      },
+      {
+        "name": "short-panel-max-height",
+        "value": "640px"
+      },
+      {
+        "name": "very-short-panel-max-height",
+        "value": "480px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "A source-derived primary action; preview only.",
+      "html": "<button class=\"ds-primary\" type=\"button\">Approve change</button>",
+      "css": ".ds-primary { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); min-height: 36px; padding: 6px 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); background: transparent; cursor: pointer; background: var(--accent, #bd4332); color: var(--on-accent, #fff); border-color: transparent; } .ds-primary:hover { background: var(--soft, #f1efed); } .ds-primary:active { background: var(--border, #d4cfca); } .ds-primary:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; } .ds-primary:disabled { opacity: .55; cursor: not-allowed; } @media (prefers-reduced-motion: no-preference) { .ds-primary { transition: background-color 160ms ease-out, border-color 160ms ease-out; } } .ds-primary:hover { background: var(--accent-hover, #9b382a); }"
+    },
+    {
+      "name": "Secondary button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "The neutral action beside a primary decision.",
+      "html": "<button class=\"ds-secondary\" type=\"button\">Decline</button>",
+      "css": ".ds-secondary { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); min-height: 36px; padding: 6px 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); background: transparent; cursor: pointer; } .ds-secondary:hover { background: var(--soft, #f1efed); } .ds-secondary:active { background: var(--border, #d4cfca); } .ds-secondary:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; } .ds-secondary:disabled { opacity: .55; cursor: not-allowed; } @media (prefers-reduced-motion: no-preference) { .ds-secondary { transition: background-color 160ms ease-out, border-color 160ms ease-out; } }"
+    },
+    {
+      "name": "Icon button",
+      "kind": "button",
+      "refersTo": "button-icon",
+      "description": "A named compact control using the source SVG family.",
+      "html": "<button class=\"ds-icon\" type=\"button\" aria-label=\"New conversation\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M15 5l4 4 M14 4l3-2 5 5-3 3-9 9-5 1 1-5z M10 3H4v17h17v-7\"></path></svg></button>",
+      "css": ".ds-icon { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); min-height: 36px; padding: 6px 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); background: transparent; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 8px; border-color: transparent; } .ds-icon svg { width: 20px; height: 20px; flex-shrink: 0; } .ds-icon:hover { background: var(--soft, #f1efed); } .ds-icon:active { background: var(--border, #d4cfca); } .ds-icon:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; } .ds-icon:disabled { opacity: .55; cursor: not-allowed; } @media (prefers-reduced-motion: no-preference) { .ds-icon { transition: background-color 160ms ease-out, border-color 160ms ease-out; } }"
+    },
+    {
+      "name": "Text field",
+      "kind": "input",
+      "refersTo": "input-text",
+      "description": "Shared local configuration input styling.",
+      "html": "<input class=\"ds-input\" type=\"text\" aria-label=\"AXIS service URL\" placeholder=\"AXIS service URL\">",
+      "css": ".ds-input { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); background: var(--surface, #fff); border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); padding: 8px 10px; min-width: 0; max-width: 100%; caret-color: var(--accent, #bd4332); } .ds-input::placeholder { color: var(--muted, #6f6964); opacity: 1; } .ds-input:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; }"
+    },
+    {
+      "name": "Workspace navigation",
+      "kind": "nav",
+      "refersTo": "workspace-navigation",
+      "description": "The toolbar action group, excluding the separately rendered AXIS mark and connection indicator.",
+      "html": "<nav class=\"ds-nav\" aria-label=\"Workspace\"><button type=\"button\" aria-label=\"Conversation history\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 8v4l3 2 M21 12a9 9 0 1 1-3-6.7 M21 3v5h-5\"></path></svg></button><button type=\"button\" aria-label=\"New conversation\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M15 5l4 4 M14 4l3-2 5 5-3 3-9 9-5 1 1-5z M10 3H4v17h17v-7\"></path></svg></button><button type=\"button\" aria-label=\"Settings\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0\"></path></svg></button></nav>",
+      "css": ".ds-nav { display: flex; align-items: center; gap: 4px; min-height: 52px; padding: 0 16px; color: var(--shell-text, #fbf9f8); background: var(--shell, #312d2a); } .ds-nav button { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); min-height: 36px; padding: 6px 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); background: transparent; cursor: pointer; color: inherit; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 8px; border-color: transparent; } .ds-nav svg { width: 20px; height: 20px; flex-shrink: 0; } .ds-nav button:hover { background: var(--soft, #f1efed); } .ds-nav button:active { background: var(--border, #d4cfca); } .ds-nav button:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; } .ds-nav button:disabled { opacity: .55; cursor: not-allowed; } @media (prefers-reduced-motion: no-preference) { .ds-nav button { transition: background-color 160ms ease-out, border-color 160ms ease-out; } } .ds-nav button:hover { background: var(--shell-hover, #514c47); } .ds-nav button:focus-visible { outline-color: var(--shell-warning, #ffd18c); }"
+    },
+    {
+      "name": "Context chip",
+      "kind": "chip",
+      "refersTo": "context-chip",
+      "description": "A compact context label with its remove-control treatment.",
+      "html": "<div class=\"ds-chip\"><span>Browser context</span><button type=\"button\" aria-label=\"Remove context\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M6 6l12 12 M18 6L6 18\"></path></svg></button></div>",
+      "css": ".ds-chip { font: 12px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; display: inline-flex; align-items: center; gap: 8px; padding: 0 6px 0 8px; max-width: 100%; color: var(--muted, #6f6964); background: var(--soft, #f1efed); border-radius: var(--radius-control, 6px); } .ds-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-chip button { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); min-height: 36px; padding: 6px 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); background: transparent; cursor: pointer; min-height: 36px; width: 36px; padding: 4px; border: 0; } .ds-chip svg { width: 16px; height: 16px; display: block; } .ds-chip button:hover { background: var(--soft, #f1efed); } .ds-chip button:active { background: var(--border, #d4cfca); } .ds-chip button:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; } .ds-chip button:disabled { opacity: .55; cursor: not-allowed; } @media (prefers-reduced-motion: no-preference) { .ds-chip button { transition: background-color 160ms ease-out, border-color 160ms ease-out; } }"
+    },
+    {
+      "name": "Approval container",
+      "kind": "card",
+      "refersTo": "permission-card",
+      "description": "Container styling only; complete review fields and decisions are populated by the application.",
+      "html": "<section class=\"ds-permission\"><h2>Approve website change</h2><p>Review the supplied change details before deciding.</p></section>",
+      "css": ".ds-permission { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; margin: 8px 12px; padding: 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-surface, 12px); color: var(--text, #312d2a); background: var(--surface, #fff); } .ds-permission h2 { font-size: 16px; line-height: 1.4; font-weight: 600; margin: 0 0 8px; } .ds-permission p { font-size: 12px; color: var(--muted, #6f6964); margin: 4px 0 0; }"
+    },
+    {
+      "name": "Composer",
+      "kind": "custom",
+      "refersTo": "composer",
+      "description": "The source input shell and Send primitive; application-populated attachments and task controls are omitted.",
+      "html": "<div class=\"ds-composer\"><textarea aria-label=\"Instruction\" placeholder=\"Ask or add an instruction...\"></textarea><div class=\"ds-composer-controls\"><button class=\"ds-send\" type=\"button\" aria-label=\"Send instruction\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 20V4 M5 11l7-7 7 7\"></path></svg></button></div></div>",
+      "css": ".ds-composer { display: flex; flex-direction: column; font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); background: var(--surface, #fff); border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-surface, 12px); padding: 10px 12px; } .ds-composer:focus-within { border-color: var(--focus, #bd4332); outline: 1px solid var(--focus, #bd4332); outline-offset: 0; } .ds-composer textarea { font: inherit; color: inherit; resize: none; background: transparent; border: 0; width: 100%; min-height: 52px; max-height: 160px; padding: 6px 0 12px; caret-color: var(--accent, #bd4332); } .ds-composer textarea::placeholder { color: var(--muted, #6f6964); opacity: 1; } .ds-composer textarea:focus-visible { outline: none; } .ds-composer-controls { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; } .ds-send { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); min-height: 36px; padding: 6px 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); background: transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; background: var(--accent, #bd4332); color: var(--on-accent, #fff); border: 0; width: 40px; height: 40px; padding: 10px; } .ds-send svg { width: 20px; height: 20px; display: block; flex-shrink: 0; } .ds-send:hover { background: var(--soft, #f1efed); } .ds-send:active { background: var(--border, #d4cfca); } .ds-send:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; } .ds-send:disabled { opacity: .55; cursor: not-allowed; } @media (prefers-reduced-motion: no-preference) { .ds-send { transition: background-color 160ms ease-out, border-color 160ms ease-out; } } .ds-send:hover { background: var(--accent-hover, #9b382a); }"
+    },
+    {
+      "name": "History selection",
+      "kind": "nav",
+      "refersTo": "history-row",
+      "description": "The selected conversation copy, excluding its separately rendered actions menu.",
+      "html": "<article class=\"ds-history\"><button type=\"button\" aria-current=\"true\"><span><strong>Conversation title</strong><span class=\"ds-preview\">A preview of the saved conversation</span></span></button></article>",
+      "css": ".ds-history { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 12px 8px; margin-bottom: 4px; color: var(--text, #312d2a); background: var(--accent-soft, #ffebe8); border-radius: var(--radius-control, 6px); } .ds-history button { font: 14px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; color: var(--text, #312d2a); min-height: 36px; padding: 6px 12px; border: 1px solid var(--border, #d4cfca); border-radius: var(--radius-control, 6px); background: transparent; cursor: pointer; display: flex; text-align: left; width: 100%; border: 0; padding: 0; } .ds-history button > span { min-width: 0; flex: 1; } .ds-history strong, .ds-preview { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-history strong { font-weight: 600; } .ds-preview { font-size: 12px; color: var(--muted, #6f6964); margin-top: 4px; } .ds-history button:hover { background: var(--soft, #f1efed); } .ds-history button:active { background: var(--border, #d4cfca); } .ds-history button:focus-visible { outline: 2px solid var(--focus, #bd4332); outline-offset: 3px; } .ds-history button:disabled { opacity: .55; cursor: not-allowed; } @media (prefers-reduced-motion: no-preference) { .ds-history button { transition: background-color 160ms ease-out, border-color 160ms ease-out; } }"
+    },
+    {
+      "name": "Task status",
+      "kind": "chip",
+      "refersTo": "task-badge",
+      "description": "A status label with the shared filled active/completed dot.",
+      "html": "<span class=\"ds-badge\" role=\"status\">Active</span>",
+      "css": ".ds-badge { font: 600 12px/1.5 \"Oracle Sans\", \"Segoe UI\", system-ui, sans-serif; display: inline-flex; align-items: center; gap: 6px; color: var(--green, #436b35); white-space: nowrap; } .ds-badge::before { content: ''; width: 7px; height: 7px; border: 1px solid currentColor; border-radius: 50%; background: currentColor; flex-shrink: 0; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Redwood Conversation Workspace",
+    "overview": "AXIS uses the user-selected Oracle Redwood direction: warm neutral surfaces, a charcoal shell, and restrained red actions. The existing AXIS mark retains its geometry. The interface is compact and rectangular, with local sans typography and a consistent authored SVG stroke family.\n\nFlat surfaces, readable text, and explicit state carry the interface. Shared controls and review patterns connect the side panel, full-tab settings, and approval popup. Capabilities remain available through progressive disclosure; visual simplification does not change task ownership, execution modes, or approval semantics.",
+    "keyCharacteristics": [
+      "Warm light surfaces and an explicit charcoal dark theme.",
+      "Local sans typography with stronger leading for answers.",
+      "Small control corners, larger contained-surface corners, and restrained borders.",
+      "Authored SVG icons, labeled states, and visible keyboard focus.",
+      "Short functional motion that respects reduced-motion preferences."
+    ],
+    "rules": [
+      {
+        "name": "The Semantic State Rule",
+        "body": "Brand red identifies actions and emphasis; success, warning, and danger retain their separate semantic roles. Status is accompanied by text.",
+        "section": "colors"
+      },
+      {
+        "name": "The Local Type Rule",
+        "body": "Use the packaged local font stack. Do not add a remote font or a new display face to this product.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat Surface Rule",
+        "body": "Ordinary content, controls, and cards remain flat. Floating action menus use the shared shadow; modal separation uses the shared backdrop.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do use semantic CSS variables so light, dark, and system appearance remain consistent across extension surfaces.",
+      "Do preserve the AXIS mark geometry and use the authored SVG family for interface icons.",
+      "Do retain visible keyboard focus, accessible names for icon controls, and text labels for status.",
+      "Do let long content wrap and expose scrollable approval details with a visible continuation cue.",
+      "Do keep native popover menus distinct from modal history and task-switch dialogs.",
+      "Do place live task controls in the single current-task strip and keep answers readable above collapsed activity."
+    ],
+    "donts": [
+      "Don't add remote fonts, runtime design dependencies, ornamental gradients, or decorative animation.",
+      "Don't replace semantic success, warning, or danger colors with brand red.",
+      "Don't duplicate live Pause/Resume and Stop controls across the timeline and composer.",
+      "Don't truncate decision-critical approval values or substitute a generated summary for supplied data.",
+      "Don't convert the restrained control geometry into pill-shaped navigation or add shadows to ordinary cards."
+    ]
+  }
+}

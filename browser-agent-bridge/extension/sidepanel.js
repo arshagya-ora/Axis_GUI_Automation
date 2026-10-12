@@ -10,8 +10,10 @@ import {
   ownsRuntime,
   mergeTask,
   continuationContext,
+  STATUS,
 } from "./ui/state.js";
-import { el, icon, button, decorate, feedback } from "./ui/dom.js";
+import { el, icon, button, decorate, feedback, actionMenu } from "./ui/dom.js";
+import { activityText } from "./ui/activity.js";
 import { renderChat, duration } from "./ui/chat.js";
 import { mountHistory } from "./ui/history.js";
 import { applyAppearance, mountSettings } from "./ui/settings.js";
@@ -24,7 +26,6 @@ const $ = (selector) => document.querySelector(selector),
 const workspace = $("#workspace"),
   scroller = $("#conversation"),
   input = $("#instruction"),
-  mode = $("#message-mode"),
   timeline = $("#timeline");
 let bridge = { state: "disconnected" },
   settings = null,
@@ -63,11 +64,12 @@ if (view) {
   state.target = view.target;
   state.context = view.context;
 }
-mode.value = state.mode;
 const attachmentComposer = mountAttachments($("#attachment-composer"), api, state, { save, error, changed: renderComposer, focusPrompt: () => input.focus() });
 let pendingTaskSwitch = null;
 function error(text) {
-  feedback($("#workspace-error"), text, true);
+  const pending = !!state.pending;
+  feedback($("#pending-feedback"), pending ? text : "", true);
+  feedback($("#workspace-error"), pending ? "" : text, true);
 }
 function nearBottom() {
   return (
@@ -148,8 +150,12 @@ function renderConnection() {
       : Object.values(state.tasks).at(-1)?.browser_context;
   $("#browser-context").replaceChildren(
     icon("browser"),
-    el("span", "", context?.title || "No controlled tab yet"),
+    el("span", "", context?.title || ""),
   );
+  $("#browser-context").hidden = !context?.title;
+  $("#browser-context").title = context?.title || "";
+  label.title = label.textContent;
+  label.setAttribute("aria-label", "Connection details: " + label.textContent);
   $("#return-active").hidden =
     !state.active || state.active.conversation_id === state.selected;
 }
@@ -168,10 +174,13 @@ function renderComposer() {
   $("#retry-instruction").disabled = sending || !state.connected;
   const current =
     state.active?.conversation_id === state.selected ? state.active : null;
+  if (current && ownsRuntime(current) && !state.context && state.mode === "new_task") {
+    state.mode = "follow_up";
+    state.target = current.id;
+  }
   if (state.mode === "follow_up" && (!current || state.target !== current.id)) {
     state.mode = "new_task";
     state.target = null;
-    mode.value = "new_task";
   }
   const target =
       state.mode === "follow_up"
@@ -180,8 +189,8 @@ function renderComposer() {
           ? state.tasks[state.context]
           : null,
     chip = $("#context-chip");
-  chip.hidden = !target;
-  if (target) {
+  chip.hidden = !target || state.mode === "follow_up";
+  if (target && state.mode !== "follow_up") {
     chip.replaceChildren(
       el(
         "span",
@@ -194,7 +203,6 @@ function renderComposer() {
           state.context = null;
           state.target = null;
           state.mode = "new_task";
-          mode.value = state.mode;
           save();
           renderComposer();
         },
@@ -203,6 +211,8 @@ function renderComposer() {
       ),
     );
   }
+  $("#composer-target").textContent = state.mode === "follow_up" ? "Follow-up" : "New task";
+  $("#composer-target").title = state.mode === "follow_up" ? "Instructions go to the current task" : "Start a new task";
   const hint = $("#composer-hint");
   hint.textContent = !api.token || state.pairingRequired
     ? "Pair the local AXIS service in Settings to get started."
@@ -215,7 +225,7 @@ function renderComposer() {
         : "Enter to send · Shift+Enter for a new line";
   if (state.connected && current && state.mode === "new_task")
     hint.textContent =
-      "A task owns this browser. Use Current task to send a follow-up.";
+      "A task is active. Choose Follow up on current task in Task options to continue it.";
   if (state.connected && current?.status === "limit_reached")
     hint.textContent =
       "Extend the task’s budget to resume, or Stop to release this browser.";
@@ -225,22 +235,40 @@ function renderComposer() {
   $("#send").setAttribute("aria-label", sendLabel);
   $("#send").title = sendLabel;
   if (attachmentComposer.uploading) hint.textContent = "Uploading files… Wait for upload to finish, then press Enter to send.";
+  const strip = $("#active-task-strip");
+  strip.hidden = !current || !ownsRuntime(current);
+  if (!strip.hidden) {
+    const status = $("#task-status");
+    status.textContent = STATUS[current.status] || current.status;
+    status.className = "badge " + current.status;
+    const action = $("#task-action");
+    action.textContent = activityText(current.current_activity) || current.title;
+    action.title = action.textContent;
+  }
   const taskControls = $("#composer-task-controls");
   const controlKey = `${current?.id}:${current?.status}:${unavailable}`;
   if (taskControls.dataset.version !== controlKey) {
+    const focused = taskControls.contains(document.activeElement)
+      ? document.activeElement.classList.contains("task-pause") ? "task-pause" : "task-stop"
+      : null;
     taskControls.dataset.version = controlKey;
     taskControls.replaceChildren();
     if (current && ownsRuntime(current)) {
       if (["active", "paused", "pausing"].includes(current.status)) {
         const pause = button(current.status === "paused" ? "Resume" : current.status === "pausing" ? "Pausing…" : "Pause",
-          () => actions.control(current, current.status === "paused" ? "resume" : "pause"), null, "primary");
-        pause.disabled = unavailable || current.status === "pausing";
+          () => { if (!unavailable && current.status !== "pausing") actions.control(current, current.status === "paused" ? "resume" : "pause"); }, null, "task-pause");
+        pause.disabled = unavailable;
+        pause.setAttribute("aria-disabled", String(current.status === "pausing"));
         taskControls.append(pause);
       }
-      const stop = button(current.status === "stopping" ? "Stopping…" : "Stop", () => actions.control(current, "stop"));
-      stop.disabled = unavailable || current.status === "stopping";
+      const stop = button(current.status === "stopping" ? "Stopping…" : "Stop", () => {
+        if (!unavailable && current.status !== "stopping") actions.control(current, "stop");
+      }, null, "task-stop");
+      stop.disabled = unavailable;
+      stop.setAttribute("aria-disabled", String(current.status === "stopping"));
       taskControls.append(stop);
     }
+    if (focused) (taskControls.querySelector(`.${focused}`) || taskControls.querySelector("button") || input).focus({ preventScroll: true });
   }
   attachmentComposer.render(sending || Boolean(state.pending) || unavailable);
   input.readOnly = sending;
@@ -267,12 +295,11 @@ function closeSettings() {
   $("#settings-button").focus();
 }
 function positionApprovals() {
-  const region = $("#approval-region");
+  const region = $("#approval-stack");
   if ($("#history-drawer").open) $("#history-drawer .toolbar").after(region);
   else if (!$("#settings-view").hidden)
     $("#settings-view .toolbar").after(region);
   else $("#return-active").after(region);
-  region.after($("#execution-approval"));
 }
 async function selectConversation(id, { fresh = false } = {}) {
   rememberView(state, scroller.scrollTop);
@@ -303,7 +330,6 @@ async function selectConversation(id, { fresh = false } = {}) {
       remembered?.target ||
       (state.active?.conversation_id === id ? state.active.id : null);
     state.context = remembered?.context || null;
-    mode.value = state.mode;
     input.value = state.drafts[id] || "";
     error("");
     // Events received while fetching a snapshot are replayed only if newer than
@@ -468,7 +494,7 @@ const actions = {
       draw();
       scroller.scrollTop = 0;
       $("#new-activity").hidden = false;
-      $("#new-activity").textContent = "↓ Recent messages";
+      $("#new-activity-label").textContent = "Recent messages";
     } catch (cause) {
       error(cause.message);
     }
@@ -477,7 +503,6 @@ const actions = {
     state.mode = "new_task";
     state.target = null;
     state.context = task.id;
-    mode.value = state.mode;
     renderComposer();
     save();
     input.focus();
@@ -496,32 +521,36 @@ $("#return-active").addEventListener(
 );
 $("#connection-button").addEventListener(
   "click",
-  () => ($("#connection-details").hidden = !$("#connection-details").hidden),
+  () => {
+    const details = $("#connection-details");
+    details.hidden = !details.hidden;
+    $("#connection-button").setAttribute("aria-expanded", String(!details.hidden));
+  },
 );
 $("#new-activity").addEventListener("click", () => {
   if (state.readingEarlier) {
     selectConversation(state.selected);
-    $("#new-activity").textContent = "↓ New activity";
+    $("#new-activity-label").textContent = "New activity";
   } else scroller.scrollTop = scroller.scrollHeight;
   $("#new-activity").hidden = true;
 });
-mode.addEventListener("change", () => {
-  const current =
-    state.active?.conversation_id === state.selected ? state.active : null;
-  if (mode.value === "follow_up" && !current) {
-    mode.value = "new_task";
-    error(
-      "There is no live task in this conversation. Use a saved outcome to start a new task.",
-    );
-  } else {
-    error("");
-    state.mode = mode.value;
-    state.target = mode.value === "follow_up" ? current.id : null;
+function startNewTask() {
+  const start = () => {
+    state.mode = "new_task";
+    state.target = null;
     state.context = null;
-  }
-  renderComposer();
-  save();
-});
+    error(""); renderComposer(); save(); input.focus();
+  };
+  if (state.active) requestTaskSwitch(start);
+  else start();
+}
+$("#composer-menu").append(actionMenu("Task options", () => [
+  { label: "Start new task", icon: "edit", action: startNewTask },
+  ...(state.active?.conversation_id === state.selected ? [{ label: "Follow up on current task", icon: "play", action: () => {
+    state.mode = "follow_up"; state.target = state.active.id; state.context = null;
+    renderComposer(); save(); input.focus();
+  }}] : []),
+]));
 input.addEventListener("keydown", (event) => {
   if (
     event.key === "Enter" &&
@@ -594,9 +623,7 @@ $("#composer").addEventListener("submit", async (event) => {
       previous.body.intent !== body.intent ||
       !sameAttachments(previous.body.attachments, body.attachments)
     ) {
-      error(
-        "Resolve the previous submission using Retry previous instruction. Your current draft is kept.",
-      );
+      $("#retry-instruction").focus();
       return;
     }
     body.client_request_id = previous.body.client_request_id;
@@ -668,7 +695,6 @@ async function sendInstruction({ conversationId, body }) {
       state.mode = state.active ? "follow_up" : "new_task";
       state.target = state.active?.id || null;
       state.context = null;
-      mode.value = state.mode;
     }
     save();
   } catch (cause) {
@@ -790,7 +816,6 @@ async function connect() {
     if (state.active?.conversation_id === state.selected && !state.context) {
       state.mode = "follow_up";
       state.target = state.active.id;
-      mode.value = state.mode;
     }
     input.value = state.drafts[state.selected] || input.value;
     state.stream = "live";

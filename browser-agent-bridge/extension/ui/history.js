@@ -1,4 +1,4 @@
-import { el, icon, button, feedback } from "./dom.js";
+import { el, icon, button, feedback, actionMenu } from "./dom.js";
 import { STATUS } from "./state.js";
 
 export function mountHistory({
@@ -19,6 +19,7 @@ export function mountHistory({
   dialog.addEventListener(
     "keydown",
     (event) => {
+      if (event.target.closest(".action-menu")) return;
       if (event.key === "Escape") {
         event.preventDefault();
         close();
@@ -148,18 +149,10 @@ export function mountHistory({
       time.dateTime = date.toISOString();
       actions.append(
         time,
-        button(
-          `Rename ${conversation.title}`,
-          () => rename(row, conversation),
-          "edit",
-          "icon-button",
-        ),
-        button(
-          `Delete ${conversation.title}`,
-          () => remove(row, conversation),
-          "trash",
-          "icon-button",
-        ),
+        actionMenu(`Actions for ${conversation.title}`, [
+          { label: "Rename", ariaLabel: `Rename ${conversation.title}`, icon: "edit", action: () => rename(row, conversation) },
+          { label: "Delete", ariaLabel: `Delete ${conversation.title}`, icon: "trash", danger: true, action: () => remove(row, conversation) },
+        ]),
       );
       row.append(actions);
       list.append(row);
@@ -191,7 +184,7 @@ export function mountHistory({
     form.append(
       input,
       save,
-      button("Cancel", () => form.remove()),
+      button("Cancel", () => { form.remove(); row.querySelector('[aria-haspopup="menu"]').focus(); }),
     );
     row.append(form);
     input.focus();
@@ -239,7 +232,7 @@ export function mountHistory({
     });
     box.append(
       confirm,
-      button("Keep", () => box.remove()),
+      button("Keep", () => { box.remove(); row.querySelector('[aria-haspopup="menu"]').focus(); }),
     );
     row.append(box);
     confirm.focus();

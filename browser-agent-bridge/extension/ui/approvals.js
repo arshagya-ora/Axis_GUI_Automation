@@ -1,4 +1,5 @@
 import { el, button, feedback } from "./dom.js";
+import { reviewField } from "./review-fields.js";
 const descriptions = {
   read_tabs: "Read the titles and addresses of your open tabs.",
   cookies: "Read cookies, including sensitive session tokens.",
@@ -36,14 +37,17 @@ export function mountApprovals(root, { popup = false } = {}) {
         "",
         descriptions[prompt.category] || "Review this browser action.",
       ),
-      el("p", "metadata", prompt.method),
     );
+    const body = el("div", "permission-body");
+    reviewField(body, "Action", prompt.method);
+    reviewField(body, "Requested access", prompt.params);
     const details = el("details");
     details.append(
-      el("summary", "", "Action details"),
+      el("summary", "", "Exact technical data"),
       el("pre", "permission-params", JSON.stringify(prompt.params, null, 2)),
     );
-    card.append(details);
+    body.append(details);
+    card.append(body);
     const message = el("p", "feedback");
     message.setAttribute("role", "status");
     card.append(message);

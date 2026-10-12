@@ -4,6 +4,14 @@ import json
 from .scope import requested_range, normalized
 
 
+def matches_quote(quote, section):
+    texts = [section['text']]
+    for cell in section.get('cells') or []:
+        texts.extend(value for key in ('value', 'display') if isinstance(value := cell.get(key), str))
+    quote = normalized(quote)
+    return bool(quote) and any(quote in normalized(text) for text in texts)
+
+
 class DocumentProgress:
     def scope(self, identifier, sheet=None, cell_range=None):
         use = self._uses().get(identifier, {})
@@ -86,29 +94,52 @@ class DocumentProgress:
             scope = self.scope(item['attachment_id'])
             if scope.get('cell_range') or scope.get('sheet'):
                 source = self.store.sections(self.task_id, item['attachment_id'], ids=[item['section_id']], **scope)
-                if not source['items'] or normalized(item['quote']) not in normalized(source['items'][0]['text']):
+                if not source['items'] or not matches_quote(item['quote'], source['items'][0]):
                     continue
             items.append(item)
             size += len(json.dumps(item))
         return dict(items=items, has_more=len(rows)>examined, next_offset=offset+examined)
 
     def retain_notes(self, notes):
+        rejected = []
         with self.store.history.transaction():
             for note in notes:
-                row = self.store.history.db.execute('SELECT attachment_id FROM attachment_sections WHERE id=?', (note.section_id,)).fetchone()
-                if not row:
-                    raise ValueError('Unknown section for document finding.')
-                self._check_read(row[0])
-                scope = self.scope(row[0])
-                recorded = self.store.history.db.execute('SELECT scope FROM document_scope_reads WHERE task_id=? AND section_id=?', (self.task_id, note.section_id)).fetchall()
-                sources = [self.store.sections(self.task_id, row[0], ids=[note.section_id], **json.loads(r[0])) for r in recorded]
-                if not sources:
-                    raise ValueError('Read the section in the current scope before retaining a finding.')
-                result = self.store.sections(self.task_id, row[0], ids=[note.section_id], **scope)
-                if (not result['items'] or normalized(note.quote) not in normalized(result['items'][0]['text']) or
-                        not any(source['items'] and normalized(note.quote) in normalized(source['items'][0]['text']) for source in sources)):
-                    raise ValueError('Document findings must quote the read source text.')
-                self.store.history.db.execute('INSERT OR IGNORE INTO document_notes VALUES(?,?,?)', (self.task_id, note.section_id, note.quote))
+                reason = self._note_rejection(note)
+                if reason:
+                    rejected.append(dict(section_id=note.section_id, reason=reason))
+                else:
+                    self.store.history.db.execute('INSERT OR IGNORE INTO document_notes VALUES(?,?,?)', (self.task_id, note.section_id, note.quote))
+            task = self.store.history.task(self.task_id)
+            task['document_note_rejections'] = rejected
+            self.store.history.save_task(task)
+        return rejected
+
+    def _note_rejection(self, note):
+        row = self.store.history.db.execute('''SELECT s.attachment_id FROM attachment_sections s
+            JOIN task_attachments t ON t.attachment_id=s.attachment_id
+            WHERE t.task_id=? AND s.id=?''', (self.task_id, note.section_id)).fetchone()
+        if not row:
+            return 'unknown_section'
+        identifier = row[0]
+        if self._reading_restricted(identifier):
+            return 'read_restricted'
+        recorded = self.store.history.db.execute('SELECT scope FROM document_scope_reads WHERE task_id=? AND section_id=?',
+                                                (self.task_id, note.section_id)).fetchall()
+        if not recorded:
+            return 'unread_source'
+        result = self.store.sections(self.task_id, identifier, ids=[note.section_id], **self.scope(identifier))
+        if not result['items']:
+            return 'scope_mismatch'
+        current_match = matches_quote(note.quote, result['items'][0])
+        read_match = False
+        for record in recorded:
+            source = self.store.sections(self.task_id, identifier, ids=[note.section_id], **json.loads(record[0]))
+            if source['items'] and matches_quote(note.quote, source['items'][0]):
+                read_match = True
+                break
+        if current_match and read_match:
+            return None
+        return 'scope_mismatch' if current_match or read_match else 'quote_mismatch'
 
     def checkpoint(self, state, limits=None):
         """Save compact control state; raw source content already lives in storage."""
@@ -126,6 +157,7 @@ class DocumentProgress:
                 current_goal_id=state.current_goal_id, current_goal=state.current_goal,
                 current_verification=state.current_verification.model_dump(mode='json') if state.current_verification else None,
                 assertions=[value.model_dump(mode='json') for value in state.assertions],
+                last_interaction_by_tab=state.last_interaction_by_tab,
                 model_requests=int(state.usage.requests), browser_actions=state.counters.browser_actions,
                 mutation_count=state.counters.mutation_count, verified_mutation_count=state.counters.verified_mutation_count,
                 successful_actions=state.successful_actions,

@@ -15,6 +15,7 @@ const paths = {
   check: "M5 12l4 4L19 6",
   up: "M6 15l6-6 6 6",
   down: "M6 9l6 6 6-6",
+  forward: "M4 12h16 M14 6l6 6-6 6",
   stop: "M6 6h12v12H6z",
   pause: "M8 5v14 M16 5v14",
   play: "M8 4l12 8-12 8z",
@@ -28,6 +29,7 @@ const paths = {
   lock: "M6 10h12v11H6z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3",
   trash: "M3 6h18 M9 6V3h6v3 M6 6l1 15h10l1-15 M10 10v7 M14 10v7",
   info: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0 M12 11v6 M12 7h.01",
+  more: "M5 12h.01 M12 12h.01 M19 12h.01",
 };
 export function icon(name) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -55,6 +57,7 @@ export function el(tag, cls, text) {
 export function button(label, action, iconName, cls = "") {
   const node = el("button", cls, cls.includes("icon-button") ? "" : label);
   node.type = "button";
+  if (cls.includes("icon-button")) node.title = label;
   if (iconName) {
     node.prepend(icon(iconName));
     node.setAttribute("aria-label", label);
@@ -62,10 +65,66 @@ export function button(label, action, iconName, cls = "") {
   node.addEventListener("click", action);
   return node;
 }
+// Native popovers escape scrolling containers, including the history dialog.
+export function actionMenu(label, items, { iconName = "more", className = "icon-button" } = {}) {
+  const trigger = button(label, () => {
+    if (trigger.getAttribute("aria-expanded") === "true") return;
+    const menu = el("div", "action-menu");
+    menu.popover = "auto";
+    menu.id = `menu-${crypto.randomUUID()}`;
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", label);
+    trigger.setAttribute("aria-controls", menu.id);
+    trigger.setAttribute("aria-expanded", "true");
+    const close = (restore = true) => {
+      menu.hidePopover();
+      if (restore && trigger.isConnected) trigger.focus({ preventScroll: true });
+    };
+    for (const item of typeof items === "function" ? items() : items) {
+      const control = button(item.label, () => { close(); item.action(); }, item.icon, item.danger ? "menu-item danger" : "menu-item");
+      if (item.ariaLabel) control.setAttribute("aria-label", item.ariaLabel);
+      control.setAttribute("role", "menuitem");
+      control.disabled = !!item.disabled;
+      menu.append(control);
+    }
+    menu.addEventListener("keydown", event => {
+      const controls = [...menu.querySelectorAll("button:not(:disabled)")];
+      const index = controls.indexOf(document.activeElement);
+      if (["Escape", "ArrowDown", "ArrowUp", "Home", "End", "Tab"].includes(event.key)) {
+        event.stopPropagation();
+        if (event.key === "Tab") { close(); return; }
+        event.preventDefault();
+        if (event.key === "Escape") close();
+        else controls[event.key === "Home" ? 0 : event.key === "End" ? controls.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + controls.length) % controls.length]?.focus();
+      }
+    });
+    const resize = () => close(false);
+    menu.addEventListener("toggle", event => {
+      if (event.newState !== "closed") return;
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.removeAttribute("aria-controls");
+      window.removeEventListener("resize", resize);
+      menu.remove();
+    });
+    (trigger.closest("dialog") || document.body).append(menu);
+    menu.showPopover();
+    const anchor = trigger.getBoundingClientRect(), rect = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(anchor.right - rect.width, innerWidth - rect.width - 8))}px`;
+    menu.style.top = `${Math.max(8, anchor.bottom + rect.height + 8 <= innerHeight ? anchor.bottom + 4 : anchor.top - rect.height - 4)}px`;
+    window.addEventListener("resize", resize, { once: true });
+    menu.querySelector("button:not(:disabled)")?.focus();
+  }, iconName, className);
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", "false");
+  return trigger;
+}
 export function decorate(root = document) {
   root
     .querySelectorAll("[data-icon]")
-    .forEach((node) => node.replaceChildren(icon(node.dataset.icon)));
+    .forEach((node) => {
+      node.replaceChildren(icon(node.dataset.icon));
+      if (node.matches("button[aria-label]")) node.title = node.getAttribute("aria-label");
+    });
 }
 export function feedback(node, text, error = false) {
   node.textContent = text;

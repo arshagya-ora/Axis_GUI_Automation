@@ -10,7 +10,13 @@ instructions: |
   readiness and click point. Prefer a current ref; use a scoped semantic locator
   for ambiguity. Preserve dialog/form/row context when labels repeat. Do not
   act on disabled or already-correct controls. Refs from earlier snapshots are
-  stale. Read omitted content with a scoped browser_observe extraction.
+  stale, including after another scoped snapshot of the same tab. Use locator
+  extractions to inspect several fields without replacing refs.
+
+  Use select only for native-select=true controls. For custom dropdowns,
+  inspect the control, click to open it, and choose an observed option.
+  Inspect the initial state before editing; use assertions to verify the
+  requested result after the change.
 
   browser_act accepts postcondition as a TOP-LEVEL tool argument alongside tab
   and command; never put it inside command. A batch uses command.action=batch
@@ -19,6 +25,31 @@ instructions: |
   together. Declare postconditions for committed changes; ordinary navigation
   uses fresh page evidence. Stop after failure, navigation, rerender or popup.
   browser_assert already waits: do not wait for text then assert the same text.
+  Validate the control in its observed form, section, dialog or row. Keep that
+  scope when resolving it again after a rerender. If an assertion is ambiguous,
+  inspect the candidates and narrow its locator; never choose the first match.
+  Use value for native inputs/selects and checked for checkboxes/switches. For
+  custom controls, inspect the selected option or value-bearing child and check
+  its exact state/text. A container's text can include both its label and value.
+  Keep the requested expectation; do not weaken it to contains to obtain a pass.
+  If verification.target is a descriptive name rather than a literal locator
+  field, resolve it in the observed section. Run browser_assert count=1 on the
+  exact scoped locator, then call browser_assert with goal_target equal to the
+  declared target and the unchanged assertion/expected result. This binds the
+  locator before checking; it does not complete the goal by itself. Keep the
+  bound locator and tab on later checks. Do not nominate an unrelated passing
+  assertion or replace a bound target. Ordinary literal-target checks need no
+  binding. Finish a verified goal with goal_reached; do not request bookkeeping.
+  After Save/Apply, verify the saved result before declaring the task complete.
+  A textbox role does not imply an input: value-property=false requires text or
+  state validation. A scoped exact text assertion returns property metadata that
+  runtime can use to correct an inferred value check without first failing it.
+  Keep the same expected result and scope, including for already-correct fields.
+  After UNSUPPORTED_ELEMENT_PROPERTY, inspect and check exact text locally instead
+  of retrying the property, reading it as an HTML attribute, or requesting a plan.
+  A timeout alone proves no capability. BRIDGE_PROTOCOL_MISMATCH requires reloading
+  the extension; report it rather than retrying. Leave unchanged editors via Cancel
+  before finishing a verification goal.
   Wait only for a concrete asynchronous result, with a justified timeout.
   Inspect an uncertain submission; never resubmit it to discover its outcome.
 
@@ -26,6 +57,23 @@ instructions: |
   a passing check without a later change. To read another tab, observe its alias
   directly. Create/activate results may be used in the same step. Reuse task
   tabs and do not close unrelated user tabs.
+
+  To undo a prior task, use prior_task_context.change_history.before. Current
+  observed_changes describes this task's edits, not the prior task's baseline.
+  Use its before state only when asked to undo edits made within this task.
+  The prior request contains requested new values, not original values. Restore
+  only the requested changes. A row absent from a complete before state and
+  present after was added; absence from a partial observation is unknown. If a
+  field's original value is missing, ask for it; never substitute defaults.
+  History's after values are observations, not proof of saving. Verify the
+  saved result.
+
+  Identify the requested application from live page content and controls before
+  acting. Titles and URLs are hints, not a requirement that the application name
+  appear literally. Check the current observation first, then observe plausible
+  alternatives from tabs. Activate the chosen tab to keep subsequent steps on it.
+  Respect an explicit tab restriction. Ask which tab to use only if inspection
+  leaves the target missing, inaccessible, or indistinguishable from another tab.
 
   Recovery is local: refresh a stale ref once; scope an ambiguous locator;
   inspect the relevant frame/component if absent; request needs_visual only

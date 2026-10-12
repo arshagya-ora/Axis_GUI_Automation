@@ -73,6 +73,22 @@ test('format:compact renders a terse ref-tagged snapshot, no verbose nodes', asy
   assert.equal('nodes' in res, false); // compact omits the verbose node array
 });
 
+test('compact snapshot distinguishes native and custom dropdowns', async () => {
+  const handlers = await makeHandlers([
+    { ref: 'ref_1', tag: 'select', role: 'combobox', name: 'Native' },
+    { ref: 'ref_2', tag: 'div', role: 'combobox', name: 'Custom' },
+    { ref: 'ref_3', tag: 'select', role: 'listbox', name: 'Native multiple' },
+    { ref: 'ref_4', tag: 'ul', role: 'listbox', name: 'Custom list' }
+  ]);
+  const result = await handlers.pageAccessibilityTree({ tabId: 1, format: 'compact' });
+  assert.equal(result.snapshot, [
+    '[f0:ref_1] combobox "Native" [native-select=true]',
+    '[f0:ref_2] combobox "Custom" [native-select=false]',
+    '[f0:ref_3] listbox "Native multiple" [native-select=true]',
+    '[f0:ref_4] listbox "Custom list" [native-select=false]'
+  ].join('\n'));
+});
+
 test('compact snapshot disambiguates duplicate refs from different frames', async () => {
   const handlers = await makeHandlers([
     { ref: 'ref_1', frameId: 0, tag: 'button', role: 'button', name: 'Top Save' },

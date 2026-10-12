@@ -40,7 +40,8 @@
       try {
         sendResponse({ ok: true, ...selectRefOptions(message) });
       } catch (error) {
-        sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) });
+        sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error),
+          ...(typeof error?.code === 'string' ? { code: error.code } : {}) });
       }
       return true;
     }
@@ -136,7 +137,10 @@
           const value = a11y.ariaBooleanState(el, state);
           if (value !== null && value !== undefined) states[state] = value;
         }
-        emit(el, { role: role || undefined, name, type: el.getAttribute('type') || undefined, value: valueOf(el), href: el instanceof HTMLAnchorElement ? el.href : undefined, ...states }, context, interactive);
+        emit(el, { role: role || undefined, name, type: el.getAttribute('type') || undefined,
+          hasValue: 'value' in el, value: valueOf(el),
+          displayValue: ['textbox', 'combobox', 'spinbutton', 'row'].includes(role) && !('value' in el) ? a11y.visibleText(el).slice(0, 500) : undefined,
+          href: el instanceof HTMLAnchorElement ? el.href : undefined, ...states }, context, interactive);
       }
       if (role === 'row' && !interactive && !scope && a11y.isVisible(el)) emit(el, { role, name }, context, false);
       const row = rowMetadata.get(el);
@@ -153,7 +157,12 @@
     const all = [...controls, ...prose], nodes = all.slice(0, maxNodes);
     const retained = new Set(nodes.map(node => node.ref));
     for (const ref of refState.refs.keys()) if (!retained.has(ref)) refState.refs.delete(ref);
-    return { url: location.href, title: document.title, snapshotId: refState.snapshotId, frameId, nodes, iframes, truncated: all.length > maxNodes || scanned >= 50000 || nodes.some(node => node.textTruncated || (typeof node.value === 'string' && node.value.length > 500)) };
+    const fieldNodes = nodes.filter(node => ['textbox', 'combobox', 'spinbutton', 'checkbox', 'switch', 'radio', 'row'].includes(node.role) && node.type !== 'password');
+    const fields = fieldNodes.slice(0, 128).map(node => ({ frame: frameId, role: node.role, name: node.name,
+        context: node.context, value: node.value, display: node.displayValue,
+        checked: node.checked, selected: node.selected, readonly: node.readonly }));
+    return { url: location.href, title: document.title, snapshotId: refState.snapshotId, frameId, nodes, fields,
+      fieldsTruncated: fieldNodes.length > fields.length, iframes, truncated: all.length > maxNodes || scanned >= 50000 || nodes.some(node => node.textTruncated || (typeof node.value === 'string' && node.value.length > 500)) };
   }
 
   function targetIdentity(element) {
@@ -227,7 +236,9 @@
     const { ref, entry } = lookupRefEntry(message);
     const element = entry.element;
     if (!element.tagName || element.tagName.toLowerCase() !== 'select') {
-      throw new Error('Accessibility ref is not a <select>');
+      const error = new Error('Accessibility ref is not a <select>. Inspect the custom control, open it, and click an observed option.');
+      error.code = 'INVALID_ARGUMENT';
+      throw error;
     }
     const requested = Array.isArray(message.values) ? message.values : [];
     if (requested.length === 0) throw new Error('no options requested');
@@ -274,23 +285,14 @@
     const clickPoint = localClickPoint ? { x: localClickPoint.x + offsetX, y: localClickPoint.y + offsetY } : null;
     // Reuse the shared dom-a11y atom so ref actionability matches locator.click
     // (covers element.hidden / [hidden] ancestor / aria-hidden / fieldset[disabled]).
-    const visible = globalThis.__browserAgentBridgeDomA11y.isVisible(element);
+    const a11y = globalThis.__browserAgentBridgeDomA11y;
+    const visible = a11y.isVisible(element) || Array.from(element.labels || []).some(label => label.control === element && a11y.isVisible(label));
     const enabled = globalThis.__browserAgentBridgeDomA11y.isEnabled(element);
-    const hitDocument = element.ownerDocument || document;
-    const canHitTest = localClickPoint && typeof hitDocument.elementFromPoint === 'function';
-    let hit = canHitTest ? hitDocument.elementFromPoint(localClickPoint.x, localClickPoint.y) : null;
-    const visitedHits = new Set();
-    while (hit?.shadowRoot?.elementFromPoint && !visitedHits.has(hit)) {
-      visitedHits.add(hit);
-      const inner = hit.shadowRoot.elementFromPoint(localClickPoint.x, localClickPoint.y);
-      if (!inner || inner === hit) break;
-      hit = inner;
-    }
-    const receivesEvents = !canHitTest || Boolean(hit && (element === hit || element.contains(hit)));
+    const receivesEvents = a11y.receivesEvents(element, localClickPoint);
     const reasons = [];
     if (!visible) reasons.push('not visible');
     if (!enabled) reasons.push('disabled');
-    const pointerEvents = getComputedStyle(element).pointerEvents !== 'none';
+    const pointerEvents = getComputedStyle(element).pointerEvents !== 'none' || receivesEvents;
     if (!pointerEvents) reasons.push('pointer-events none');
     if (!clickPoint) reasons.push('no clickable point');
     if (!receivesEvents) reasons.push('covered by another element');

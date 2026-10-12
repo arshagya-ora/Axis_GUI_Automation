@@ -13,7 +13,7 @@ import pytest
 from test_axis_agent import FakeBridge, Script, browse, done, make
 import browser_tools as bt
 from axis.agents import StepGate, _extracted, browser_context
-from axis.models import ActionRecord, BrowserState, GoalCheck, TaskFact, TaskRequirements, TaskRunState
+from axis.models import ActionRecord, BrowserState, GoalCheck, NavigatorOutcome, TaskFact, TaskRequirements, TaskRunState
 from axis.orchestrator import verify_completion
 
 
@@ -67,7 +67,7 @@ def test_heading_role_is_a_valid_goal_check_target():
     assert not orchestrator.state.pending_changes
 
 
-def test_inferred_check_can_be_corrected_but_requires_a_further_verification():
+def test_inferred_check_reuses_existing_post_change_verification():
     orchestrator, _, _ = ready()
     state = orchestrator.state
     orchestrator._register_action(action(), True)
@@ -76,8 +76,8 @@ def test_inferred_check_can_be_corrected_but_requires_a_further_verification():
     corrected = GoalCheck(assertion="text", expected="Saved successfully", target="#status")
     assert orchestrator._refine_verification(corrected)
     assert state.assertions[0].superseded_by == actual.evidence_id
-    assert not verify_completion(state, None).valid
-    assertion(orchestrator, expected="Saved successfully")
+    assert not state.pending_changes
+    assert len(state.assertions) == 2
     assert verify_completion(state, None).valid
 
 
@@ -562,6 +562,8 @@ def test_checked_true_cannot_verify_a_goal_to_uncheck_the_control():
 async def test_continue_after_no_progress_replans_while_preserving_extracted_facts():
     script = Script([done("Recovered using the retained record.")])
     orchestrator, _, _ = ready(script=script)
+    # This continuation reads retained research; it has no Save postcondition.
+    orchestrator.state.current_verification = None
     record = extraction(orchestrator, {"retained": "Keep this result"})
     orchestrator.state.counters.no_progress_steps = 3
     orchestrator.state.counters.repeated_actions = 3
@@ -637,6 +639,205 @@ def test_duplicate_field_names_require_the_matching_scope():
     orchestrator._register_action(check, False)
     assert len(orchestrator.state.pending_changes) == 1
     assert next(iter(orchestrator.state.pending_changes.values())).verification_locator["within"] == "#billing"
+
+
+@pytest.mark.parametrize('value_child', [False, True])
+def test_scoped_validation_replaces_failure_and_save_still_needs_its_own_check(value_child):
+    orchestrator, _, _ = ready()
+    state = orchestrator.state
+    check = GoalCheck(assertion='text', expected='ENABLED', target='Status')
+    original = {'role': 'combobox', 'name': 'Status', 'within': {'role': 'main'}}
+    corrected = {**original, 'exact': True, 'within': {
+        'role': 'region', 'name': 'Responses', 'within': {'role': 'main'}}}
+    if value_child:
+        corrected = {'selector': '.selected-value', 'within': corrected}
+    state.current_verification = check
+    orchestrator._register_action(action(postcondition=check, postcondition_locator=original), True)
+    failed = action('browser_assert', 'text', semantic_success=False,
+        target=json.dumps({'locator': original}), result_data={
+            'expected': 'ENABLED', 'passed': False, 'match': 'exact',
+            'actual': 'Status DISABLED', 'count': 1, 'message': 'Text did not match'})
+    orchestrator._register_action(failed, False)
+    state.counters.consecutive_failures = 2
+    passed = action('browser_assert', 'text', semantic_success=True,
+        target=json.dumps({'locator': corrected}),
+        result_data={'expected': 'ENABLED', 'passed': True, 'match': 'exact', 'actual': 'ENABLED'})
+    orchestrator._register_action(passed, False)
+    assert not state.pending_changes
+    assert state.counters.consecutive_failures == 0
+    assert state.assertions[0].superseded_by == passed.evidence_id
+    failed_evidence = next(e for e in state.evidence if e.id == failed.evidence_id)
+    assert not failed_evidence.verified
+    assert "actual='Status DISABLED' count=1" in failed_evidence.detail
+
+    state.current_verification = GoalCheck(assertion='text', expected='Saved', target='#receipt')
+    orchestrator._register_action(action(target='Save'), True)
+    assertion(orchestrator, target='#receipt', passed=False)
+    assert state.pending_changes
+    assert not verify_completion(state, None).valid
+    assertion(orchestrator, target='#receipt')
+    assert not state.pending_changes
+    assert verify_completion(state, None).valid
+
+
+@pytest.mark.parametrize('corrected', [
+    {'label': 'Other', 'within': {'selector': '#profile'}},
+    {'label': 'Name', 'within': {'selector': '#billing'}},
+    {'label': 'Name'},
+    {'label': 'Name', 'exact': False, 'within': {'selector': '#profile'}},
+])
+def test_validation_correction_cannot_change_or_broaden_the_field(corrected):
+    orchestrator, _, _ = ready()
+    original = {'label': 'Name', 'exact': True, 'within': {'selector': '#profile'}}
+    check = GoalCheck(assertion='value', expected='Alice', target='Name')
+    orchestrator.state.current_verification = check
+    orchestrator._register_action(action(operation='fill', expected_value='Alice',
+        target=json.dumps({'locator': original}), postcondition=check, postcondition_locator=original), True)
+    orchestrator._register_action(action('browser_assert', 'value', semantic_success=True,
+        target=json.dumps({'locator': corrected}), result_data={'expected': 'Alice', 'passed': True}), False)
+    assert orchestrator.state.pending_changes
+
+
+def test_observation_only_resets_failure_streak_when_it_verifies_navigation():
+    orchestrator, _, _ = ready()
+    state = orchestrator.state
+    state.counters.consecutive_failures = 2
+    extraction(orchestrator, 'Some visible page text')
+    assert state.counters.consecutive_failures == 2
+    orchestrator._register_action(action('browser_navigate', 'open'), True)
+    pending = next(iter(state.pending_changes.values()))
+    orchestrator._verify_navigation('tab_1', pending.expected_url, state.next_sequence())
+    assert not state.pending_changes
+    assert state.counters.consecutive_failures == 0
+
+
+def test_read_only_check_recovery_resets_streak_and_preserves_failed_evidence():
+    orchestrator, _, _ = ready()
+    failed = assertion(orchestrator, passed=False)
+    orchestrator.state.counters.consecutive_failures = 2
+    passed = assertion(orchestrator)
+    assert orchestrator.state.counters.consecutive_failures == 0
+    assert orchestrator.state.assertions[0].superseded_by == passed.evidence_id
+    assert not next(e for e in orchestrator.state.evidence if e.id == failed.evidence_id).verified
+
+
+def test_change_history_keeps_before_state_across_edits_save_and_checkpoint():
+    orchestrator, bridge, _ = ready()
+    state = orchestrator.state
+    before = [{'role': 'textbox', 'name': 'Limit', 'value': '0', 'context': 'form Settings'},
+              {'role': 'row', 'name': '310 14 Edit Delete', 'context': 'table Networks'}]
+    observed = state.add_evidence('observation', 'Original configuration', tab='tab_1')
+    orchestrator._remember_fields('tab_1', {'url': bridge.url, 'fields': before, 'fields_complete': True}, observed.id)
+    orchestrator._register_action(action(operation='fill', expected_value='10', target='textbox "Limit"'), True)
+    edited = [{'role': 'textbox', 'name': 'Limit', 'value': '10', 'context': 'form Settings'},
+              *before[1:], {'role': 'row', 'name': '345 18 Edit Delete', 'context': 'table Networks'}]
+    orchestrator._remember_fields('tab_1', {'url': bridge.url, 'fields': edited}, 'edited')
+    orchestrator._register_action(action(target='Save'), True)
+    saved = [{'role': 'textbox', 'name': 'Limit', 'display': '10', 'readonly': True}, *edited[1:]]
+    orchestrator._remember_fields('tab_1', {'url': bridge.url, 'fields': saved}, 'saved')
+    assert len(state.change_history) == 1
+    assert state.change_history[0]['before'] == before
+    assert state.change_history[0]['before_evidence_id'] == observed.id
+    assert state.change_history[0]['after'] == saved
+    checkpoint = orchestrator.checkpoint_browser()
+    assert 'field_observations' not in checkpoint
+    restored, _, _ = ready()
+    restored._restore_browser_checkpoint(checkpoint)
+    assert restored.state.change_history == state.change_history
+
+
+def test_revert_progress_does_not_replace_the_prior_tasks_baseline():
+    orchestrator, bridge, _ = ready()
+    prior = [{'url': bridge.url, 'before': [{'name': 'Limit', 'value': '0'}],
+              'after': [{'name': 'Limit', 'value': '10'}]}]
+    orchestrator.state.reference_context = {'change_history': prior}
+    orchestrator._remember_fields('tab_1', {'url': bridge.url, 'fields': [{'name': 'Limit', 'value': '10'}]}, 'before_revert')
+    orchestrator._register_action(action(operation='fill', expected_value='0', target='textbox "Limit"'), True)
+    orchestrator._remember_fields('tab_1', {'url': bridge.url, 'fields': [{'name': 'Limit', 'value': '0'}]}, 'after_revert')
+    assert orchestrator.state.reference_context['change_history'][0]['before'][0]['value'] == '0'
+    assert orchestrator.state.change_history[0]['before'][0]['value'] == '10'
+
+
+def test_missing_field_observations_do_not_invent_a_baseline():
+    orchestrator, _, _ = ready()
+    orchestrator._register_action(action(operation='fill', expected_value='10', target='textbox "Limit"'), True)
+    assert orchestrator.state.change_history == []
+
+
+def test_completed_step_reports_are_idempotent_and_conflicts_identify_the_step():
+    from axis.models import BrowserStep, StepResult
+    orchestrator, _, _ = ready()
+    state = orchestrator.state
+    state.browser_steps = [BrowserStep(instruction='Edit'), BrowserStep(instruction='Save')]
+    proof = state.add_evidence('assertion', 'Verified', verified=True)
+    first = StepResult(step=1, result='Edited', evidence_ids=[proof.id])
+    assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[first])) is None
+    assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[first])) is None
+    conflicting = first.model_copy(update={'result': 'Changed result'})
+    error = orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[conflicting]))
+    assert 'Step 1 is already recorded' in error and 'next incomplete step is 2' in error
+    second = StepResult(step=2, result='Saved', evidence_ids=[proof.id])
+    assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[first, second])) is None
+
+
+@pytest.mark.anyio
+async def test_next_step_receives_the_previous_recovery_decision():
+    script = Script([], [
+        {'outcome': {'status': 'continue', 'summary': 'Saved view is a div.', 'reason': 'Use exact text, not the value property.'}},
+        {'outcome': {'status': 'failed', 'reason': 'Fixture stopped'}},
+    ])
+    orchestrator, _, _ = make(script, direct=True)
+    await orchestrator.run('Inspect settings')
+    assert '<previous_step>' in script.navigator_prompts[1]
+    assert 'Use exact text, not the value property.' in script.navigator_prompts[1]
+
+
+@pytest.mark.anyio
+async def test_stale_rejections_get_a_fresh_step_without_spending_failure_budget():
+    script = Script([], [{'outcome': {'status': 'failed', 'reason': 'Reached fresh step'}}])
+    orchestrator, _, config = make(script, direct=True)
+    config.run.max_consecutive_failures = 1
+    navigate = orchestrator._navigate
+    attempts = 0
+
+    async def stale_then_navigate(browser_state):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            gate = StepGate(max_actions=4, remaining_total_actions=4)
+            gate.reject('browser_act', {'tab': 'tab_1'}, 'STALE_STATE', 'Observe the changed page')
+            return NavigatorOutcome(status='continue'), gate
+        return await navigate(browser_state)
+
+    orchestrator._navigate = stale_then_navigate
+    result = await orchestrator.run('Inspect the current tab')
+    assert attempts == 3
+    assert result.reason == 'Reached fresh step'
+    assert orchestrator.state.counters.consecutive_failures == 0
+
+
+@pytest.mark.anyio
+async def test_reads_between_failed_checks_do_not_reset_failure_budget():
+    command = ('browser_assert', {'tab': 'tab_1', 'command': {
+        'assertion': 'text', 'locator': {'selector': '#status'}, 'expected': 'Saved'}})
+    script = Script([], [
+        {'calls': [command], 'outcome': {'status': 'continue'}},
+        {'calls': [('browser_observe', {'tab': 'tab_1'})], 'outcome': {'status': 'continue'}},
+        {'calls': [command], 'outcome': {'status': 'continue'}},
+    ])
+    orchestrator, bridge, config = make(script, direct=True)
+    config.run.max_consecutive_failures = 2
+
+    def mismatch():
+        raise bt.BrowserBridgeError('Text did not match', {'code': 'LOCATOR_EXPECT_TIMEOUT'})
+
+    bridge.responses['expect.locator.toHaveText'] = mismatch
+    result = await orchestrator.run('Verify the current status')
+    assert result.status == 'failed'
+    assert 'VERIFICATION_UNRESOLVED' in result.reason
+    assert "expected 'Saved'" in result.reason
+    assert '#status' in result.reason
+    assert result.total_steps == 3
 
 
 def test_missing_required_approval_callback_refuses_before_execution():

@@ -1,6 +1,7 @@
 """Task-scoped approvals and automatic attachment contracts."""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import json
 import sys
 from uuid import uuid4
 
@@ -461,10 +462,12 @@ def test_conversation_context_preserves_goal_without_restoring_old_execution(ser
     response = submit(client, cid, text=followup, conversation_task_id=task['id'])
     assert response.status_code == 202
     restarted = response.json()['task']
-    assert restarted['instruction'].startswith(followup)
-    assert original in restarted['instruction']
-    assert 'Open Settings' in restarted['instruction']
-    assert 'reference only' in restarted['instruction']
+    assert restarted['instruction'] == followup
+    assert restarted['reference_context']['request'] == original
+    assert 'browser_checkpoint' not in restarted['reference_context']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state
+             and runner.orchestrator.state.original_request == followup)
+    assert runner.orchestrator.state.reference_context == restarted['reference_context']
     assert not restarted.get('browser_checkpoint')
     assert 'pending_approval' not in restarted
 
@@ -478,3 +481,45 @@ def test_conversation_context_cannot_cross_conversations(service):
     wait_for(lambda: runner.active() is None)
     response = submit(client, conversation(client), text='Try again', conversation_task_id=task['id'])
     assert response.status_code == 422
+
+
+def test_conversation_context_uses_messages_instead_of_legacy_checkpoint_text(service):
+    client, runner, store = service
+    cid = conversation(client)
+    task = submit(client, cid, text='Hi').json()['task']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
+    client.post(f'/api/tasks/{task["id"]}/control', json={'action': 'stop'})
+    wait_for(lambda: runner.active() is None)
+    source = store.task(task['id'])
+    source['instruction'] = 'Hi\n\nPrior task context (reference only):\n' + json.dumps({
+        'request': 'Download http://old.test and take a screenshot',
+        'browser_checkpoint': {'current_goal': 'nested checkpoint'},
+    })
+    source['browser_checkpoint'] = {'tab': {'id': 42, 'url': 'http://old.test/', 'title': ''}}
+    history = [{'url': 'http://old.test/', 'before': [{'name': 'Limit', 'value': '0'}],
+                'after': [{'name': 'Limit', 'value': '10'}], 'before_evidence_id': 'evidence_1'}]
+    source['browser_checkpoint']['change_history'] = history
+    store.save_task(source)
+    restarted = submit(client, cid, text='Hi', conversation_task_id=task['id']).json()['task']
+    assert restarted['instruction'] == 'Hi'
+    assert restarted['reference_context']['request'] == 'Hi'
+    assert restarted['reference_context']['tab'] == {'url': 'http://old.test/', 'title': ''}
+    assert restarted['reference_context']['change_history'] == history
+    assert 'nested checkpoint' not in json.dumps(restarted['reference_context'])
+
+
+def test_restart_rebuilds_user_instructions_without_legacy_context(service):
+    client, runner, store = service
+    cid = conversation(client)
+    original = 'Inspect Settings. Do not modify anything.'
+    task = submit(client, cid, text=original).json()['task']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
+    client.post(f'/api/tasks/{task["id"]}/control', json={'action': 'stop'})
+    wait_for(lambda: runner.active() is None)
+    source = store.task(task['id'])
+    source['instruction'] = original + '\n\nPrior task context (reference only):\nDownload http://old.test'
+    store.save_task(source)
+    restarted = submit(client, cid, text='Try again', context_task_id=task['id']).json()['task']
+    assert original in restarted['instruction']
+    assert 'Download' not in restarted['instruction']
+    assert restarted['restart_instruction'] == original

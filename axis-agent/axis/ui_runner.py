@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from axis.bootstrap import build_orchestrator
 from axis.console import print_debug_event, print_event, print_result
-from axis.models import AxisConfig, AxisEvent, AxisResult
+from axis.models import AxisConfig, AxisEvent, AxisResult, MAX_REQUEST
 from axis.models import AttachmentRef
 from axis.attachments.runtime import DocumentSession
 from axis.ui_store import Store, ServiceError, TERMINAL
@@ -50,6 +50,12 @@ def public_activity(event: AxisEvent) -> str | None:
             return 'Reading progress: ' + '; '.join(f"{x['filename']}: {x['read']}/{x['total']} sections" for x in detail['coverage'])[:800]
         if detail.get('phase') == 'document_error':
             return f"Document issue ({detail.get('attempt', 1)}/3): {str(detail.get('error', 'Document operation failed'))[:600]}"
+        if detail.get('phase') == 'document_notes_rejected':
+            reasons = {'unknown_section', 'read_restricted', 'unread_source', 'scope_mismatch', 'quote_mismatch'}
+            rejected = [f"section {item['section_id']}: {item['reason']}"
+                        for item in detail.get('rejections', [])[:24]
+                        if type(item.get('section_id')) is int and item.get('reason') in reasons]
+            return 'Skipped unverified document notes: ' + '; '.join(rejected)[:800]
         return {'document_read': 'Read attachment or updated workflow progress',
                 'planner_started': 'Planning the next step', 'navigator_step_started': 'Working in the browser',
                 'action_started': 'Executing browser operation',
@@ -62,7 +68,7 @@ def public_phase(event: AxisEvent) -> str:
     """A bounded display category; never forward raw event details."""
     if event.kind == 'planner_decision' or event.detail.get('phase') == 'planner_started':
         return 'Planning'
-    if event.detail.get('phase') in {'observed', 'document_read', 'document_error'}:
+    if event.detail.get('phase') in {'observed', 'document_read', 'document_error', 'document_notes_rejected'}:
         return 'Evidence'
     if event.kind == 'browser_action' and event.detail.get('tool') in {'browser_capture_evidence', 'browser_observe'}:
         return 'Evidence'
@@ -102,6 +108,27 @@ class Runner:
         self.closed = False
         self.attachments = None
         self.approvals = ExecutionApprovals(self)
+
+    def _user_request(self, task):
+        rows = self.store.db.execute(
+            "SELECT text FROM messages WHERE task_id=? AND role='user' AND delivery='applied' "
+            "AND intent IN ('new_task','follow_up') ORDER BY ordinal", (task['id'],),
+        ).fetchall()
+        parts = [row['text'] for row in rows]
+        if task.get('restart_instruction'):
+            parts.insert(0, task['restart_instruction'])
+        return '\nFollow-up: '.join(parts)[:MAX_REQUEST] if parts else task['title']
+
+    def _reference_context(self, task):
+        request = self._user_request(task)
+        prior = task.get('reference_context', {}).get('request')
+        if prior:
+            request = prior + '\nFollow-up: ' + request
+        tab = (task.get('browser_checkpoint') or {}).get('tab') or {}
+        return {'request': request[:MAX_REQUEST], 'status': task['status'],
+                'change_history': (task.get('browser_checkpoint') or {}).get('change_history', [])[:8],
+                'outcome': ((task.get('result') or {}).get('answer') or '')[:800],
+                'tab': {key: tab[key] for key in ('url', 'title') if key in tab}}
 
     def change_mode(self, task_id, mode):
         with self.lock, self.store.transaction():
@@ -166,31 +193,17 @@ class Runner:
                     source = self.store.task(body.conversation_task_id)
                     if source['conversation_id'] != conversation_id:
                         raise ServiceError('invalid_input', 'Conversation context must belong to this conversation.', 422)
-                    # Context informs the existing agent; it does not replay an old
-                    # task or restore stale completion/authorization state.
-                    previous = source.get('conversation_context') or source.get('instruction') or source['title']
-                    outcome = (source.get('result') or {}).get('answer') or source.get('current_activity', '')
-                    checkpoint = source.get('browser_checkpoint') or {}
-                    context = {'request': previous, 'status': source['status'],
-                               'outcome': outcome, 'browser_checkpoint': checkpoint}
-                    instruction = (body.text + '\n\nPrior task context (reference only):\n' + json.dumps(context, ensure_ascii=False)
-                        + '\nResolve references in the current request using this context. The current request determines scope; '
-                          'starting from scratch resets execution progress, not the objective or constraints. '
-                          'Verify the live page before reusing prior evidence or repeating changes.')
-                    task['conversation_context'] = previous + '\nFollow-up: ' + body.text
-                    task['instruction'] = instruction
+                    task['reference_context'] = self._reference_context(source)
                     self.store.save_task(task)
                 if body.context_task_id:
                     source = self.store.task(body.context_task_id)
                     if source['conversation_id'] != conversation_id:
                         raise ServiceError('invalid_input', 'Saved context must belong to this conversation.', 422)
-                    outcome = (source.get('result') or {}).get('answer') or source.get('current_activity', '')
+                    task['reference_context'] = self._reference_context(source)
                     if source['status'] in {'failed', 'cancelled', 'interrupted'}:
-                        original = source.get('instruction')
-                        if not original:
-                            row = self.store.db.execute("SELECT text FROM messages WHERE task_id=? AND intent='new_task' ORDER BY ordinal LIMIT 1", (source['id'],)).fetchone()
-                            original = row[0] if row else source['title']
+                        original = self._user_request(source)
                         instruction = original + '\n\nRestart request: ' + body.text + '\nPrior execution ended; inspect current website state before repeating any change.'
+                        task['restart_instruction'] = original
                         if self.attachments:
                             refs = [AttachmentRef(attachment_id=a['id'], role=a['role']) for a in self.attachments.catalog(source['id'])]
                             refs = list({r.attachment_id: r for r in [*refs, *body.attachments]}.values())
@@ -212,11 +225,7 @@ class Runner:
                         task['instruction'] = instruction
                         if source.get('browser_checkpoint'):
                             task['browser_checkpoint'] = source['browser_checkpoint']
-                        self.store.save_task(task)
-                        outcome = ''
-                    available = max(0, 4000-len(instruction)-60)
-                    if available and outcome:
-                        instruction += '\n\nSaved prior outcome (context only):\n' + outcome[:min(800, available)]
+                    self.store.save_task(task)
                 message = self.store.message(conversation_id, task_id, body.text, body.client_request_id, body.intent, attachments=[r.model_dump() for r in body.attachments])
                 self.store.event(conversation_id, task_id, 'status', {'task': task, 'text': task['current_activity']})
                 # Publish execution only after acceptance has committed (below).
@@ -309,7 +318,7 @@ class Runner:
                 config = self.config.model_copy(deep=True)
                 # Retain cumulative usage through a new model/browser session.
                 config.run = type(config.run).model_validate(task.get('document_checkpoint', {}).get('base_limits', task['limits']))
-                self.future = asyncio.run_coroutine_threadsafe(self._execute('recover', (task['instruction'], config)), self.loop)
+                self.future = asyncio.run_coroutine_threadsafe(self._execute('recover', (self._user_request(task), config)), self.loop)
                 return task
             if self.active_id != task_id:
                 if action == 'stop' and task['status'] in TERMINAL:
@@ -458,7 +467,11 @@ class Runner:
                         total_steps=state.counters.total_steps if state else 0,
                         model_requests=int(state.usage.requests) if state else 0)
                 elif mode in {'start', 'recover'}:
-                    result = await self.orchestrator.start_task(value, task_id=task_id)
+                    reference = self.store.task(task_id).get('reference_context')
+                    if reference:
+                        result = await self.orchestrator.start_task(value, task_id=task_id, reference_context=reference)
+                    else:
+                        result = await self.orchestrator.start_task(value, task_id=task_id)
                 elif mode == 'resume':
                     result = await self.orchestrator.resume_run()
                 elif mode == 'extend':

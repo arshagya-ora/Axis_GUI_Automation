@@ -54,8 +54,16 @@ class FakeBridge:
     def rpc(self, method, params=None, **_):
         self.calls.append((method, params or {}))
         if method == "tabs.list":
-            base = {"id": self.base_id, "url": self.url, "title": self.title, "active": not self.extra_tabs}
-            return {"tabs": [base, *self.extra_tabs]}
+            base = {"id": self.base_id, "url": self.url, "title": self.title,
+                    "active": self.focused_id == self.base_id if hasattr(self, 'focused_id') else not self.extra_tabs}
+            tabs = [base, *self.extra_tabs]
+            query = (params or {}).get('query', {})
+            if query.get('lastFocusedWindow'):
+                focused = getattr(self, 'focused_id', next((t['id'] for t in tabs if t.get('active')), None))
+                tabs = [t for t in tabs if t['id'] == focused]
+            if query.get('active'):
+                tabs = [t for t in tabs if t.get('active')]
+            return {"tabs": tabs}
         if method == "page.accessibilityTree":
             self.observations += 1
             return {
@@ -193,14 +201,16 @@ OBSERVE = ("browser_observe", {"tab": "tab_1"})
 # 1-4: planner cadence
 # ---------------------------------------------------------------------------
 
-async def test_named_gui_request_requires_matching_controlled_tab():
-    script = Script([browse('Configure the CNCC timeout')])
-    orchestrator, bridge, _ = make(script)
+async def test_named_gui_request_inspects_the_page_before_asking_for_a_tab():
+    script = Script([browse('Configure the CNCC timeout')], [
+        {'outcome': {'status': 'ask_user', 'reason': 'The requested application is not open.'}},
+    ])
+    orchestrator, bridge, _ = make(script, direct=True)
     result = await orchestrator.run('From CNCC Core GUI, configure the timeout.')
     assert result.status == 'needs_user'
-    assert 'CNCC Core GUI' in result.reason
-    assert bridge.methods[-1] == 'tabs.list'
-    assert 'page.accessibilityTree' not in bridge.methods
+    assert result.reason == 'The requested application is not open.'
+    assert 'page.accessibilityTree' in bridge.methods
+    assert script.navigator_calls == 1
 
 
 def test_pause_cancels_model_wait_but_preserves_inflight_browser_action():
@@ -258,6 +268,7 @@ async def test_planner_runs_again_after_three_navigator_steps():
         [{"calls": [], "outcome": {"status": "continue", "summary": f"step {i}"}} for i in range(5)],
     )
     orchestrator, _, config = make(script)
+    config.run.planner_interval_steps = 3
     await orchestrator.run("Keep going.")
     assert config.run.planner_interval_steps == 3
     assert script.navigator_calls == 3  # exactly the interval, then the planner
@@ -298,7 +309,8 @@ async def test_every_navigator_step_gets_a_fresh_observation():
         [browse(), done()],
         [{"calls": [], "outcome": {"status": "continue"}} for _ in range(3)],
     )
-    orchestrator, bridge, _ = make(script)
+    orchestrator, bridge, config = make(script)
+    config.run.planner_interval_steps = 3
     await orchestrator.run("Look repeatedly.")
     assert bridge.methods.count("page.accessibilityTree") == 3 == script.navigator_calls
     for index, prompt in enumerate(script.navigator_prompts, start=1):
@@ -1115,6 +1127,7 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
         "extension.info",          # one-time capability negotiation
         "native.sitePatterns",     # site-pattern preflight
         "tabs.list",              # bind to the focused tab, once
+        "tabs.list",              # active tab in the last-focused window
         "page.accessibilityTree",  # programmatic observation before step 1
         "tabs.list",              # validate destination before an authorized action
         "locator.fillRef",
@@ -1160,6 +1173,87 @@ async def test_direct_action_plus_check_completes_in_two_requests():
     assert not orchestrator.memory.pending_changes
     assert bridge.methods.count("locator.fill") == 1
     assert bridge.methods.count("expect.locator.toHaveValue") == 1
+
+
+async def test_custom_dropdown_recovers_then_saves_and_verifies_after_reopening():
+    class DropdownBridge(FakeBridge):
+        value = 'DISABLED'
+        saved = 'DISABLED'
+        opened = False
+        editing = True
+
+        def rpc(self, method, params=None, **kwargs):
+            if method == 'locator.selectOptionRef':
+                self.calls.append((method, params))
+                raise bt.BrowserBridgeError('Control is not a <select>', {'code': 'INVALID_ARGUMENT'})
+            if method == 'locator.click':
+                name = params['locator']['name']
+                if name == 'Feature Status':
+                    assert self.editing
+                    self.opened = True
+                elif name == 'Enabled':
+                    assert self.opened
+                    self.value, self.opened = 'ENABLED', False
+                elif name == 'Save':
+                    assert self.editing and self.value == 'ENABLED'
+                    self.saved, self.editing = self.value, False
+                    self.value = ''
+                elif name == 'Edit':
+                    assert not self.editing
+                    self.value, self.editing = self.saved, True
+            result = super().rpc(method, params, **kwargs)
+            if method == 'page.accessibilityTree':
+                result['snapshot'] = (
+                    f'[f0:status] combobox "Feature Status" [native-select=false] {self.value}\n'
+                    '[f0:save] button "Save"' if self.editing else '[f0:edit] button "Edit"')
+                if self.opened:
+                    result['snapshot'] += '\n[f0:enabled] option "Enabled"'
+            if method == 'expect.locator.toHaveText':
+                assert self.editing and self.saved == self.value == params['expected'] == 'ENABLED'
+                return {'ok': True, 'actual': self.value}
+            return result
+
+    def click(role, name):
+        return ('browser_act', {'tab': 'tab_1', 'command': {'action': 'click',
+                'target': {'kind': 'locator', 'locator': {'role': role, 'name': name, 'exact': True}}}})
+
+    class DropdownScript(Script):
+        retries = 0
+
+        def _respond(self, messages, info):
+            if any(part.part_kind == 'retry-prompt' and part.tool_name == 'browser_act'
+                   for part in messages[-1].parts):
+                self.retries += 1
+                assert self.retries == 1
+                name, args = click('combobox', 'Feature Status')
+                return ModelResponse(parts=[ToolCallPart(name, args)])
+            return super()._respond(messages, info)
+
+    script = DropdownScript([
+        browse('Enable Feature Status and verify it after saving and reopening',
+               verification={'assertion': 'text', 'target': 'Feature Status', 'expected': 'ENABLED'}),
+        done('Saved and verified ENABLED.'),
+    ], [
+        {'calls': [('browser_act', {'tab': 'tab_1', 'command': {'action': 'select',
+            'target': {'kind': 'ref', 'ref': 'ref_1'}, 'options': ['Enabled']}})]},
+        {'calls': [click('option', 'Enabled')]},
+        {'calls': [click('button', 'Save')]},
+        {'calls': [click('button', 'Edit')]},
+        {'calls': [('browser_assert', {'tab': 'tab_1', 'command': {'assertion': 'text',
+            'locator': {'role': 'combobox', 'name': 'Feature Status', 'exact': True}, 'expected': 'ENABLED'}})],
+         'outcome': {'status': 'goal_reached'}},
+    ])
+    orchestrator, bridge, _ = make(script, bridge=DropdownBridge())
+    result = await orchestrator.start_task('Set Feature Status to Enabled, Save, then reopen Edit and verify ENABLED on the current page.')
+    assert result.status == 'completed', result.reason
+    assert script.retries == 1
+    assert script.navigator_calls == 5
+    assert result.planner_passes == script.planner_calls == 2
+    assert bridge.methods.count('locator.selectOptionRef') == 1
+    assert [params['locator']['name'] for method, params in bridge.calls if method == 'locator.click'] == [
+        'Feature Status', 'Enabled', 'Save', 'Edit']
+    assert bridge.methods.count('expect.locator.toHaveText') == 1
+    assert not orchestrator.state.pending_changes
 
 
 async def test_direct_browser_agent_can_request_planner_help():

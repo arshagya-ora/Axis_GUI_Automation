@@ -62,9 +62,12 @@ _UNOBSERVABLE_PREFIXES = ("chrome://", "about:")
 # above. Matches the Google flow the project's own smoke test already treats
 # as a first-class target (scripts/browser_foundation_smoke.py).
 _FALLBACK_TAB_URL = "https://www.google.com/webhp?hl=en&pws=0"
-_GUI_ACTION = re.compile(r"\b(open|click|fill|enter|configure|apply|update|create|change|set|select|submit|perform|do)\b", re.I)
+_GUI_ACTION = re.compile(r"\b(open|click|fill|enter|configure|apply|update|create|change|set|select|enable|disable|submit|perform|do)\b", re.I)
 _GUI_TARGET = re.compile(r"\b(?:current|open|this) (?:page|tab|website)\b|\b(?:gui|web app(?:lication)?|website)\b", re.I)
 _NAMED_GUI = re.compile(r"\b([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,4})\s+GUI\b")
+_CURRENT_TAB = re.compile(
+    r"\b(?:current(?:ly)?(?: open)?|this|active|focused|open) tab\b|\bopened the tab\b", re.I,
+)
 
 
 def gui_action_request(request: str) -> bool:
@@ -405,9 +408,11 @@ class AxisOrchestrator:
 
     # -- entry points ----------------------------------------------------
 
-    async def start_task(self, task: str, *, task_id: str | None = None) -> AxisResult:
+    async def start_task(self, task: str, *, task_id: str | None = None,
+                         reference_context: dict[str, Any] | None = None) -> AxisResult:
         """Start an independent task while reusing the connected browser."""
         self.state = self.config.new_memory(task, extract_requirements(task))
+        self.state.reference_context = reference_context or {}
         numbered = re.findall(r'(?m)^\s*\d+[.)]\s+(.+?)(?=^\s*\d+[.)]\s+|\Z)', task, re.S | re.M)
         if len(numbered) > 1 and not self.documents:
             self.state.browser_steps = [BrowserStep(instruction=text.strip()[:4000]) for text in numbered[:64]]
@@ -440,6 +445,7 @@ class AxisOrchestrator:
                 self.state.goal_number = checkpoint.get('goal_number', 0)
                 self.state.pending_uploads = checkpoint.get('pending_uploads', {})
                 self.state.pending_changes = {key:PendingChange.model_validate(value) for key,value in checkpoint.get('pending_changes', {}).items()}
+                self.state.last_interaction_by_tab = checkpoint.get('last_interaction_by_tab', {})
                 self.state.current_goal_id = checkpoint.get('current_goal_id')
                 self.state.current_goal = checkpoint.get('current_goal')
                 if checkpoint.get('current_verification'):
@@ -463,6 +469,7 @@ class AxisOrchestrator:
             self.recovery_counts = None
         if self.browser_checkpoint and not self.documents:
             self._restore_browser_checkpoint(self.browser_checkpoint)
+            self.state.requirements = extract_requirements(task)
             self.browser_checkpoint = None
         self._set_navigator_tools()
         try:
@@ -506,6 +513,11 @@ class AxisOrchestrator:
         state.add_followup(follow_up)
         added = extract_requirements(follow_up)
         state.requirements = _merge_requirements(state.requirements, added)
+        application = named_gui(follow_up)
+        if (_CURRENT_TAB.search(follow_up) or added.literal_urls or re.search(r"\btab_\d+\b", follow_up)
+                or (application and application != state.bound_application)):
+            state.bound_tab = None
+            state.bound_application = None
         if added.require_download:
             state.downloads.clear()
             state.started_wallclock = time.time()
@@ -671,6 +683,14 @@ class AxisOrchestrator:
                      "Use /continue with recovery instructions to retain these sources and existing tabs.")
         return clip("\n".join(lines), self.config.run.final_answer_max_chars) or ""
 
+    def _synthesis_reserve(self) -> int:
+        if self.state.requirements.min_sources or self.state.requirements.require_search:
+            return self.config.run.synthesis_reserve_requests
+        if gui_action_request(self._current_request()) or (self.documents and any(
+                use.get('purpose') == 'execute' for use in self.documents._uses().values())):
+            return 0
+        return self.config.run.synthesis_reserve_requests
+
     def _stop_reason(self) -> AxisResult | None:
         state = self.state
         assert state is not None
@@ -685,7 +705,7 @@ class AxisOrchestrator:
                 room = self.config.run.document_extra_steps - state.document_auto_steps
                 if (room > 0 and covered > state.document_extension_progress
                         and self.documents.progress().get('attempts', 0) == 0
-                        and int(state.usage.requests) < run.max_model_requests - self.config.run.synthesis_reserve_requests):
+                        and int(state.usage.requests) < run.max_model_requests - self._synthesis_reserve()):
                     extension = min(room, self.config.run.document_extension_steps)
                     state.extra_steps += extension
                     state.document_auto_steps += extension
@@ -809,9 +829,11 @@ class AxisOrchestrator:
                     from axis.attachments.scope import user_messages
                     self.documents.configure_uses(plan.attachment_uses, state.original_request + '\n' + '\n'.join(user_messages(self.documents.store, state.task_id)))
                 except ValueError as error:
-                    from axis.attachments.runtime import DocumentRestriction
+                    from axis.attachments.runtime import DocumentRestriction, DocumentScopeError
                     if isinstance(error, DocumentRestriction):
                         return self._result('needs_user', reason=str(error), answer=str(error))
+                    if isinstance(error, DocumentScopeError):
+                        return self._result('failed', reason='Invalid attachment scope: ' + str(error), recoverable=True)
                     state.last_error = str(error)
                     document_stalls += 1
                     self.documents.progress(document_stalls, document_results)
@@ -819,14 +841,10 @@ class AxisOrchestrator:
                         return self._result('failed', reason='Document scope could not be validated: ' + str(error), recoverable=True)
                     continue
             if self.documents and plan.document_notes:
-                try:
-                    self.documents.retain_notes(plan.document_notes)
-                except ValueError as error:
-                    state.last_error = str(error)
-                    document_stalls += 1
-                    if document_stalls >= 3:
-                        return self._result('failed', reason='Document findings could not be validated: ' + str(error), recoverable=True)
-                    continue
+                rejected = self.documents.retain_notes(plan.document_notes)
+                if rejected:
+                    self._emit('status', phase='document_notes_rejected', rejections=rejected,
+                               error='; '.join(f"Section {item['section_id']}: {item['reason']}" for item in rejected))
 
             if plan.decision == "complete":
                 if self.documents:
@@ -846,6 +864,9 @@ class AxisOrchestrator:
                     state.last_error = f"Shorten the answer to {self.config.run.final_answer_max_chars} characters while preserving required sources."
                     continue
                 verdict = verify_completion(state, state.last_browser_state)
+                if not self._current_goal_verified():
+                    verdict.valid = False
+                    verdict.reasons.append("The current goal still needs its declared scoped verification.")
                 if not verdict.valid:
                     state.completion_rejected = True
                     state.last_error = "Completion rejected: " + " ".join(verdict.reasons)
@@ -886,7 +907,7 @@ class AxisOrchestrator:
                     self._emit('status', phase='document_read', operation=result.get('operation', plan.document_request.operation),
                                coverage=self.documents.coverage())
                 except (ValueError, RuntimeError) as error:
-                    from axis.attachments.runtime import DocumentRestriction
+                    from axis.attachments.runtime import DocumentRestriction, DocumentScopeError
                     state.last_error = str(error)[:600]
                     document_stalls += 1
                     if self.documents:
@@ -895,6 +916,8 @@ class AxisOrchestrator:
                                attempt=document_stalls, operation=plan.document_request.operation if plan.document_request else 'missing')
                     if isinstance(error, DocumentRestriction):
                         return self._result('needs_user', reason=state.last_error, answer=state.last_error)
+                    if isinstance(error, DocumentScopeError):
+                        return self._result('failed', reason='Invalid attachment scope: ' + state.last_error, recoverable=True)
                     if document_stalls >= 3:
                         reason = 'Document work stopped after three attempts without progress: ' + state.last_error
                         return self._result('failed', reason=reason, answer=reason, recoverable=True)
@@ -902,48 +925,76 @@ class AxisOrchestrator:
                 self.documents.checkpoint(state, self.config.run.model_dump())
                 continue
 
-            if (state.remaining_work or state.requirements.min_sources) and (
+            if self._synthesis_reserve() and (state.remaining_work or state.requirements.min_sources) and (
                     self._run_limits().max_model_requests - int(state.usage.requests)
-                    <= self.config.run.synthesis_reserve_requests):
+                    <= self._synthesis_reserve()):
                 return self._result("limit_reached", reason="Research budget reached its synthesis reserve; progress is preserved.")
 
-            # A repair stays attached to the unfinished goal; changing its wording
-            # never silently completes it or abandons pending changes.
-            if not state.current_goal_id or (plan.next_goal != state.current_goal and not state.pending_changes):
-                state.goal_number += 1
-                state.current_goal_id = f"goal_{state.goal_number}"
-                state.current_verification = plan.verification
-            elif state.current_verification is None and plan.verification is not None:
-                state.current_verification = plan.verification
-                for pending in state.pending_changes.values():
-                    if pending.goal_id == state.current_goal_id and pending.verification is None:
-                        pending.verification = plan.verification
-            elif plan.verification != state.current_verification:
-                self._refine_verification(plan.verification)
-            state.current_plan_summary = plan.plan_summary
-            state.current_goal = self._preserve_literal_urls(plan.next_goal)
-            state.current_success_condition = plan.success_condition
-            state.repair_attempted = False
-
-            if self.documents:
-                workflow = self.documents.workflow()
-                if workflow['next_steps'] and not plan.workflow_step_id:
-                    state.last_error = 'Choose the first pending workflow_step_id for browser execution.'
-                    continue
-                if plan.workflow_step_id:
-                    if plan.verification is None:
-                        state.last_error = 'Workflow execution requires a concrete verification postcondition.'
-                        continue
-                    try:
-                        self.documents.begin(plan.workflow_step_id, state.current_goal_id, plan.verification)
-                    except ValueError as error:
-                        state.last_error = str(error)
-                        continue
+            try:
+                self._apply_browse_plan(plan)
+            except ValueError as error:
+                from axis.attachments.runtime import DocumentRestriction, DocumentScopeError
+                state.last_error = str(error)
+                if isinstance(error, DocumentRestriction):
+                    return self._result('needs_user', reason=state.last_error, answer=state.last_error)
+                if isinstance(error, DocumentScopeError):
+                    return self._result('failed', reason='Invalid attachment scope: ' + state.last_error, recoverable=True)
+                continue
 
             try:
                 await self._navigator_burst()
             except _Stop as stopped:
                 return stopped.result
+
+    def _apply_browse_plan(self, plan):
+        """Validate a workflow transition before changing active goal or evidence identity."""
+        state = self.state
+        step = None
+        if self.documents:
+            workflow = self.documents.workflow()
+            if workflow['next_steps'] and not plan.workflow_step_id:
+                raise ValueError('Choose the first pending workflow_step_id for browser execution.')
+            if plan.workflow_step_id:
+                if plan.verification is None:
+                    raise ValueError('Workflow execution requires a concrete verification postcondition.')
+                step = self.documents.validate_step(plan.workflow_step_id)
+        if plan.verification and (plan.verification.locator or plan.verification.tab):
+            saved = GoalCheck.model_validate_json(step['verification']) if step and step.get('verification') else None
+            if plan.verification != state.current_verification and plan.verification != saved:
+                raise ValueError('Only the navigator can bind an observed verification locator; retain the declared outcome.')
+        running_id = step.get('goal_id') if step else None
+        keep_goal = bool(state.current_goal_id and (state.pending_changes or
+                         (state.current_verification and not self._current_goal_verified()) or
+                         plan.next_goal == state.current_goal))
+        if step:
+            keep_goal = bool(running_id)
+        goal_id = running_id or (state.current_goal_id if keep_goal else f'goal_{state.goal_number + 1}')
+        check = state.current_verification if keep_goal else plan.verification
+        if step and step.get('verification'):
+            check = GoalCheck.model_validate_json(step['verification'])
+        if check is None:
+            check = plan.verification
+        proposed = plan.verification
+        if check and proposed and check.locator and not proposed.locator and not proposed.tab:
+            proposed = proposed.model_copy(update={'locator': check.locator, 'tab': check.tab})
+        if proposed != check and keep_goal and state.current_goal_id == goal_id:
+            if self._refine_verification(proposed):
+                check = state.current_verification
+        if step and proposed != check:
+            raise ValueError('Retain the saved verification postcondition when recovering this step: ' + check.model_dump_json())
+        if step:
+            self.documents.begin(step['id'], goal_id, check)
+        if not keep_goal:
+            state.goal_number += 1
+        state.current_goal_id = goal_id
+        state.current_verification = check
+        for pending in state.pending_changes.values():
+            if pending.goal_id == goal_id and pending.verification is None:
+                pending.verification = check
+        state.current_plan_summary = plan.plan_summary
+        state.current_goal = self._preserve_literal_urls(plan.next_goal)
+        state.current_success_condition = plan.success_condition
+        state.repair_attempted = False
 
     async def _navigator_burst(self) -> None:
         """Run navigator steps until the planner is due again."""
@@ -970,12 +1021,16 @@ class AxisOrchestrator:
             state.counters.navigator_steps_since_plan += 1
             state.latest_navigator_outcome = outcome
             self._commit_gate(gate)
+            check = state.current_verification
+            if check and check.assertion == 'value':
+                self._refine_verification(check.model_copy(update={'assertion': 'text'}))
             # Follow a tab the navigator switched to, so the next observation
             # targets the page it actually moved to rather than the one it
             # left — otherwise it must burn a whole step re-activating.
             control_codes = {'ACTION_BUDGET_EXHAUSTED', 'STEP_INTERRUPTED', 'RUN_PAUSED', 'RUN_CANCELLED'}
             failures = [record for record in gate.records if not record.success and not record.recovered
                         and record.code not in control_codes
+                        and not (record.code == 'STALE_STATE' and not record.executed)
                         and not (record.code == 'INVALID_ARGUMENT' and any(
                             later.success and later.tool == record.tool
                             for later in gate.records[gate.records.index(record) + 1:]))]
@@ -1017,11 +1072,19 @@ class AxisOrchestrator:
                         f"{p.tab}: observe URL {p.expected_url!r}" if p.expected_url else
                         f"{p.tab}: run {p.verification.model_dump_json(exclude_none=True) if p.verification else 'a goal-specific check'}"
                         for p in pending) + "."
+                    passed = next((a for a in reversed(state.assertions) if a.passed and not a.superseded_by
+                                   and any(a.goal_id == p.goal_id and a.tab == p.tab and a.sequence > p.sequence
+                                           for p in pending)), None)
+                    if passed:
+                        rejection += ' The passing check does not match the required method, expectation or scoped target: ' + passed.model_dump_json(
+                            include={'assertion', 'expected', 'target'})
+                elif not self._current_goal_verified():
+                    rejection = self._goal_verification_rejection()
                 elif not known or any(ref not in known for ref in outcome.evidence_ids):
                     rejection = "Unknown or unverified evidence reference; cite runtime evidence IDs."
                 if not rejection and self.documents and self.documents.current_step:
                     try:
-                        self.documents.verified(state, self._matches_goal_check)
+                        self.documents.verified(state, self._matches_goal_check, accepted=self._accepted_goal_assertions())
                     except ValueError as error:
                         rejection = str(error)
                 if rejection:
@@ -1034,8 +1097,23 @@ class AxisOrchestrator:
                 self._reconcile_bound_tab()
             for item in outcome.evidence:
                 state.add_evidence("navigator", item, tab=self.tab, verified=False)
+            repeated_check = self._repeated_failed_check(browser_state, gate.records, failures)
             if gate.records:
                 self._update_progress(browser_state, gate.records)
+            repeated_rejection = False
+            if rejection:
+                attempts = state.progress_by_tab.setdefault(tab or '', {})
+                signature = (state.current_goal_id,
+                             state.current_verification.model_dump_json() if state.current_verification else None, tuple(
+                    (key, p.sequence, p.verification.model_dump_json() if p.verification else None)
+                    for key, p in state.pending_changes.items()), tuple(
+                    sorted({(a.assertion, a.target or '', repr(a.expected), a.passed)
+                            for a in state.assertions if a.goal_id == state.current_goal_id})))
+                repeated_rejection = attempts.get('verification_rejection') == signature
+                attempts['verification_rejection'] = signature
+                state.last_error = outcome.reason = rejection + ' Check the assertion method, target identity and scope; repeating the same assertion cannot resolve a mismatch.'
+            elif outcome.status in {'goal_reached', 'task_complete'}:
+                state.progress_by_tab.setdefault(tab or '', {}).pop('verification_rejection', None)
             self._emit(
                 "navigator_step",
                 **outcome.model_dump(),
@@ -1049,11 +1127,19 @@ class AxisOrchestrator:
                 raise _Stop(self._result("cancelled", reason="The user cancelled the run."))
             if gate.stopped == "paused":
                 raise _Stop(self._result("paused", reason="The run is paused; state is preserved."))
+            if repeated_rejection:
+                raise _Stop(self._result('failed', reason='VERIFICATION_MISMATCH: The same completion check remains unresolved after recovery. ' + rejection, recoverable=True))
+            incompatible = next((r for r in failures if r.code == 'BRIDGE_PROTOCOL_MISMATCH'), None)
+            if incompatible is not None:
+                raise _Stop(self._result('failed', reason=incompatible.error or incompatible.code, recoverable=True))
+            if repeated_check is not None:
+                raise _Stop(self._result("failed", reason=self._verification_failure_reason(repeated_check), recoverable=True))
 
             if failures:
                 state.counters.consecutive_failures += 1
             else:
-                state.counters.consecutive_failures = 0
+                if any(record.recovered for record in gate.records):
+                    state.counters.consecutive_failures = 0
                 state.repair_attempted = False
 
             if outcome.status != "ask_user":
@@ -1062,8 +1148,11 @@ class AxisOrchestrator:
                 if outcome.status == "task_complete":
                     verdict = verify_completion(state, state.last_browser_state)
                     action_required = gui_action_request(self._current_request())
-                    field_verified = any(check.passed and check.goal_id == state.current_goal_id
-                                         and check.assertion in {"value", "checked"} for check in state.assertions)
+                    field_verified = any(check.passed and not check.superseded_by
+                        and check.goal_id == state.current_goal_id and check.match not in {'contains', 'regex'}
+                        and (check.assertion in {'value', 'checked'} or (check.assertion == 'text'
+                             and any(r.evidence_id == check.evidence_id and self._reported_value_property(r) is False
+                                     for r in state.actions))) for check in state.assertions)
                     if action_required and not state.counters.mutation_count and not field_verified:
                         verdict.valid = False
                         verdict.reasons.append("Perform the requested browser action before claiming completion.")
@@ -1134,6 +1223,7 @@ class AxisOrchestrator:
             "original_request": state.original_request,
             "follow_ups": state.follow_ups,
             "current_request": self._current_request(),
+            "reference_context": state.reference_context,
             "requirements": state.requirements.model_dump(mode="json"),
             "current_plan_summary": state.current_plan_summary,
             "current_goal": state.current_goal,
@@ -1154,8 +1244,9 @@ class AxisOrchestrator:
             "source_register": list(state.source_register.values()),
             "remaining_work": state.remaining_work,
             "final_answer_max_chars": run.final_answer_max_chars,
-            "synthesis_reserve_requests": run.synthesis_reserve_requests,
+            "synthesis_reserve_requests": self._synthesis_reserve(),
             "last_error": state.last_error,
+            "bridge_warning": self.browser.capability_warning,
             "unverified_page_changes": state.unverified_mutations,
             "remaining_steps": max(0, run.max_total_steps - state.counters.total_steps),
             "remaining_browser_actions": max(0, run.max_browser_actions - state.counters.browser_actions),
@@ -1163,7 +1254,7 @@ class AxisOrchestrator:
         }
         if self.documents:
             context['documents'] = self.documents.context()
-            if run.max_model_requests - int(state.usage.requests) <= self.config.run.synthesis_reserve_requests:
+            if self._synthesis_reserve() and run.max_model_requests - int(state.usage.requests) <= self._synthesis_reserve():
                 state.document_synthesis_only = True
             context['document_synthesis_only'] = state.document_synthesis_only
         context['execution_mode'] = getattr(self, 'execution_mode', 'automatic')
@@ -1263,8 +1354,14 @@ class AxisOrchestrator:
         evidence = {e.id: e for e in state.evidence if e.verified and e.kind != 'navigator'}
         for update in outcome.completed_steps:
             index = next((i for i, step in enumerate(state.browser_steps) if step.result is None), len(state.browser_steps))
+            if 0 < update.step <= len(state.browser_steps):
+                previous = state.browser_steps[update.step - 1]
+                if previous.result is not None:
+                    if previous.result == update.result and previous.evidence_ids == update.evidence_ids:
+                        continue
+                    return f'Step {update.step} is already recorded. Keep its result and evidence unchanged; next incomplete step is {index + 1 if index < len(state.browser_steps) else "none"}.'
             if update.step != index + 1 or index >= len(state.browser_steps):
-                return 'Record completed browser steps in order, without skipping or rewriting verified steps.'
+                return f'Received step {update.step}; next incomplete step is {index + 1 if index < len(state.browser_steps) else "none"}. Report only completed steps in order.'
             proof = [evidence.get(identifier) for identifier in update.evidence_ids]
             if not proof or any(item is None for item in proof):
                 return 'Step results need verified runtime evidence, not an unsupported summary.'
@@ -1280,9 +1377,9 @@ class AxisOrchestrator:
         state = self.state
         if not state or self.documents:
             return None
-        fields = ('browser_steps', 'pending_changes', 'assertions', 'evidence', 'facts',
+        fields = ('browser_steps', 'pending_changes', 'assertions', 'evidence', 'facts', 'change_history',
                   'current_goal', 'current_goal_id', 'current_verification', 'goal_number',
-                  'sequence', 'evidence_number', 'visited_urls', 'successful_actions',
+                  'sequence', 'evidence_number', 'visited_urls', 'successful_actions', 'last_interaction_by_tab',
                   'requirements', 'counters', 'direct_navigation_done', 'bound_application')
         saved = state.model_dump(mode='json', include=set(fields))
         saved['model_requests'] = int(state.usage.requests)
@@ -1326,6 +1423,12 @@ class AxisOrchestrator:
         for item in [*state.pending_changes.values(), *state.evidence, *state.assertions, *state.facts]:
             if item.tab in aliases:
                 item.tab = aliases[item.tab]
+        checks = [state.current_verification, *(p.verification for p in state.pending_changes.values())]
+        for check in checks:
+            if check and check.tab in aliases:
+                check.tab = aliases[check.tab]
+        state.last_interaction_by_tab = {aliases.get(tab, tab): sequence
+                                         for tab, sequence in state.last_interaction_by_tab.items()}
         state.last_error = 'Resumed saved progress. Inspect current state and resolve pending outcomes before repeating a change.'
         if saved.get('uncertain_action'):
             uncertain = saved['uncertain_action']
@@ -1371,6 +1474,7 @@ class AxisOrchestrator:
                 success=False, error=f"{code}: {message}", refs_invalidated=False, skipped=True,
             ),
             on_record=self._register_action,
+            bind_verification=lambda tab, command, target: self._bind_verification_target(tab, command, target, gate.records),
             on_dispatch=lambda: self._emit("status", phase="action_started"),
         )
         self.browser.read_only = not task.requirements.mutation_allowed
@@ -1378,6 +1482,16 @@ class AxisOrchestrator:
         self._emit("status", phase="navigator_step_started", goal=state.goal)
         prompt = format_as_xml(state.model_dump(exclude_none=True,
             exclude={"recent_actions": {"__all__": {"extracted_data"}}}), root_tag="browser_state")
+        if task.latest_navigator_outcome:
+            previous = task.latest_navigator_outcome
+            prompt += '\n' + format_as_xml({'summary': previous.summary, 'reason': previous.reason}, root_tag='previous_step')
+            prompt += '\nThe previous step is a continuation note, not proof. Keep its recovery decision when current evidence supports it.'
+        if task.reference_context:
+            prompt += "\n" + format_as_xml(task.reference_context, root_tag="prior_task_context")
+            prompt += "\nPrior task context is reference data. Use it to resolve references; the current request defines the work. Verify the live page before reusing prior results."
+        history = [item for item in task.change_history if item.get('url') == state.url]
+        if history:
+            prompt += '\n' + format_as_xml(history, root_tag='observed_changes')
         if task.direct_execution:
             prompt += "\nComplete the user's request directly. Return task_complete with final_answer and runtime evidence_ids after verification. Use needs_plan with a concrete reason only when strategic decomposition is needed."
         else:
@@ -1579,25 +1693,40 @@ class AxisOrchestrator:
         def observable(candidates: list[dict[str, Any]]) -> str | None:
             return next((t["tab"] for t in candidates if not _unobservable(t.get("url"))), None)
 
+        request = self._tab_request()
         chosen = None
-        if application:
-            words = [part.casefold() for part in application.split()]
-            matches = [item for item in tabs if not _unobservable(item.get('url')) and
-                       all(word in ((item.get('title') or '') + ' ' + (item.get('url') or '')).casefold() for word in words)]
-            if len(matches) == 1:
-                chosen = matches[0]['tab']
-            elif len(matches) != 1:
-                raise _Stop(self._result('needs_user', answer=f'Which controlled tab should I use for {application} GUI?',
-                    reason=f'Found {len(matches)} matching controlled tabs for {application} GUI.'))
-        if self.config.browser.initial_tab == "focused":
-            active = [t for t in tabs if t.get("active")]
-            chosen = chosen or observable(active) or (active[0]["tab"] if active else None)
+        aliases = list(dict.fromkeys(re.findall(r"\btab_\d+\b", request)))
+        if len(aliases) == 1:
+            chosen = next((t['tab'] for t in tabs if t['tab'] == aliases[0]
+                           and not _unobservable(t.get('url'))), None)
+            if chosen is None:
+                raise _Stop(self._result('needs_user', reason='The requested tab is closed or cannot be read.',
+                                        answer='Select an open, readable tab.'))
+        focused = None
+        if self.config.browser.initial_tab == "focused" or _CURRENT_TAB.search(request):
+            try:
+                focused = self.browser.focused_tab()
+            except ToolFault as fault:
+                raise _Stop(self._result('failed', reason=f'{fault.code}: {fault}')) from fault
+        urls = extract_requirements(request).literal_urls
+        if len(urls) == 1 and not _CURRENT_TAB.search(request):
+            matches = [t for t in tabs if origin(t.get('url')) == origin(urls[0])
+                       and not _unobservable(t.get('url'))]
+            chosen = chosen or next((t['tab'] for t in matches if t['tab'] == focused), None) or observable(matches)
+        if focused and not _unobservable(self.browser.tabs[focused].url):
+            chosen = chosen or focused
+        if _CURRENT_TAB.search(request) and chosen is None:
+            raise _Stop(self._result('needs_user', reason='The focused tab cannot be read.',
+                                    answer='Open the requested page in the focused tab.'))
         if chosen is None:
             chosen = observable(tabs) or (tabs[0]["tab"] if tabs else None)
         needs_new_tab = chosen is None or (
             self.browser.tabs.get(chosen) and _unobservable(self.browser.tabs[chosen].url)
         )
         if needs_new_tab:
+            if (application or aliases) and not self._direct_url():
+                raise _Stop(self._result('needs_user', reason='No readable tab is open for the requested application.',
+                                        answer='Open the requested application in a browser tab.'))
             created = bt.browser_tabs(ctx, bt.CreateTab(operation="create", url=self._direct_url() or _FALLBACK_TAB_URL))
             self._emit(
                 "status", phase="tab_create", success=created["ok"],
@@ -1631,12 +1760,22 @@ class AxisOrchestrator:
     def _tab_summaries(self) -> list[TabSummary]:
         state = self.state
         assert state is not None
-        candidates = list(dict.fromkeys(([self.tab] if self.tab else []) + state.task_tabs[-63:]))
+        candidates = list(dict.fromkeys(([self.tab] if self.tab else []) + list(self.browser.tabs)))
         return [
             TabSummary(**self.browser.public_tab(alias))
             for alias in candidates
             if alias in self.browser.tabs and not self.browser.tabs[alias].closed
-        ]
+            and not _unobservable(self.browser.tabs[alias].url)
+        ][:64]
+
+    def _tab_request(self) -> str:
+        state = self.state
+        assert state is not None
+        requests = [state.original_request, *state.follow_ups]
+        return next((request for request in reversed(requests)
+                     if _CURRENT_TAB.search(request) or named_gui(request)
+                     or extract_requirements(request).literal_urls
+                     or re.search(r"\btab_\d+\b", request)), state.original_request)
 
     def _current_request(self) -> str:
         state = self.state
@@ -1658,8 +1797,10 @@ class AxisOrchestrator:
     def _direct_url(self) -> str | None:
         state = self.state
         assert state is not None
-        current_urls = extract_requirements(self._current_request()).literal_urls
-        urls = current_urls or state.requirements.literal_urls
+        request = self._tab_request()
+        if _CURRENT_TAB.search(request):
+            return None
+        urls = extract_requirements(request).literal_urls
         if state.direct_navigation_done or len(urls) != 1:
             return None
         if _CURRENT_PAGE_DEPENDENCY.search(self._current_request()):
@@ -1900,6 +2041,7 @@ class AxisOrchestrator:
         self._record_search(browser_state.url)
         evidence = state.add_evidence("observation", f"Title: {browser_state.title or ''}\n{browser_state.snapshot}", tab=tab, source_url=browser_state.url)
         browser_state.evidence_id = evidence.id
+        self._remember_fields(tab, observation, evidence.id)
         state.retain_fact(TaskFact(value=evidence.detail, tab=tab, source_url=browser_state.url,
                                    goal_id=state.current_goal_id, evidence_id=evidence.id,
                                    target="page", priority=0))
@@ -1918,6 +2060,9 @@ class AxisOrchestrator:
             state.counters.recovery_actions += 1
         record.sequence = state.next_sequence()
         record.goal_id = state.current_goal_id
+        if (record.tab and record.executed and record.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
+                and record.operation != 'capture'):
+            state.last_interaction_by_tab[record.tab] = record.sequence
         if record.tool == "browser_downloads" and record.tab is None:
             record.tab = state.bound_tab
         if record.target:
@@ -1926,7 +2071,22 @@ class AxisOrchestrator:
                 record.target = self.browser.describe_ref(reference[1]) or record.target
         tab = self.browser.tabs.get(record.tab) if record.tab else None
         record.source_url = self.browser.safe_url(tab.url) if tab else None
+        field_edit = record.operation in {'fill', 'select', 'check', 'uncheck', 'type_sequentially'}
+        field_click = record.operation == 'click' and re.search(
+            r'\b(?:combobox|listbox|option|checkbox|switch|radio|data-row|header-row|row)\b', record.target or '')
+        if mutated and record.tool == 'browser_act' and record.tab and (field_edit or field_click):
+            observed = state.field_observations.get(record.tab)
+            if (observed and observed['url'] == record.source_url
+                    and not any(item['url'] == observed['url'] for item in state.change_history)
+                    and len(state.change_history) < 8):
+                state.change_history.append({'url': observed['url'], 'before': observed['fields'],
+                    'before_evidence_id': observed['evidence_id'], 'before_complete': observed['complete'],
+                    'after': [], 'after_evidence_id': None})
         if record.success:
+            if record.tool == 'browser_tabs' and record.operation in {'activate', 'create'} and tab:
+                initial_origin = origin(tab.url)
+                if initial_origin:
+                    state.authorized_origins.setdefault(record.tab, [initial_origin])
             login = self._login_intent(record.tab) if record.tab else None
             changed = record.result_data.get('whatChanged') or {}
             source = changed.get('fromUrl') or record.source_url
@@ -1942,10 +2102,21 @@ class AxisOrchestrator:
             if record.tab and record.tab not in state.task_tabs:
                 state.task_tabs = (state.task_tabs + [record.tab])[-128:]
         if mutated and record.tab:
-            navigation = (record.success and not record.postcondition and not state.current_verification
-                          and (record.tool == "browser_navigate" or (record.operation == "click"
-                               and (bool(re.match(r"^(?:link|menuitem|tab)\b", record.target or ""))
-                                    or any((record.result_data.get("whatChanged") or {}).get(k) for k in ("domChanged", "urlChanged", "navigated"))))))
+            target_role = (record.target or '').split(' ', 1)[0]
+            try:
+                target_role = json.loads(record.target or '{}').get('locator', {}).get('role', target_role)
+            except (ValueError, TypeError, AttributeError):
+                pass
+            changed = record.result_data.get('whatChanged') or {}
+            # Keep route changes separate from saved settings. Arbitrary buttons
+            # (including Edit/Cancel) remain conservative pending interactions.
+            route_change = (record.operation == 'click' and target_role in {'menuitem', 'tab'}
+                            and (changed.get('urlChanged') or changed.get('navigated')))
+            navigation = (record.success and not record.postcondition
+                          and (record.tool == 'browser_navigate' or route_change or (
+                              not state.current_verification and record.operation == 'click'
+                              and (target_role in {'link', 'menuitem', 'tab'}
+                                   or any(changed.get(k) for k in ('domChanged', 'urlChanged', 'navigated'))))))
             key = f"{record.goal_id}:{record.tab}"
             if navigation:
                 key += ":navigation"
@@ -1986,7 +2157,7 @@ class AxisOrchestrator:
                     target = next((locator[k] for k in ("name", "label", "text", "placeholder", "selector") if locator.get(k)), None)
                 check = GoalCheck(assertion="checked" if record.operation in {"check", "uncheck"} else "value", expected=record.expected_value, target=target) if target else None
             verification_locator = record.postcondition_locator
-            if check and check.assertion in {"value", "checked"} and not verification_locator:
+            if field_edit and check and check.assertion in {"value", "checked"} and not verification_locator:
                 try:
                     verification_locator = json.loads(record.target or "{}").get("locator")
                 except (ValueError, TypeError):
@@ -1999,7 +2170,7 @@ class AxisOrchestrator:
                     record.source_url if record.success and record.tool == "browser_navigate" and
                     (not previous or previous.search_query is not None or previous.expected_url) else None,
                 search_query=search_query, search_host=search_host, search_submitted=search_submitted,
-                verification=None if search_submitted else check,
+                verification=None if search_submitted or navigation else check,
                 verification_locator=verification_locator, login_stage=login_stage,
                 navigation=navigation, uncertain=record.code in UNKNOWN_OUTCOME_CODES,
             )
@@ -2042,6 +2213,7 @@ class AxisOrchestrator:
                              search == (pending.search_host, pending.search_query))
             if url_matches or query_matches or (pending.navigation and url):
                 state.counters.verified_mutation_count += pending.count
+                state.counters.consecutive_failures = 0
                 del state.pending_changes[key]
 
     def _verify_login_result(self, record: ActionRecord) -> None:
@@ -2065,6 +2237,18 @@ class AxisOrchestrator:
                     and pending.sequence <= submitted_at):
                 state.counters.verified_mutation_count += pending.count
                 del state.pending_changes[key]
+
+    def _remember_fields(self, tab: str | None, data: dict, evidence_id: str) -> None:
+        if not tab or not data.get('fields') or not data.get('url'):
+            return
+        observed = {'url': data['url'], 'fields': data['fields'], 'evidence_id': evidence_id,
+                    'complete': data.get('fields_complete', False)}
+        self.state.field_observations[tab] = observed
+        for change in self.state.change_history:
+            if change['url'] == data['url']:
+                change['after'] = data['fields']
+                change['after_evidence_id'] = evidence_id
+                change['after_complete'] = observed['complete']
 
     def _record_search(self, url: str | None) -> None:
         search = self._search_location(url)
@@ -2102,7 +2286,13 @@ class AxisOrchestrator:
                 required=(self._matches_goal_check(state.current_verification, record)
                           or any(self._matches_goal_check(p.verification, record) for p in state.pending_changes.values())),
             )
-            item = evidence("assertion", f"{assertion.assertion} {record.target} passed={assertion.passed} expected={assertion.expected!r}", assertion.passed)
+            actual = data.get("actual")
+            if isinstance(actual, dict):
+                actual = actual.get("actual", actual)
+            detail = (f"{assertion.assertion} passed={assertion.passed} expected={assertion.expected!r} "
+                      f"actual={actual!r} count={data.get('count')} "
+                      f"reason={data.get('message') or record.message or ''} target={record.target}")
+            item = evidence("assertion", detail, assertion.passed)
             assertion.evidence_id = item.id
             state.assertions = (state.assertions + [assertion])[-128:]
             if assertion.passed:
@@ -2117,14 +2307,21 @@ class AxisOrchestrator:
                             and record.source_url == upload['source_url'] and 'input' not in target.lower()):
                         del state.pending_uploads[identifier]
             for key, pending in list(state.pending_changes.items()):
-                if (assertion.passed and pending.goal_id == record.goal_id and pending.tab == record.tab
-                        and record.sequence > pending.sequence
-                        and self._matches_goal_check(pending.verification, record)
-                        and (not pending.verification_locator or
-                             pending.verification_locator == json.loads(record.target or "{}").get("locator"))):
+                if self._assertion_verifies_change(pending, assertion):
                     state.counters.verified_mutation_count += pending.count
+                    state.counters.consecutive_failures = 0
                     del state.pending_changes[key]
             if assertion.passed:
+                for earlier in state.assertions:
+                    if (not earlier.passed and not earlier.superseded_by
+                            and earlier.goal_id == assertion.goal_id and earlier.tab == assertion.tab
+                            and earlier.sequence < assertion.sequence
+                            and earlier.assertion == assertion.assertion and earlier.expected == assertion.expected
+                            and (earlier.match or 'exact') == (assertion.match or 'exact')
+                            and self._assertion_target_refines(earlier.target, assertion.target,
+                                                               allow_descendant=assertion.assertion == 'text')):
+                        earlier.superseded_by = item.id
+                        state.counters.consecutive_failures = 0
                 self._verify_login_result(record)
         elif record.success and record.tool in {"browser_observe", "browser_navigate", "browser_tabs"}:
             if record.tool == "browser_observe":
@@ -2137,6 +2334,8 @@ class AxisOrchestrator:
             content = record.extracted_data
             if content is not None:
                 item = evidence(kind, content)
+                if record.tool == 'browser_observe':
+                    self._remember_fields(record.tab, data, item.id)
                 if (record.tool == "browser_observe" and (kind == "extraction" or record.operation == "text")
                         and len(re.findall(r"[a-zA-Z]", content)) >= 40 and record.source_url):
                     state.source_register[record.source_url] = {
@@ -2191,49 +2390,273 @@ class AxisOrchestrator:
                                       goal_id=record.goal_id, evidence_id=item.id,
                                       tool=record.tool, target=record.operation, priority=1))
 
-    def _refine_verification(self, check: GoalCheck | None) -> bool:
-        """Correct inferred wording only with an actual post-mutation exact check.
+    def _verification_failure_reason(self, record: ActionRecord) -> str:
+        data = record.result_data
+        reason = (f"VERIFICATION_UNRESOLVED: {record.operation} check on {record.tab} "
+                  f"expected {data.get('expected')!r}, actual {data.get('actual')!r}; "
+                  f"target={record.target}. The same check failed after recovery. "
+                  f"{data.get('message') or record.message or record.code or ''}")
+        if record.operation == 'value' and self.browser.capability_warning:
+            reason += ' ' + self.browser.capability_warning
+        return clip(reason, 1600) or reason
 
-        Keep pending changes until a further check; retain superseded failures
-        with their replacement evidence ID for an auditable correction.
-        """
+    def _repeated_failed_check(self, browser_state, records, failures):
+        """Bound identical assertion retries, including across needs_plan returns."""
+        state = self.state
+        for record in records:
+            if record.tool != 'browser_assert':
+                continue
+            entry = state.progress_by_tab.setdefault(record.tab or '', {})
+            identity = (record.goal_id, record.operation, record.target, repr(record.result_data.get('expected')))
+            if record.success:
+                previous = entry.get('failed_check')
+                if previous and previous['identity'] == identity:
+                    entry.pop('failed_check', None)
+                continue
+            if record not in failures or record.code not in {'ASSERTION_FAILED', 'UNSUPPORTED_ELEMENT_PROPERTY'}:
+                continue
+            interaction = max((r.sequence for r in state.actions if r.tab == record.tab
+                and r.goal_id == record.goal_id and r.executed and r.sequence < record.sequence
+                and r.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
+                and r.operation != 'capture'), default=0)
+            attempt = {'identity': identity, 'interaction': interaction,
+                       'page': self._page_fingerprint(browser_state, [])}
+            if entry.get('failed_check') == attempt:
+                return record
+            entry['failed_check'] = attempt
+        return None
+
+    def _bind_verification_target(self, tab, command, target, records=()):
+        """Bind an inferred label before its assertion, using a fresh unique scoped target."""
+        state = self.state
+        check = state.current_verification
+        locator = getattr(command, 'locator', None)
+        expected = getattr(command, 'expected', None)
+        if (not state.current_goal_id or not check or target != check.target
+                or command.assertion != check.assertion or expected != check.expected
+                or getattr(command, 'contains', False) or getattr(command, 'regex', False)):
+            raise ValueError('Binding must retain the current goal target, assertion and exact expected result.')
+        if tab != self.tab or locator is None:
+            raise ValueError('Bind the verification on the current goal tab with an observed locator.')
+        scoped = locator.model_dump(exclude_none=True)
+        if not scoped.get('within') or not any(scoped.get(k) for k in ('name', 'label', 'text', 'has_text', 'placeholder', 'selector')):
+            raise ValueError('Use a specific target inside its observed section, form, dialog or row.')
+        candidate = ActionRecord(tool='browser_assert', operation=command.assertion, tab=tab,
+            target=json.dumps({'locator': scoped}), result_data={'expected': expected, 'match': 'exact'})
+        if check.locator:
+            if not self._matches_goal_check(check, candidate):
+                raise ValueError('Retain the bound verification locator and tab; its scope cannot be replaced.')
+            return
+        user_text = '\n'.join([state.original_request, *state.follow_ups, *state.requirements.required_text]).casefold()
+        if target.casefold() in user_text and not self._matches_goal_check(check, candidate):
+            raise ValueError('An explicit user target must keep its literal identity; observe that target.')
+        interactions = [r.sequence for r in [*state.actions, *records] if r.goal_id == state.current_goal_id
+                        and r.tab == tab and r.executed and r.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
+                        and r.operation != 'capture']
+        interactions.extend(p.sequence for p in state.pending_changes.values() if p.goal_id == state.current_goal_id and p.tab == tab)
+        after = max([state.last_interaction_by_tab.get(tab, 0), *interactions])
+        unique = any(a.passed and not a.superseded_by and a.goal_id == state.current_goal_id and a.tab == tab
+                     and a.sequence > after and a.assertion == 'count' and a.expected == 1
+                     and self._assertion_target_refines(a.target, candidate.target)
+                     for a in state.assertions)
+        if not unique:
+            raise ValueError('First run count=1 on this exact scoped locator after the latest interaction, then bind its check.')
+        # Existing per-action scopes stay authoritative, including uncertain submissions.
+        pending = [p for p in state.pending_changes.values() if p.goal_id == state.current_goal_id and p.verification == check]
+        if any(p.tab != tab or p.uncertain or (p.verification_locator and not self._locator_refines(
+                p.verification_locator, scoped, allow_descendant=check.assertion == 'text')) for p in pending):
+            raise ValueError('The proposed target conflicts with an outstanding change or its scope.')
+        bound = check.model_copy(update={'locator': scoped, 'tab': tab})
+        if self.documents:
+            self.documents.refine_verification(state.current_goal_id, check, bound)
+        state.current_verification = bound
+        for p in pending:
+            p.verification = bound
+
+    def _current_goal_verified(self) -> bool:
+        state = self.state
+        check = state.current_verification
+        if state.current_goal_id is None or check is None or check.assertion == 'download':
+            return True  # Download evidence has its own completion gate.
+        return bool(self._accepted_goal_assertions())
+
+    def _goal_verification_rejection(self):
+        state = self.state
+        check = state.current_verification
+        last = next((a for a in reversed(state.assertions) if a.goal_id == state.current_goal_id and a.passed), None)
+        detail = last.model_dump_json(include={'assertion', 'expected', 'target', 'tab'}) if last else 'none'
+        return ('Goal verification required: declared=' + (check.model_dump_json(exclude_none=True) if check else 'none')
+                + '; latest passing assertion=' + detail
+                + '. Match the method, exact expectation, tab and scoped target after the latest interaction.'
+                + (' For an inferred descriptive target, use count=1 and browser_assert goal_target to bind its observed locator.'
+                   if check and check.target and not check.locator else ''))
+
+    def _accepted_goal_assertions(self):
+        from axis.models import accepted_goal_assertions
+        return accepted_goal_assertions(self.state, self._matches_goal_check)
+
+    def _assertion_verifies_change(self, change, assertion) -> bool:
+        record = ActionRecord(tool='browser_assert', operation=assertion.assertion, target=assertion.target, tab=assertion.tab,
+                              result_data={'expected': assertion.expected, 'match': assertion.match})
+        return (assertion.passed and not assertion.superseded_by
+                and assertion.goal_id == change.goal_id and assertion.tab == change.tab
+                and assertion.sequence > change.sequence
+                and self._matches_goal_check(change.verification, record)
+                and (not change.verification_locator or self._locator_refines(
+                    change.verification_locator, json.loads(assertion.target or '{}').get('locator'),
+                    allow_descendant=assertion.assertion == 'text')))
+
+    @staticmethod
+    def _reported_value_property(record: ActionRecord) -> bool | None:
+        """Only bridge property metadata is capability evidence, never page prose."""
+        if record.tool == 'browser_assert' and record.operation == 'value':
+            return False if record.code == 'UNSUPPORTED_ELEMENT_PROPERTY' else None
+        if not record.success:
+            return None
+        if record.tool == 'browser_assert' and record.operation == 'text':
+            result = record.result_data.get('actual')
+        elif record.tool == 'browser_observe':
+            result = record.result_data.get('result')
+        else:
+            return None
+        if not isinstance(result, dict) or result.get('count') != 1:
+            return None
+        element, elements = result.get('element'), result.get('elements')
+        if element is None and isinstance(elements, list) and len(elements) == 1:
+            element = elements[0]
+        value = element.get('hasValue') if isinstance(element, dict) else None
+        return value if isinstance(value, bool) else None
+
+    def _supports_text_verification(self, assertion, after: int) -> bool:
+        check = self.state.current_verification
+        for record in reversed(self.state.actions):
+            if (record.goal_id != assertion.goal_id or record.tab != assertion.tab
+                    or not after < record.sequence <= assertion.sequence
+                    or not self._matches_goal_check(check, ActionRecord(tool='browser_assert', operation='value',
+                        target=record.target, tab=record.tab, result_data={'expected': check.expected}))
+                    or not self._assertion_target_refines(record.target, assertion.target, allow_descendant=True)):
+                continue
+            supported = self._reported_value_property(record)
+            if supported is not None:
+                return supported is False  # Newer native-control evidence vetoes older metadata.
+        return False
+
+    def _refine_verification(self, check: GoalCheck | None) -> bool:
+        """Correct an inferred check using matching post-change runtime evidence."""
         state = self.state
         assert state is not None
         old = state.current_verification
-        if (not old or not check or old == check or old.assertion != check.assertion
+        if (not old or not check or old == check
                 or old.assertion not in {"text", "title", "value"}
-                or (old.target and old.target != check.target)):
+                or (old.target and old.target != check.target)
+                or old.locator != check.locator or old.tab != check.tab):
             return False
         user_text = "\n".join([state.original_request, *state.follow_ups,
                                *state.requirements.required_text]).casefold()
-        if isinstance(old.expected, str) and old.expected.casefold() in user_text:
+        method_change = old.assertion == 'value' and check.assertion == 'text' and old.expected == check.expected
+        if old.assertion != check.assertion and not method_change:
+            return False
+        if method_change and re.search(r'\b(?:value assertion|value property|tohavevalue)\b', user_text):
+            return False
+        if not method_change and isinstance(old.expected, str) and old.expected.casefold() in user_text:
             return False
         pending = [p for p in state.pending_changes.values() if p.goal_id == state.current_goal_id]
-        if not pending:
+        if not pending and not method_change:
             return False
         replacements = []
         for change in pending:
+            if change.uncertain or change.verification != old:
+                return False
+            corrected = change.model_copy(update={'verification': check})
             replacement = next((a for a in reversed(state.assertions)
-                if a.passed and a.evidence_id and not a.superseded_by
-                and a.goal_id == change.goal_id and a.tab == change.tab
-                and a.sequence > change.sequence
-                and self._matches_goal_check(check, ActionRecord(
-                    tool="browser_assert", operation=a.assertion, target=a.target,
-                    result_data={"expected": a.expected, "match": a.match}))), None)
+                if a.evidence_id and self._assertion_verifies_change(corrected, a)), None)
+            if replacement is None:
+                return False
+            if method_change and not self._supports_text_verification(replacement, change.sequence):
+                return False
+            replacements.append(replacement)
+        if not pending:
+            # An already-correct field needs no edit. Still require a fresh,
+            # exact check on the active goal's tab after its last interaction.
+            after = max((r.sequence for r in state.actions if r.goal_id == state.current_goal_id
+                         and r.tab == self.tab and r.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
+                         and r.operation != 'capture' and r.executed), default=0)
+            replacement = next((a for a in reversed(state.assertions)
+                if a.passed and not a.superseded_by and a.evidence_id and a.goal_id == state.current_goal_id
+                and a.tab == self.tab and a.sequence > after
+                and self._matches_goal_check(check, ActionRecord(tool='browser_assert', operation=a.assertion,
+                    target=a.target, tab=a.tab, result_data={'expected': a.expected, 'match': a.match}))
+                and self._supports_text_verification(a, after)), None)
             if replacement is None:
                 return False
             replacements.append(replacement)
+        if self.documents:
+            if method_change:
+                steps = self.documents.workflow()['next_steps']
+                if steps and re.search(r'\b(?:value assertion|value property|tohavevalue)\b', steps[0]['instruction'], re.I):
+                    return False
+            self.documents.refine_verification(state.current_goal_id, old, check)
         state.current_verification = check
-        for change, replacement in zip(pending, replacements):
+        for change in pending:
             change.verification = check
+        for replacement in replacements:
+            replacement.required = True
+            if method_change:
+                for record in state.actions:
+                    if (record.tool == 'browser_assert' and record.operation == 'value'
+                            and record.code in {'UNSUPPORTED_ELEMENT_PROPERTY', 'ASSERTION_FAILED'}
+                            and record.goal_id == replacement.goal_id and record.tab == replacement.tab
+                            and record.sequence < replacement.sequence
+                            and (record.code == 'UNSUPPORTED_ELEMENT_PROPERTY'
+                                 or record.result_data.get('expected') == old.expected)
+                            and self._assertion_target_refines(record.target, replacement.target, allow_descendant=True)):
+                        record.recovered = True
             for assertion in state.assertions:
-                if (not assertion.passed and assertion.goal_id == change.goal_id
-                        and assertion.tab == change.tab and assertion.target == replacement.target
+                if (not assertion.passed and assertion.goal_id == replacement.goal_id
+                        and assertion.tab == replacement.tab
+                        and self._assertion_target_refines(assertion.target, replacement.target,
+                                                           allow_descendant=method_change)
                         and assertion.assertion == old.assertion and assertion.expected == old.expected):
                     assertion.superseded_by = replacement.evidence_id
+        for key, change in list(state.pending_changes.items()):
+            if any(self._assertion_verifies_change(change, a) for a in replacements):
+                state.counters.verified_mutation_count += change.count
+                del state.pending_changes[key]
+        state.counters.consecutive_failures = 0
         self._emit("verification_refined", verification=check.model_dump(),
                    evidence_ids=[a.evidence_id for a in replacements])
         return True
+
+    @staticmethod
+    def _locator_refines(original: dict | None, corrected: dict | None, *, allow_descendant: bool = False) -> bool:
+        if not original or not corrected:
+            return False
+        if original == corrected:
+            return True
+        if not isinstance(original, dict) or not isinstance(corrected, dict):
+            return False
+        if allow_descendant and AxisOrchestrator._locator_refines(original, corrected.get('within'), allow_descendant=True):
+            return True
+        for key, value in original.items():
+            if value is None or (key == 'exact' and value is False):
+                continue
+            if key == 'within':
+                if not AxisOrchestrator._locator_refines(value, corrected.get(key), allow_descendant=True):
+                    return False
+            elif corrected.get(key) != value:
+                return False
+        return True
+
+    @staticmethod
+    def _assertion_target_refines(original: str | None, corrected: str | None, *, allow_descendant: bool = False) -> bool:
+        try:
+            before, after = json.loads(original or '{}'), json.loads(corrected or '{}')
+            return (before.get('attribute') == after.get('attribute')
+                    and before.get('index', 0) == after.get('index', 0)
+                    and AxisOrchestrator._locator_refines(before.get('locator'), after.get('locator'),
+                                                          allow_descendant=allow_descendant))
+        except (ValueError, TypeError, AttributeError):
+            return False
 
     @staticmethod
     def _matches_goal_check(check: GoalCheck | None, record: ActionRecord) -> bool:
@@ -2244,12 +2667,25 @@ class AxisOrchestrator:
             return False
         if check.expected is not None and actual != check.expected:
             return False
+        if check.locator:
+            try:
+                identity = json.loads(record.target or '{}')
+                return (record.tab == check.tab and identity.get('attribute') is None
+                        and identity.get('index', 0) == 0
+                        and AxisOrchestrator._locator_refines(check.locator, identity.get('locator')))
+            except (ValueError, TypeError, AttributeError):
+                return False
         if check.target:
             try:
                 identity = json.loads(record.target or "{}")
                 locator = identity.get("locator", {})
                 targets = [str(v).casefold() for k, v in locator.items()
-                           if k in {"name", "label", "text", "placeholder", "selector", "role"}]
+                            if k in {"name", "label", "text", "has_text", "placeholder", "selector", "role"}]
+                scope = locator.get('within') if check.assertion == 'text' else None
+                while isinstance(scope, dict):
+                    targets.extend(str(v).casefold() for k, v in scope.items()
+                                   if k in {"name", "label", "text", "has_text", "placeholder", "selector", "role"})
+                    scope = scope.get('within')
                 if check.target.casefold() not in targets:
                     return False
             except (ValueError, TypeError, AttributeError):
@@ -2302,14 +2738,16 @@ class AxisOrchestrator:
             record_tab = record.tab or tab
             tracked = state.progress_by_tab.setdefault(record_tab, {})
             if record.success and record.tool in {"browser_observe", "browser_assert"}:
+                new_assertion = False
                 if record.tool == "browser_assert":
                     key = (record.operation, record.target, repr(record.result_data.get("expected")),
                            state.counters.mutation_count, page_fingerprint)
-                    if tracked.get("last_assertion") == key:
+                    new_assertion = tracked.get("last_assertion") != key
+                    if not new_assertion:
                         state.counters.redundant_assertions += 1
                     tracked["last_assertion"] = key
                 text = record.extracted_data
-                positive = record.tool == "browser_assert" or (text is not None and text != tracked.get("extracted"))
+                positive = new_assertion if record.tool == "browser_assert" else (text is not None and text != tracked.get("extracted"))
                 if record.tool == "browser_observe" and "snapshot" in record.result_data:
                     observed = BrowserState(tab=record_tab, url=record.source_url or browser_state.url,
                                             snapshot=record.result_data["snapshot"])

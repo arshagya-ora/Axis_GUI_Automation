@@ -44,9 +44,10 @@ class ControlledOrchestrator:
         self.block_next = False
         self.complete_status = 'completed'
 
-    async def start_task(self, text, *, task_id=None):
+    async def start_task(self, text, *, task_id=None, reference_context=None):
         self.starts += 1
         self.state = self.config.new_memory(text)
+        self.state.reference_context = reference_context or {}
         self.state.task_id = task_id
         return await self.run_loop()
 

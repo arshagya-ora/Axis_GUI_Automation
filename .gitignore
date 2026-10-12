@@ -97,6 +97,17 @@ PHASE_*.md
 P0_P3_*.md
 *.local.md
 
+# Impeccable engine binaries and generated review/runtime output.
+.agents/skills/impeccable/scripts/bin/
+**/.impeccable/config.local.json
+**/.impeccable/hook.cache.json
+**/.impeccable/hook.pending.json
+**/.impeccable/*.png
+**/.impeccable/review/
+**/.impeccable/mocks/
+**/.impeccable/build/
+**/.impeccable/live/session*
+
 # ---------------------------------------------------------------------------
 # OS noise
 # ---------------------------------------------------------------------------

@@ -86,7 +86,7 @@ test("replayed events are deduplicated and activity remains bounded", () => {
   assert.equal(state.activity.task.items.length, 30);
   assert.equal(state.activity.task.has_more, true);
   assert.equal(state.cursor, 2000);
-  assert.equal(state.expanded.task, true);
+  assert.equal(state.expanded.task, false);
   state.expanded.task = false;
   applyEvent(state, {
     sequence: 2001,

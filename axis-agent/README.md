@@ -141,6 +141,33 @@ alone cannot prove required text or a visited URL. A download goal instead uses
 completed-download evidence matching its declared filename or URL within the
 current task's download window to verify the triggering action.
 
+For a custom control, an inferred value check can become an exact text check
+when fresh bridge metadata proves that the same scoped control has no value
+property. The expected result stays unchanged; explicit value-property
+requirements, ambiguous targets, stale evidence, and uncertain writes cannot use
+this correction. The text assertion can supply the metadata itself, so no failing
+value probe or extra planner turn is required. Already-correct settings still
+need a passing check, but do not require an edit. Workbook progress stores the
+accepted check before advancing.
+
+For an inferred descriptive target, the navigator first asserts `count=1` on its
+observed scoped locator, then uses `browser_assert(..., goal_target=...)` with the
+declared target and unchanged expectation. The runtime binds the locator and tab
+before the assertion; later checks cannot replace that scope. Literal-target
+checks remain compatible. A running workbook step keeps the same goal identity
+across replanning and resume, and uses the same acceptance rule as goal completion.
+Repeated completion rejection stops after one recovery even when no changes are
+pending. Duplicate passing checks do not reset progress. Workflow reads never
+mark a step complete; the runtime records accepted evidence directly.
+
+Route changes are tracked separately from configuration writes and cannot clear
+an outstanding Save check. Repeating the same failing assertion on an unchanged
+page after a recovery attempt stops with the target, expected/actual result, and
+bridge diagnostic. Pause and cancel retain precedence. The extension handshake
+advertises property-evidence and attribute-protocol capabilities; an older bridge
+produces a compatibility warning instead of silently authorizing weaker checks.
+Reload the extension and restart the AXIS service together after updating them.
+
 Both agents receive retained source facts: extracted scalars and structured
 values, source URL, tab, goal, target, and evidence ID. Repeated reads from the
 same source and target are deduplicated. At most 16 entries and 32,000 characters
@@ -166,9 +193,13 @@ artifact captures use the separate `browser_capture_evidence` tool. A provider
 that explicitly rejects image input before any tool executes disables vision
 for that run and receives one text-only retry.
 
-Planner cadence starts at three navigator steps and can extend to six while
+Planner cadence starts at five navigator steps and can extend to eight while
 fresh evidence shows progress (`run.planner_interval_steps` and
-`run.planner_max_interval_steps`). Set both to three for fixed cadence.
+`run.planner_max_interval_steps`). Set both to the same number for fixed cadence.
+Each navigator step allows up to 16 browser calls (`run.max_actions_per_step`),
+including observations and assertions. These are ceilings, not minimum batches:
+goal completion, blockers, unknown outcomes, pause/cancel and budget limits still
+yield early. Whole-task model-request and browser-action budgets are unchanged.
 In direct mode, ordinary targeting repairs and verification remain local; the
 browser agent requests strategic replanning. In planned mode, completion and
 blockers return to the planner. Progress compares meaningful page content and action

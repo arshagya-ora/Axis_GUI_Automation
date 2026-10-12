@@ -56,7 +56,7 @@ def main():
         try:
             with sync_playwright() as playwright:
                 context=playwright.chromium.launch_persistent_context(
-                    str(Path(directory)/'profile'),headless=True,executable_path=args.executable,
+                    str(Path(directory)/'profile'),headless=True,channel='chromium',executable_path=args.executable,
                     args=[f'--disable-extensions-except={extension}',f'--load-extension={extension}'],
                     viewport={'width':400,'height':900})
                 try:
@@ -72,14 +72,16 @@ def main():
                     assert page.get_by_role('button',name='Attach files',exact=True).is_disabled()
                     assert page.get_by_role('button',name='Set up connection',exact=True).is_visible()
                     assert page.locator('#connection-button').inner_text() == 'Setup required'
+                    page.screenshot(path=str(args.output/'empty-unpaired-400x900.png'),animations='disabled')
                     page.get_by_label('Instruction',exact=True).fill('Keep this draft while pairing')
                     page.get_by_label('Instruction',exact=True).press('Enter')
                     assert page.locator('#workspace-error').is_hidden()
                     assert page.get_by_label('Instruction',exact=True).input_value() == 'Keep this draft while pairing'
                     assert page.locator('#instruction').get_attribute('placeholder') == 'Ask or add an instruction…'
                     assert page.locator('#history-search').get_attribute('placeholder') == 'Search conversations…'
-                    assert page.locator('#return-active').text_content().strip() == 'Return to active task →'
-                    assert page.locator('#new-activity').text_content().strip() == '↓ New activity'
+                    assert page.locator('#return-active').text_content().strip() == 'Return to active task'
+                    assert page.locator('#new-activity').text_content().strip() == 'New activity'
+                    assert page.locator('#return-active svg, #new-activity svg').count() == 2
                     report['checks'].append('Unpacked MV3 loaded; empty production state has no sample task')
                     # Exercise the actual shared settings form and authenticated API.
                     page.get_by_role('button',name='Settings',exact=True).click()
@@ -114,10 +116,12 @@ def main():
                     retry.wait_for()
                     page.wait_for_function("() => !document.querySelector('#retry-instruction').disabled")
                     page.get_by_role('button',name='Send instruction').click()
-                    assert 'Retry previous instruction' in page.locator('#workspace-error').inner_text()
+                    assert page.locator('#workspace-error').is_hidden()
+                    assert page.locator('#retry-instruction').evaluate('(node)=>node===document.activeElement')
                     assert page.get_by_label('Instruction',exact=True).input_value() == 'hi'
                     page.set_viewport_size({'width':320,'height':640})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                    assert page.locator('#composer').evaluate('(node)=>node.getBoundingClientRect().height>100')
                     page.screenshot(path=str(args.output/'pending-recovery-320x640.png'))
                     retry.click()
                     page.get_by_role('button',name='Return to active task').wait_for()
@@ -166,33 +170,73 @@ def main():
                     page.reload()
                     page.get_by_role('button',name='Approve change',exact=True).wait_for()
                     assert page.locator('#execution-approval .permission-card').count() == 1
-                    page.get_by_text('Review exact change and verification',exact=True).click()
+                    assert page.get_by_text('A summary prepared from the attached file.',exact=True).first.is_visible()
+                    page.get_by_text('Exact technical data',exact=True).click()
+                    assert 'arguments' in page.locator('#execution-approval pre.permission-params').inner_text()
+                    page.get_by_text('Exact technical data',exact=True).click()
                     page.set_viewport_size({'width':320,'height':640})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                    page.locator('#execution-approval .permission-body').evaluate('(node)=>node.scrollTop=0')
+                    assert page.get_by_text('Scroll to review all change details',exact=True).is_visible()
+                    assert page.get_by_text('Draft body',exact=True).first.is_visible()
+                    assert page.get_by_text('A summary prepared from the attached file.',exact=True).first.evaluate('(node)=>{const r=node.getBoundingClientRect(),body=node.closest(".permission-body").getBoundingClientRect();return r.top>=body.top&&r.bottom<=body.bottom;}')
                     page.screenshot(path=str(args.output/'execution-approval-320x640.png'))
+                    for width in (320,360,400,480):
+                        for height in (640,900):
+                            page.set_viewport_size({'width':width,'height':height})
+                            page.get_by_role('button',name='Approve change',exact=True).click(trial=True)
+                            page.get_by_role('button',name='Decline',exact=True).click(trial=True)
+                            assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                    page.get_by_role('button',name='Settings',exact=True).click()
+                    assert page.locator('#settings-view #execution-approval').is_visible()
+                    page.get_by_role('button',name='Back to workspace').click()
+                    page.get_by_role('button',name='Conversation history').click()
+                    assert page.locator('#history-drawer #execution-approval').is_visible()
+                    page.keyboard.press('Escape')
                     page.get_by_role('button',name='Approve change',exact=True).click()
                     approval_thread.join(timeout=3)
                     assert authorization == [True]
                     page.locator('#execution-approval').wait_for(state='hidden')
                     page.set_viewport_size({'width':400,'height':900})
                     report['checks'].append('Execution modes persist on active tasks; exact action approval survives reload and resolves once')
+                    assert page.get_by_role('button',name='Pause',exact=True).count() == 1
+                    assert page.get_by_role('button',name='Stop',exact=True).count() == 1
+                    assert page.locator('#message-mode').count() == 0
+                    assert page.locator('#composer-target').inner_text() == 'Follow-up'
                     page.get_by_role('button',name='Pause',exact=True).click()
                     page.get_by_role('button',name='Resume',exact=True).wait_for()
+                    assert page.get_by_role('button',name='Resume',exact=True).evaluate('(node)=>node===document.activeElement')
+                    page.screenshot(path=str(args.output/'paused-400x900.png'),animations='disabled')
                     assert runner.orchestrator.max_loops==1
-                    page.get_by_role('button',name='Hide activity').click()
                     assert page.get_by_role('button',name='Show activity').is_visible()
                     assert page.get_by_role('button',name='Stop',exact=True).is_visible()
                     page.get_by_role('button',name='Resume',exact=True).click()
                     page.get_by_role('button',name='Pause',exact=True).wait_for()
+                    assert page.get_by_role('button',name='Pause',exact=True).evaluate('(node)=>node===document.activeElement')
                     page.get_by_role('button',name='Show activity').click()
                     page.get_by_label('Instruction',exact=True).fill('Read the next fixture row')
-                    page.get_by_role('button',name='Send instruction').click()
+                    page.get_by_role('button',name='Send follow-up').click()
                     page.get_by_text('Applied to task',exact=True).wait_for()
                     assert runner.orchestrator.continuations==1
                     assert runner.orchestrator.max_loops==1
                     assert page.locator('.task-card').count()==1
                     report['checks'].append('Submit, pause, resume, collapsed Stop, and serialized follow-up work in MV3')
                     page.get_by_label('Instruction',exact=True).fill('Unsent draft stays here')
+                    page.get_by_role('button',name='Task options',exact=True).click()
+                    assert page.get_by_role('menuitem',name='Start new task',exact=True).evaluate('(node)=>node===document.activeElement')
+                    page.screenshot(path=str(args.output/'task-menu-400x900.png'),animations='disabled')
+                    page.keyboard.press('ArrowDown')
+                    assert page.get_by_role('menuitem',name='Follow up on current task',exact=True).evaluate('(node)=>node===document.activeElement')
+                    page.keyboard.press('Escape')
+                    assert page.get_by_role('button',name='Task options',exact=True).evaluate('(node)=>node===document.activeElement')
+                    page.get_by_role('button',name='Task options',exact=True).click()
+                    page.get_by_role('menuitem',name='Start new task',exact=True).click()
+                    page.get_by_role('dialog',name='Active task',exact=True).wait_for()
+                    page.get_by_role('button',name='Cancel',exact=True).click()
+                    assert page.get_by_label('Instruction',exact=True).input_value()=='Unsent draft stays here'
+                    assert page.locator('#composer-target').inner_text()=='Follow-up'
+                    assert page.get_by_role('button',name='Task options',exact=True).evaluate('(node)=>node===document.activeElement')
+                    report['checks'].append('Task menu keyboard navigation restores focus; cancelling task switch preserves target and draft')
                     page.get_by_role('button',name='Conversation history').click()
                     page.get_by_role('heading',name='Conversations',exact=True).wait_for()
                     page.keyboard.press('Escape')
@@ -214,7 +258,7 @@ def main():
                     report['checks'].append('Panel document close/reopen preserves active task and draft')
                     runner.orchestrator.complete_status='limit_reached'
                     runner.orchestrator.complete.set()
-                    page.get_by_text('Limit reached',exact=True).wait_for()
+                    page.wait_for_function("() => document.querySelector('#task-status').textContent === 'Limit reached'")
                     page.get_by_text('Extend budget',exact=True).click()
                     assert page.get_by_text('Add to this task’s budget while retaining its tabs, sources, and evidence.',exact=True).is_visible()
                     assert ' · ' in page.locator('.task-meta').inner_text()
@@ -249,7 +293,7 @@ def main():
                     assert page.locator('.activity li').count()==30
                     page.locator('#conversation').evaluate('(node)=>node.scrollTop=0')
                     runner.orchestrator.on_event(AxisEvent(kind='status',detail={'phase':'planner_started'}))
-                    page.get_by_role('button',name='↓ New activity',exact=True).wait_for()
+                    page.get_by_role('button',name='New activity',exact=True).wait_for()
                     assert page.locator('#conversation').evaluate('(node)=>node.scrollTop')<2
                     page.get_by_role('button',name='Settings',exact=True).click()
                     runner.orchestrator.on_event(AxisEvent(kind='status',detail={'phase':'observed'}))
@@ -258,25 +302,54 @@ def main():
                     assert page.locator('#conversation').evaluate('(node)=>node.scrollTop')<2
                     report['checks'].append('Two reconnects deduplicate missed activity; 70 events stay bounded and preserve the reader’s position through Settings')
                     page.get_by_role('button',name='Hide activity').click()
-                    for width in (320,360,400,480):
-                        for height in (640,900):
-                            page.set_viewport_size({'width':width,'height':height})
-                            for screen in ('workspace','history','settings'):
-                                if screen=='history':
-                                    page.get_by_role('button',name='Conversation history').click()
-                                    page.get_by_text('Budget extension requested',exact=True).wait_for()
-                                if screen=='settings':page.get_by_role('button',name='Settings',exact=True).click()
-                                assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'),f'Horizontal overflow: {width}x{height} {screen}'
-                                filename=f'{screen}-{width}x{height}.png'
-                                page.screenshot(path=str(args.output/filename),animations='disabled')
-                                report['screenshots'].append(filename)
-                                if screen=='history':page.keyboard.press('Escape')
-                                if screen=='settings':page.get_by_role('button',name='Back to workspace').click()
+                    for scheme in ('light','dark'):
+                        page.emulate_media(color_scheme=scheme)
+                        for width in (320,360,400,480):
+                            for height in (640,900):
+                                page.set_viewport_size({'width':width,'height':height})
+                                for screen in ('workspace','history','settings'):
+                                    if screen=='history':
+                                        page.get_by_role('button',name='Conversation history').click()
+                                        page.get_by_text('Budget extension requested',exact=True).wait_for()
+                                    if screen=='settings':page.get_by_role('button',name='Settings',exact=True).click()
+                                    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'),f'Horizontal overflow: {width}x{height} {screen}'
+                                    filename=f'{screen}{"-dark" if scheme=="dark" else ""}-{width}x{height}.png'
+                                    page.screenshot(path=str(args.output/filename),animations='disabled')
+                                    report['screenshots'].append(filename)
+                                    if screen=='history':page.keyboard.press('Escape')
+                                    if screen=='settings':page.get_by_role('button',name='Back to workspace').click()
+                    page.emulate_media(color_scheme='light')
                     page.set_viewport_size({'width':400,'height':900})
                     page.get_by_role('button',name='Settings',exact=True).click()
+                    assert not page.locator('.advanced-settings').evaluate('(node)=>node.open')
+                    assert page.get_by_label('Runtime approvals',exact=True).is_hidden()
+                    page.get_by_text('Advanced settings',exact=True).click()
+                    assert page.get_by_label('Runtime approvals',exact=True).is_visible()
+                    page.get_by_text('Port and diagnostics',exact=True).click()
+                    assert page.get_by_label('Browser bridge port',exact=True).is_visible()
+                    page.screenshot(path=str(args.output/'settings-advanced-400x900.png'),animations='disabled',full_page=True)
+                    page.get_by_text('Advanced settings',exact=True).click()
+                    page.evaluate("""() => {
+                        window.restoreStorageSet = chrome.storage.local.set;
+                        chrome.storage.local.set = async values => {
+                            if ('axisTheme' in values) throw Error('Fixture: storage is unavailable');
+                            return window.restoreStorageSet(values);
+                        };
+                    }""")
+                    page.get_by_role('radio',name='Dark',exact=True).click()
+                    page.get_by_text('Appearance could not be saved.',exact=False).wait_for()
+                    assert page.locator('html').get_attribute('data-theme')=='system'
+                    assert page.get_by_role('radio',name='System',exact=True).is_checked()
+                    page.evaluate('() => {chrome.storage.local.set = window.restoreStorageSet; delete window.restoreStorageSet;}')
+                    page.emulate_media(color_scheme='dark',reduced_motion='reduce')
+                    assert page.get_by_role('button',name='Refresh',exact=True).evaluate('(node)=>getComputedStyle(node).transitionDuration')=='0s'
+                    assert page.locator('html').evaluate('(node)=>getComputedStyle(node).backgroundColor')=='rgb(32, 30, 28)'
+                    page.emulate_media(color_scheme='light')
+                    assert page.locator('html').evaluate('(node)=>getComputedStyle(node).backgroundColor')=='rgb(251, 249, 248)'
                     page.get_by_role('radio',name='Dark',exact=True).check()
-                    page.get_by_role('button',name='Save appearance').click()
+                    assert page.get_by_role('button',name='Save appearance').count() == 0
                     page.get_by_text('Appearance saved.',exact=True).wait_for()
+                    report['checks'].append('Advanced settings preserve all controls; theme saves immediately, rolls back on failure, and System follows the OS')
                     page.screenshot(path=str(args.output/'settings-dark-400x900.png'))
                     page.get_by_role('button',name='Back to workspace').click()
                     page.screenshot(path=str(args.output/'workspace-dark-400x900.png'))
@@ -291,7 +364,18 @@ def main():
                     page.get_by_text('<img src=x onerror=alert(1)> fixture',exact=True).wait_for()
                     assert page.locator('#history-list img').count()==0
                     report['checks'].append('Untrusted history title is inert text')
-                    page.get_by_role('button',name='Rename <img src=x onerror=alert(1)> fixture',exact=True).click()
+                    page.get_by_role('button',name='Actions for <img src=x onerror=alert(1)> fixture',exact=True).click()
+                    page.keyboard.press('End')
+                    assert page.get_by_role('menuitem',name='Delete <img src=x onerror=alert(1)> fixture',exact=True).evaluate('(node)=>node===document.activeElement')
+                    page.keyboard.press('Escape')
+                    assert page.locator('#history-drawer').evaluate('(node)=>node.open')
+                    assert page.get_by_role('button',name='Actions for <img src=x onerror=alert(1)> fixture',exact=True).evaluate('(node)=>node===document.activeElement')
+                    page.get_by_role('button',name='Actions for <img src=x onerror=alert(1)> fixture',exact=True).click()
+                    page.get_by_role('menuitem',name='Delete <img src=x onerror=alert(1)> fixture',exact=True).click()
+                    page.get_by_role('button',name='Keep',exact=True).click()
+                    assert page.get_by_role('button',name='Actions for <img src=x onerror=alert(1)> fixture',exact=True).evaluate('(node)=>node===document.activeElement')
+                    page.get_by_role('button',name='Actions for <img src=x onerror=alert(1)> fixture',exact=True).click()
+                    page.get_by_role('menuitem',name='Rename <img src=x onerror=alert(1)> fixture',exact=True).click()
                     page.get_by_label('Conversation title',exact=True).fill('Local fixture check')
                     page.get_by_role('button',name='Save',exact=True).click()
                     page.get_by_label('Search conversations',exact=True).fill('no matching title')
@@ -314,6 +398,9 @@ def main():
                         target.click(trial=True)
                     page.get_by_role('button',name='Settings',exact=True).click()
                     page.get_by_role('button',name='Back to workspace').click()
+                    page.locator('#new-activity').evaluate('(node)=>node.hidden=false')
+                    assert page.locator('#new-activity').evaluate('(node)=>node.getBoundingClientRect().bottom<=document.querySelector(".composer-wrap").getBoundingClientRect().top')
+                    page.get_by_role('button',name='New activity',exact=True).click(trial=True)
                     page.screenshot(path=str(args.output/'workspace-200-percent.png'))
                     report['checks'].append('200% extension zoom retains reachable controls without page overflow')
                     # Options is the actual registered extension options document.
@@ -322,48 +409,68 @@ def main():
                     assert options.locator('html').get_attribute('data-theme')=='dark'
                     assert options.get_by_label('Service address',exact=True).input_value()==f'http://127.0.0.1:{port}'
                     report['checks'].append('Options document shares appearance, pairing, and settings code')
-                    # Render a completed-answer fixture with the real renderer in
-                    # this isolated profile. Never writes production history.
-                    page.evaluate("""async () => {
-                        const {renderChat} = await import('./ui/chat.js');
-                        const {createState, mergeTask} = await import('./ui/state.js');
-                        const state = createState(); state.selected = 'preview';
-                        const task = {id:'preview-task', conversation_id:'preview', title:'What is this page about?',
-                            status:'completed', current_activity:'Reviewed the page', counters:{browser_actions:3}, duration_ms:19000};
-                        state.expanded[task.id] = true;
-                        mergeTask(state, task);
-                        state.messages = [
-                            {id:'question', role:'user', text:task.title, task_id:task.id},
-                            {id:'answer', role:'assistant', task_id:task.id, text:
-                                '## About this page\\n\\nThis is a tutorial about **image and design tools**. It explains how to connect them and use them in a creative workflow.\\n\\n- Configure the tools\\n- Check the connection\\n- Generate an image\\n\\nRead the [source](https://example.com/tutorial). Use `Settings` to configure the connection.'}
-                        ];
-                        const root = document.querySelector('#timeline');
-                        renderChat(root, state, {expand:(id,value)=>{state.expanded[id]=value;renderChat(root,state,{});}});
-                        const order = [...root.children].map(node=>node.dataset.key);
-                        if (order.indexOf('message-answer') > order.indexOf('task-preview-task')) throw Error('Answer is below activity');
-                        if (!root.querySelector('.task-completed.collapsed')) throw Error('Completed activity did not collapse');
-                        document.querySelector('#conversation-title').textContent = task.title;
-                        document.querySelector('#instruction').value = '';
-                        document.querySelector('#context-chip').hidden = true;
-                        document.querySelector('#new-activity').hidden = true;
-                        document.querySelector('#conversation').scrollTop = 0;
+                    # Seed only the disposable service, then render a real snapshot.
+                    page.evaluate("async()=>{const tab=await chrome.tabs.getCurrent();await chrome.tabs.setZoom(tab.id,1);}")
+                    page.goto('about:blank')
+                    store.create_conversation('preview')
+                    task={'id':'preview-task','conversation_id':'preview','title':'What is this page about?',
+                          'status':'completed','current_activity':'Reviewed the page','counters':{'browser_actions':3},
+                          'duration_ms':19000,'created_at':time.time()-19,'updated_at':time.time()}
+                    answer='## About this page\n\nThis is a tutorial about **image and design tools**. It explains how to connect them and use them in a creative workflow.\n\n- Configure the tools\n- Check the connection\n- Generate an image\n\nRead the [source](https://example.com/tutorial). Use `Settings` to configure the connection.'
+                    with store.transaction():
+                        store.save_task(task)
+                        question=store.message('preview',task['id'],task['title'],'preview-question','new_task')
+                        response=store.message('preview',task['id'],answer,'preview-answer','result',role='assistant')
+                        store.db.execute('UPDATE conversations SET title=? WHERE id=?',(task['title'],'preview'))
+                    worker.evaluate("""async () => {
+                        const {axisWorkspace} = await chrome.storage.local.get('axisWorkspace');
+                        axisWorkspace.selected = 'preview';
+                        axisWorkspace.expanded['preview-task'] = true;
+                        await chrome.storage.local.set({axisWorkspace});
                     }""")
+                    page.goto(f'chrome-extension://{identifier}/sidepanel.html')
+                    page.locator('.answer-content').wait_for()
                     assert page.locator('.answer-content strong').inner_text() == 'image and design tools'
                     assert page.locator('.answer-content li').count() == 3
                     assert page.locator('.answer-content a').get_attribute('rel') == 'noopener noreferrer'
-                    page.evaluate("async()=>{const tab=await chrome.tabs.getCurrent();await chrome.tabs.setZoom(tab.id,1);}")
+                    assert page.locator('.task-completed.collapsed').count() == 1
+                    assert page.locator('.answer-content').evaluate('(node)=>!!(node.closest(".message").compareDocumentPosition(document.querySelector(".task-card")) & Node.DOCUMENT_POSITION_FOLLOWING)')
                     for theme in ('light','dark'):
-                        page.locator('html').evaluate('(node,theme)=>node.dataset.theme=theme',theme)
+                        worker.evaluate('(axisTheme)=>chrome.storage.local.set({axisTheme})',theme)
+                        page.wait_for_function('(theme)=>document.documentElement.dataset.theme===theme',arg=theme)
+                        options.wait_for_function('(theme)=>document.documentElement.dataset.theme===theme',arg=theme)
+                        assert options.get_by_role('radio',name=theme.capitalize(),exact=True).is_checked()
+                        contrast = page.evaluate("""() => {
+                            const style=getComputedStyle(document.documentElement);
+                            const rgb=value=>{
+                                const hex=value.trim().replace('#','');
+                                return (hex.length===3?[...hex].map(c=>c+c):hex.match(/../g)).map(c=>parseInt(c,16)/255);
+                            };
+                            const luminance=value=>rgb(value).map(c=>c<=.04045?c/12.92:((c+.055)/1.055)**2.4).reduce((sum,c,i)=>sum+c*[.2126,.7152,.0722][i],0);
+                            const ratio=(a,b)=>{const x=luminance(style.getPropertyValue(a)),y=luminance(style.getPropertyValue(b));return (Math.max(x,y)+.05)/(Math.min(x,y)+.05);};
+                            return [['--text','--canvas'],['--muted','--canvas'],['--muted','--soft'],['--on-accent','--accent'],['--accent','--surface'],['--green','--canvas'],['--danger','--canvas'],['--warning','--canvas']].map(pair=>({pair,ratio:ratio(...pair)}));
+                        }""")
+                        assert all(item['ratio'] >= 4.5 for item in contrast),contrast
+                        report.setdefault('contrast',{})[theme]=contrast
                         for width in (320,400):
                             page.set_viewport_size({'width':width,'height':900})
+                            page.locator('#conversation').evaluate('(node)=>node.scrollTop=0')
                             assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
-                            page.screenshot(path=str(args.output/f'answer-{theme}-{width}x900.png'))
+                            assert page.locator('.answer-content').is_visible()
+                            page.screenshot(path=str(args.output/f'answer-{theme}-{width}x900.png'),animations='disabled')
+                    report['checks'].append('Theme changes sync across panel and options; answer screenshots use a persisted completed-task fixture')
                     safe = page.evaluate("""async () => {
                         const {renderMarkdown} = await import('./ui/markdown.js');
                         const root = renderMarkdown('<img src=x onerror=alert(1)> **Safe** [bad](javascript:alert) [data](data:text/html,test)\\n\\n```html\\n<script>alert(1)</script>\\n```');
                         return !root.querySelector('img,script,a') && root.querySelector('strong').textContent === 'Safe' && root.querySelector('pre code').textContent.includes('<script>');
                     }""")
                     assert safe
+                    assert page.evaluate("""async () => {
+                        const {reviewValue} = await import('./ui/review-fields.js');
+                        const text='<img src=x onerror=alert(1)> '+ 'very-long-untrusted-content/'.repeat(100);
+                        const fields=reviewValue({target:text,files:[{name:text}],verification:{expected:text}});
+                        return !fields.querySelector('img,script') && fields.textContent.split(text).length===4;
+                    }""")
                     page.get_by_label('Instruction',exact=True).focus()
                     assert page.locator('#instruction').evaluate('(node)=>getComputedStyle(node).outlineStyle') == 'none'
                     report['checks'].append('Completed answer precedes collapsed activity; Markdown formats safely; narrow light/dark answer layouts and single composer focus outline verified')

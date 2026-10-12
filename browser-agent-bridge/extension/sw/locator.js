@@ -122,7 +122,7 @@ export function createLocatorHandlers({
     const render = budget => renderRefTree(tree.nodes || [], budget, params.format === 'aria');
     const snapshot = render(params.maxChars || 12000);
     const tab = await chromeApi.tabs.get(tabId);
-    return { snapshot, snapshotId: tree.snapshotId, url: tab.url, title: tab.title,
+    return { snapshot, fields: tree.fields || [], fieldsTruncated: tree.fieldsTruncated, snapshotId: tree.snapshotId, url: tab.url, title: tab.title,
       nodeCount: tree.nodes.length, truncated: tree.truncated || snapshot.length < render(Infinity).length };
   }
 
@@ -140,7 +140,7 @@ export function createLocatorHandlers({
     const index = Number.isInteger(params.index) && params.index >= 0 ? params.index : 0;
     const frameTarget = await resolveFrameTarget(tabId, params);
     const result = await runLocatorScript(tabId, { ...params, index }, 'textContent', frameTarget);
-    return { text: result.text, element: result.element, frame: frameTarget.frame };
+    return { text: result.text, count: result.count, element: result.element, frame: frameTarget.frame };
   }
 
   async function locatorAllTextContents(params) {
@@ -162,10 +162,13 @@ export function createLocatorHandlers({
   async function locatorGetAttribute(params) {
     const tabId = assertTabId(params.tabId);
     await assertTabAllowed(tabId, 'locator.getAttribute');
-    assertString(params.name, 'name');
+    const attributeName = params.attribute ?? params.name;
+    assertString(attributeName, 'attribute');
     const index = Number.isInteger(params.index) && params.index >= 0 ? params.index : 0;
     const frameTarget = await resolveFrameTarget(tabId, params);
-    const result = await runLocatorScript(tabId, { ...params, index, attributeName: params.name }, 'getAttribute', frameTarget);
+    const targetParams = { ...params, index, attributeName, scrollIntoView: false };
+    if (params.attribute == null) delete targetParams.name;
+    const result = await runLocatorScript(tabId, targetParams, 'getAttribute', frameTarget);
     return { value: result.value, element: result.element, frame: frameTarget.frame };
   }
 
@@ -212,6 +215,9 @@ export function createLocatorHandlers({
       try {
         // Poll from the worker: a wait running inside a document dies on navigation.
         result = await runLocatorScript(tabId, params, 'query', frameTarget);
+        if (params.strict === true && result.count > 1) {
+          throw createLocatorStrictModeError(params, state, frameTarget, result, Date.now() - started);
+        }
         const visibleCount = result.visibleCount || 0;
         const found = result.count > 0;
         if ((state === 'attached' && found) || (state === 'visible' && visibleCount > 0) ||
@@ -234,7 +240,7 @@ export function createLocatorHandlers({
   async function expectLocatorToBeVisible(params) {
     const tabId = assertTabId(params.tabId);
     await assertTabAllowed(tabId, 'expect.locator.toBeVisible');
-    const result = await locatorWaitFor({ ...params, state: 'visible' });
+    const result = await locatorWaitFor({ ...params, state: 'visible', strict: true });
     return { ok: true, assertion: 'toBeVisible', ...result };
   }
 
@@ -273,11 +279,16 @@ export function createLocatorHandlers({
 
     const result = await runLocatorScript(tabId, {
       ...params,
-      wait: { kind: 'text', expected, timeoutMs, intervalMs, match: locatorTextMatchOptions(params) }
+      wait: { kind: 'text', expected, single: !Array.isArray(expected), timeoutMs, intervalMs, match: locatorTextMatchOptions(params) }
     }, Array.isArray(expected) ? 'allInnerTexts' : 'textContent', frameTarget);
     const actual = Array.isArray(expected) ? result.texts : result.text;
-    if (matchesExpectedText(actual, expected, params)) {
-      return { ok: true, assertion: 'toHaveText', expected, actual, elapsedMs: Date.now() - started, frame: frameTarget.frame };
+    if (!Array.isArray(expected) && result.count > 1) {
+      throw createLocatorStrictModeError(params, 'toHaveText', frameTarget, result, Date.now() - started);
+    }
+    if ((Array.isArray(expected) || result.count === 1) && matchesExpectedText(actual, expected, params)) {
+      return { ok: true, assertion: 'toHaveText', expected, actual, count: result.count,
+        element: !Array.isArray(expected) && result.element ? { hasValue: result.element.hasValue } : undefined,
+        elapsedMs: Date.now() - started, frame: frameTarget.frame };
     }
     throw createLocatorExpectTimeoutError(params, 'toHaveText', frameTarget, {
       expected,
@@ -299,17 +310,26 @@ export function createLocatorHandlers({
     const result = await runLocatorScript(tabId, {
       ...params,
       index,
-      wait: { kind: 'elementState', assertion, expected, timeoutMs, intervalMs, match: locatorTextMatchOptions(params) }
+      wait: { kind: 'elementState', assertion, expected, single: true, timeoutMs, intervalMs, match: locatorTextMatchOptions(params) }
     }, 'summarize', frameTarget);
     const element = result.element;
-    if (element && predicate(element)) {
+    if (result.count > 1) {
+      throw createLocatorStrictModeError(params, assertion, frameTarget, result, Date.now() - started);
+    }
+    if (element && assertion === 'toHaveValue' && element.hasValue === false) {
+      const error = new Error('This element has no value property. Inspect its displayed text or state and use the matching assertion.');
+      error.code = 'UNSUPPORTED_ELEMENT_PROPERTY';
+      error.diagnostic = { assertion, property: 'value', element: compactLocatorElement(element) };
+      throw error;
+    }
+    if (result.count === 1 && element && predicate(element)) {
       return { ok: true, assertion, expected, actual: actualOf(element), elapsedMs: Date.now() - started, frame: frameTarget.frame };
     }
     throw createLocatorExpectTimeoutError(params, assertion, frameTarget, {
       expected,
       actual: element ? actualOf(element) : null,
       elapsedMs: Date.now() - started,
-      last: { element }
+      last: result
     });
   }
 
@@ -347,7 +367,7 @@ export function createLocatorHandlers({
   async function expectLocatorToBeHidden(params) {
     const tabId = assertTabId(params.tabId);
     await assertTabAllowed(tabId, 'expect.locator.toBeHidden');
-    const result = await locatorWaitFor({ ...params, state: 'hidden' });
+    const result = await locatorWaitFor({ ...params, state: 'hidden', strict: true });
     return { ok: true, assertion: 'toBeHidden', ...result };
   }
 
@@ -368,10 +388,13 @@ export function createLocatorHandlers({
       ...params,
       index,
       attributeName,
-      wait: { kind: 'attribute', expected, attributeName, timeoutMs, intervalMs, match: locatorTextMatchOptions(params) }
+      wait: { kind: 'attribute', expected, attributeName, single: true, timeoutMs, intervalMs, match: locatorTextMatchOptions(params) }
     }, 'getAttribute', frameTarget);
     const actual = result.value;
-    if (matchesExpectedText(actual || '', expected, params)) {
+    if (result.count > 1) {
+      throw createLocatorStrictModeError(params, 'toHaveAttribute', frameTarget, result, Date.now() - started);
+    }
+    if (result.count === 1 && matchesExpectedText(actual || '', expected, params)) {
       return { ok: true, assertion: 'toHaveAttribute', attribute: attributeName, expected, actual, elapsedMs: Date.now() - started, frame: frameTarget.frame };
     }
     throw createLocatorExpectTimeoutError(params, 'toHaveAttribute', frameTarget, {
@@ -991,7 +1014,11 @@ export function createLocatorHandlers({
       snapshotId: typeof params.snapshotId === 'string' && params.snapshotId ? params.snapshotId : undefined,
       values
     }, { frameId });
-    if (!response?.ok) throw new Error(response?.error || `Accessibility ref not found: ${ref}`);
+    if (!response?.ok) {
+      const error = new Error(response?.error || `Accessibility ref not found: ${ref}`);
+      if (typeof response?.code === 'string') error.code = response.code;
+      throw error;
+    }
     const target = response.target;
     if (params.force !== true && target?.actionability?.actionable !== true) {
       throw createLocatorRefNotActionableError(params, frameTarget, target, 'locator.selectOptionRef');
@@ -1205,10 +1232,12 @@ export function createLocatorHandlers({
         if (options.action === 'textContent') {
           return {
             text: (element.innerText || element.textContent || '').trim(),
+            count: matches.length,
             element: summarizeElement(element, options.index)
           };
         }
 
+        if (options.action === 'selectOption') assertNativeSelect(element);
         if (options.scrollIntoView) element.scrollIntoView({ block: 'center', inline: 'center' });
         const actionability = getActionability(element, options.action === 'fill' ? 'fill' : (options.action === 'click' ? 'click' : options.actionKind));
 
@@ -1431,6 +1460,9 @@ export function createLocatorHandlers({
             return { ...base, value: element.getAttribute(options.attributeName), element: summarizeElement(element, options.index) };
           }
           if (options.action === 'actionability') {
+            if (options.actionKind === 'select' && (options.wait?.strict !== true || matches.length === 1)) {
+              assertNativeSelect(element);
+            }
             if (options.scrollIntoView && (options.wait?.strict !== true || matches.length === 1)) {
               element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
             }
@@ -1471,6 +1503,8 @@ export function createLocatorHandlers({
         }
 
         function locatorWaitSatisfied(snapshot, wait) {
+          // Return ambiguity to the worker before comparing a candidate's value.
+          if (wait.single && snapshot.count !== 1) return snapshot.count > 1;
           if (wait.kind === 'locatorState') {
             const found = snapshot.count > 0;
             const visibleCount = snapshot.visibleCount || 0;
@@ -1494,7 +1528,7 @@ export function createLocatorHandlers({
             if (wait.assertion === 'toBeDisabled') return element.disabled === true;
             if (wait.assertion === 'toBeEditable') return (element.editable === true) === wait.expected;
             if (wait.assertion === 'toBeChecked') return element.checked === wait.expected;
-            if (wait.assertion === 'toHaveValue') return matchesExpectedTextInPage(element.value || '', wait.expected, wait.match || {});
+            if (wait.assertion === 'toHaveValue') return element.hasValue === false || matchesExpectedTextInPage(element.value || '', wait.expected, wait.match || {});
           }
           if (wait.kind === 'actionability') {
             const checks = snapshot.actionability || {};
@@ -1715,8 +1749,14 @@ export function createLocatorHandlers({
           };
         }
 
+        function assertNativeSelect(element) {
+          if (element.tagName.toLowerCase() === 'select') return;
+          const error = new Error('Element is not a <select>. Inspect the custom control, open it, and click an observed option.');
+          error.code = 'INVALID_ARGUMENT';
+          throw error;
+        }
+
         function selectOptions(element, requested) {
-          if (element.tagName.toLowerCase() !== 'select') throw new Error('Element is not a select');
           const multiple = element.multiple === true;
           const selected = [];
           const optionsToSelect = [];
@@ -1768,13 +1808,13 @@ export function createLocatorHandlers({
         }
 
         function getActionability(element, actionKind) {
-          const visible = isVisible(element);
+          const visible = isVisible(element) || (actionKind === 'click' && Array.from(element.labels || []).some(label => label.control === element && isVisible(label)));
           const enabled = isEnabled(element);
           const editable = isEditable(element);
           const selectable = element.tagName.toLowerCase() === 'select';
-          const pointerEvents = getComputedStyle(element).pointerEvents !== 'none';
           const clickPoint = clickablePoint(element, root);
           const hitTarget = actionKind === 'click' && clickPoint ? hitTestElement(element, root, clickPoint) : { receivesEvents: true };
+          const pointerEvents = getComputedStyle(element).pointerEvents !== 'none' || (actionKind === 'click' && hitTarget.receivesEvents);
           const reasons = [];
           if (!visible) reasons.push('not visible');
           if (!enabled) reasons.push('disabled');
@@ -1811,6 +1851,7 @@ export function createLocatorHandlers({
             role: inferredRole(element),
             type: element.getAttribute('type') || '',
             text: visibleText(element).slice(0, 500),
+            hasValue: 'value' in element,
             value: (element.getAttribute('type') || '').toLowerCase() === 'password' ? undefined : 'value' in element ? String(element.value).slice(0, 500) : '',
             ariaLabel: element.getAttribute('aria-label') || '',
             placeholder: element.getAttribute('placeholder') || '',
@@ -1869,7 +1910,7 @@ export function createLocatorHandlers({
               localHit = inner;
             }
             return {
-              receivesEvents: Boolean(localHit && (localHit === element || element.contains(localHit))),
+              receivesEvents: domA11y.receivesEvents(element, { x: point.x - frameRect.x, y: point.y - frameRect.y }),
               description: describeElementForHit(localHit)
             };
           }
@@ -1880,7 +1921,7 @@ export function createLocatorHandlers({
             hit = inner;
           }
           return {
-            receivesEvents: Boolean(hit && (hit === element || element.contains(hit))),
+            receivesEvents: domA11y.receivesEvents(element, point),
             description: describeElementForHit(hit)
           };
         }

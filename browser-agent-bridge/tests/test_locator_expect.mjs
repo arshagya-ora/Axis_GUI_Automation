@@ -12,6 +12,7 @@ async function importLocatorModule() {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function makeHandlers(result) {
+  if (result && typeof result === 'object') result = { count: 1, ...result };
   const { createLocatorHandlers } = await importLocatorModule();
   return createLocatorHandlers({
     assertTabId: (v) => v,
@@ -39,6 +40,41 @@ async function captureRejection(promise) {
 }
 
 const COMMON = { tabId: 1, selector: 'x', timeoutMs: 25, intervalMs: 10 };
+
+test('scalar assertions reject duplicate matches even when the first value matches', async () => {
+  const element = { role: 'combobox', accessibleName: 'Status', text: 'ENABLED', value: 'ENABLED',
+    disabled: false, editable: true, checked: true };
+  const handlers = await makeHandlers({ count: 2, visibleCount: 2, element,
+    elements: [{ ...element, id: 'first' }, { ...element, id: 'second' }], text: 'ENABLED', value: 'ENABLED' });
+  for (const [method, params] of [
+    ['expectLocatorToHaveText', { expected: 'ENABLED' }],
+    ['expectLocatorToHaveValue', { expected: 'ENABLED' }],
+    ['expectLocatorToHaveAttribute', { attribute: 'aria-valuetext', expected: 'ENABLED' }],
+    ['expectLocatorToBeVisible', {}], ['expectLocatorToBeHidden', {}],
+    ['expectLocatorToBeEnabled', {}], ['expectLocatorToBeDisabled', {}],
+    ['expectLocatorToBeEditable', {}], ['expectLocatorToBeChecked', {}]
+  ]) {
+    const error = await captureRejection(handlers[method]({ ...COMMON, ...params }));
+    assert.equal(error.code, 'LOCATOR_STRICT_MODE_VIOLATION', method);
+    assert.equal(error.diagnostic.count, 2);
+    assert.equal(error.diagnostic.candidates[1].id, 'second');
+  }
+});
+
+test('missing elements cannot pass an empty text or attribute assertion', async () => {
+  const handlers = await makeHandlers({ count: 0, text: null, value: null });
+  for (const [method, params] of [
+    ['expectLocatorToHaveText', {}], ['expectLocatorToHaveAttribute', { attribute: 'title' }]
+  ]) {
+    const error = await captureRejection(handlers[method]({ ...COMMON, ...params, expected: '' }));
+    assert.equal(error.code, 'LOCATOR_EXPECT_TIMEOUT');
+  }
+});
+
+test('text list assertions still support multiple matches', async () => {
+  const handlers = await makeHandlers({ count: 2, texts: ['Ready', 'Saved'] });
+  assert.equal((await handlers.expectLocatorToHaveText({ ...COMMON, expected: ['Ready', 'Saved'] })).ok, true);
+});
 
 test('missing locator script results never satisfy zero-count or hidden assertions', async () => {
   for (const result of [null, undefined]) {

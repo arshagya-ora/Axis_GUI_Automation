@@ -1,4 +1,4 @@
-import { el, icon, button } from "./dom.js";
+import { el, icon, button, actionMenu } from "./dom.js";
 import { STATUS, TERMINAL, ownsRuntime } from "./state.js";
 import { renderActivity, activityText } from "./activity.js";
 import { renderMarkdown } from "./markdown.js";
@@ -163,17 +163,13 @@ function taskCard(task, state, actions) {
   const metrics = el("div", "task-metrics");
   metrics.append(
     el("span", `badge ${task.status}`, STATUS[task.status] || task.status),
-    el(
-      "p",
-      "metadata task-meta",
-      `${task.counters?.browser_actions || 0} actions · ${duration(task.duration_ms)}`,
-    ),
+    ...(expanded ? [el("p", "metadata task-meta", `${task.counters?.browser_actions || 0} actions · ${duration(task.duration_ms)}`)] : []),
   );
-  card.append(metrics);
-  if (task.execution_mode) card.append(el("p", "metadata", task.execution_mode === "automatic" ? "Automatic mode" : "Approval mode"));
-  if (task.status !== "completed" || expanded) card.append(summary);
+  if (!ownsRuntime(task) || expanded) card.append(metrics);
+  if (expanded && task.execution_mode) card.append(el("p", "metadata", task.execution_mode === "automatic" ? "Automatic mode" : "Approval mode"));
+  if (expanded || ["failed", "interrupted", "needs_user"].includes(task.status)) card.append(summary);
   if (["active", "pausing", "stopping"].includes(task.status))
-    card.querySelector(".task-meta").dataset.liveTask = task.id;
+    if (card.querySelector(".task-meta")) card.querySelector(".task-meta").dataset.liveTask = task.id;
   if (expanded) {
     const page = state.activity[task.id] || { items: [] };
     if (page.has_more)
@@ -233,17 +229,13 @@ function taskCard(task, state, actions) {
     }
     card.append(choices);
   }
-  if (task.workflow && (task.status !== "completed" || expanded)) {
+  if (task.workflow && expanded) {
     const counts = task.workflow.counts;
     const uncovered = task.workflow.uncovered_sections?.length || 0;
     if (Object.values(counts).some(value => value > 0) || uncovered)
       card.append(el("p", "metadata workflow-summary", `Workflow: ${counts.verified || 0} verified · ${(counts.pending || 0) + (counts.running || 0)} pending · ${counts.skipped || 0} not applicable${uncovered ? ` · ${uncovered}${task.workflow.more_uncovered ? '+' : ''} sections to plan` : ''}`));
   }
   if (state.active?.id === task.id && ownsRuntime(task)) {
-    if (task.status === "active")
-      buttons.append(button("Pause", () => actions.control(task, "pause")));
-    if (task.status === "paused")
-      buttons.append(button("Resume", () => actions.control(task, "resume")));
     if (task.status === "limit_reached") {
       const details = el("details", "budget-extension");
       details.append(el("summary", "", "Extend budget"));
@@ -295,15 +287,10 @@ function taskCard(task, state, actions) {
       details.append(form);
       card.append(details);
     }
-    const stop = button(task.status === "stopping" ? "Stopping…" : "Stop", () =>
-      actions.control(task, "stop"),
-    );
-    stop.disabled = task.status === "stopping";
-    buttons.append(stop);
   } else if (TERMINAL.has(task.status))
-    buttons.append(
-      button("Use saved outcome", () => actions.savedContext(task)),
-    );
+    buttons.append(actionMenu("Task actions", [
+      { label: "Use saved outcome", icon: "file", action: () => actions.savedContext(task) },
+    ]));
   controls.append(buttons);
   card.append(controls);
   return card;

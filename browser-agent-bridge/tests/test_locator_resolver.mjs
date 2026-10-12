@@ -434,6 +434,21 @@ test('locator.selectOptionRef sends normalized values and returns the selection'
   assert.deepEqual(msg.values, [{ value: 'us' }]); // string param normalized to {value}
 });
 
+test('locator.selectOptionRef preserves typed rejections and legacy errors', async () => {
+  const createLocatorHandlers = await getCreateLocatorHandlers();
+  for (const code of ['INVALID_ARGUMENT', undefined]) {
+    const handlers = createLocatorHandlers({
+      assertTabId: id => id, assertTabAllowed: async () => {}, assertString: () => {},
+      recordAction: async () => assert.fail('Rejected selection must not be recorded as an action'),
+      resolveFrameTarget: async tabId => ({ target: { tabId }, frame: {} }),
+      ensureContentScripts: async () => {},
+      chromeApi: { tabs: { sendMessage: async () => ({ ok: false, error: 'Selection rejected', code }) } }
+    });
+    await assert.rejects(handlers.locatorSelectOptionRef({ tabId: 1, ref: 'ref_1', value: 'Enabled' }),
+      error => error.code === code && error.message === 'Selection rejected');
+  }
+});
+
 test('locator.selectOptionRef rejects a non-actionable ref', async () => {
   const createLocatorHandlers = await getCreateLocatorHandlers();
   const handlers = createLocatorHandlers({

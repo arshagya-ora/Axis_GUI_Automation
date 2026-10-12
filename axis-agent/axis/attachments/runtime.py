@@ -8,13 +8,17 @@ from pathlib import Path
 from uuid import uuid4
 from .progress import DocumentProgress
 from .overview import DocumentOverview
-from .scope import constraints, normalized, user_messages, overview_request
+from .scope import constraints, normalized, user_messages, user_requests, attachment_requests, overview_request
 
 INSTRUCTIONS = Path(__file__).with_name('instructions.txt').read_text(encoding='utf-8')
 
 
 class DocumentRestriction(ValueError):
     """A user restriction needs clarification, not another document attempt."""
+
+
+class DocumentScopeError(ValueError):
+    """An invalid scope declaration cannot be repaired by repeating it."""
 
 
 class DocumentSession(DocumentOverview, DocumentProgress):
@@ -36,16 +40,34 @@ class DocumentSession(DocumentOverview, DocumentProgress):
             saved = task.get('attachment_uses', {})
             for use in uses:
                 self.store.require(self.task_id, use.attachment_id)
-                if normalized(use.user_evidence) not in normalized(request):
-                    inferred = self.inferred_uses().get(use.attachment_id)
-                    if inferred and set(use.operations) <= set(inferred['operations']):
+                messages = attachment_requests(self.store, self.task_id, use.attachment_id)
+                evidence = [message['text'] for message in messages]
+                if not user_requests(self.store, self.task_id):
+                    evidence = [request]
+                source = self._source_message(use.attachment_id)
+                inferred = self.inferred_uses().get(use.attachment_id)
+                previous = saved.get(use.attachment_id, {})
+                if not any(normalized(use.user_evidence) in normalized(text) for text in evidence):
+                    known = previous if previous.get('declared') and previous.get('source_message') == source else inferred
+                    if known and set(use.operations) <= set(known['operations']):
                         # Use the recorded user instruction, never a model quote
                         # or text from the attachment, as authorization evidence.
-                        use = use.model_copy(update={'user_evidence': inferred['user_evidence'][:1000]})
+                        use = use.model_copy(update={'user_evidence': known['user_evidence'][:1000]})
                     else:
-                        raise DocumentRestriction('Attachment use is not authorized by the user request. Clarify which file to use and whether it may be read.')
-                if 'execute' in use.operations and not constraints(self.store, self.task_id, use.attachment_id)['execute']:
-                    raise ValueError('Following file instructions needs a user request delegating that work.')
+                        raise DocumentScopeError('Attachment scope must cite a user request associated with this file.')
+                current_evidence = source and normalized(use.user_evidence) in normalized(source['text'])
+                policy = constraints(self.store, self.task_id, use.attachment_id,
+                                     execution_source=source if current_evidence else None)
+                if any(policy[operation] is False for operation in use.operations):
+                    raise DocumentRestriction('The requested attachment use conflicts with an explicit user restriction.')
+                if (previous.get('declared') and previous.get('source_message') == source
+                        and (set(use.operations) - set(previous['operations'])) & {'execute', 'upload'}):
+                    raise DocumentScopeError('Attachment operations cannot expand without a new user request.')
+                if 'execute' in use.operations:
+                    if use.purpose != 'execute' and policy['execute'] is not True:
+                        raise DocumentScopeError('Following file instructions requires an execute purpose grounded in a user request delegating that work.')
+                    use = use.model_copy(update={'purpose': 'execute',
+                                                 'operations': sorted(set(use.operations) | {'read'})})
                 if 'execute' in use.operations and re.search(r'\b(all|every|entire|complete)\b', request, re.I):
                     use = use.model_copy(update={'coverage': 'all'})
                 if self._reading_restricted(use.attachment_id) and any(op != 'upload' for op in use.operations):
@@ -53,16 +75,17 @@ class DocumentSession(DocumentOverview, DocumentProgress):
                 if use.purpose in {'summary', 'overview'} and not constraints(self.store, self.task_id, use.attachment_id)['summarize']:
                     raise DocumentRestriction('The user requested extraction without a summary. Return the requested values instead.')
                 data = use.model_dump()
-                inferred = self.inferred_uses().get(use.attachment_id)
-                if inferred and 'read' in inferred['operations']:
+                if inferred and 'read' in inferred['operations'] and 'execute' not in use.operations and not previous.get('declared'):
                     data['operations'] = sorted(set(data['operations']) | {'read'})
-                    data['purpose'] = inferred['purpose']
-                    data['coverage'] = inferred['coverage']
+                    if inferred['purpose'] == 'overview' or (use.purpose == 'answer' and inferred['purpose'] != 'execute'):
+                        data['purpose'] = inferred['purpose']
+                        data['coverage'] = inferred['coverage']
                 data.update(self.scope(use.attachment_id, use.sheet, use.cell_range))
                 if data['purpose'] in {'summary', 'enumerate', 'execute'} or data.get('cell_range'):
                     data['coverage'] = 'all'
                 elif data['purpose'] == 'overview':
                     data['coverage'] = 'relevant'
+                data.update(source_message=source, declared=True)
                 saved[use.attachment_id] = data
             task['attachment_uses'] = saved
             self.store.history.save_task(task)
@@ -70,44 +93,55 @@ class DocumentSession(DocumentOverview, DocumentProgress):
     def inferred_uses(self):
         """Bootstrap clear document requests; ambiguity stays with the planner."""
         catalog = self.store.catalog(self.task_id)
-        messages = user_messages(self.store, self.task_id)
-        text = '\n'.join(messages)
-        lower = text.casefold()
-        selected = catalog if len(catalog) == 1 or re.search(r'\b(both|all|every|these|documents|files)\b', lower) else []
-        named = [a for a in catalog if a['filename'].casefold() in lower]
-        if named and not re.search(r'\b(both|all|every|these)\b', lower):
-            selected = named
-        summary = bool(re.search(r'\b(?:summari[sz]e|summary|describe)\b|what\b.*?\bpresent\b', lower))
-        overview = overview_request(messages[-1]) if messages else False
-        enumeration = bool(re.search(r'\b(?:all|every)\b.*?\b(?:scenarios?|names?|entries|items|rows|sections?|paragraphs?|pages?|cells)\b', lower, re.S))
-        read = overview or summary or enumeration or bool(re.search(r'\b(?:read|inspect|extract)\b', lower))
-        positive_use = re.sub(r"\b(?:do not|don't|never)\s+use\b[^.;\n]*", '', lower)
-        read = read or bool(re.search(r'\buse\b.{0,100}\b(?:attached|attachment|file|document|config(?:uration)?)\b', positive_use))
-        upload = bool(re.search(r'\b(?:upload|attach)\b', lower))
         from .scope import requested_range
         uses = {}
-        for item in selected:
+        for item in catalog:
+            messages = attachment_requests(self.store, self.task_id, item['id'])
+            if not messages:
+                continue
+            text = '\n'.join(message['text'] for message in messages)
+            lower = text.casefold()
+            associated = any(item['id'] in message['attachment_ids'] for message in messages)
+            if (len(catalog) > 1 and not associated and item['filename'].casefold() not in lower
+                    and not re.search(r'\b(both|all|every|these|documents|files)\b', lower)):
+                continue
+            summary = bool(re.search(r'\b(?:summari[sz]e|summary|describe)\b|what\b.*?\bpresent\b', lower))
+            overview = overview_request(messages[-1]['text'])
+            enumeration = bool(re.search(r'\b(?:all|every)\b.*?\b(?:scenarios?|names?|entries|items|rows|sections?|paragraphs?|pages?|cells)\b', lower, re.S))
+            read = overview or summary or enumeration or bool(re.search(r'\b(?:read|inspect|extract)\b', lower))
+            positive_use = re.sub(r"\b(?:do not|don't|never)\s+use\b[^.;\n]*", '', lower)
+            read = read or bool(re.search(r'\buse\b.{0,100}\b(?:attached|attachment|file|document|config(?:uration)?)\b', positive_use))
+            upload = bool(re.search(r'\b(?:upload|attach)\b', lower))
             policy = constraints(self.store, self.task_id, item['id'])
             bounds = requested_range(self.store, self.task_id, item['id'])
             operations = (['read'] if read and policy['read'] else []) + (['upload'] if upload and policy['upload'] else [])
-            if policy['execute']:
+            if policy['execute'] is True:
                 operations = sorted(set(operations) | {'read', 'execute'})
             if not operations:
                 continue
             purpose = 'execute' if 'execute' in operations else 'answer' if bounds else 'enumerate' if enumeration else 'overview' if overview and policy['summarize'] else 'summary' if summary and policy['summarize'] else 'answer' if 'read' in operations else 'upload'
             uses[item['id']] = dict(attachment_id=item['id'], operations=operations,
                 coverage='all' if purpose in {'summary', 'enumerate', 'execute'} or bounds else 'relevant',
-                purpose=purpose, user_evidence=text[:1000], sheet=bounds.get('sheet'), cell_range=bounds.get('cell_range'))
+                purpose=purpose, user_evidence=text[:1000], sheet=bounds.get('sheet'), cell_range=bounds.get('cell_range'),
+                source_message=self._source_message(item['id']))
         return uses
+
+    def _source_message(self, identifier):
+        messages = attachment_requests(self.store, self.task_id, identifier)
+        return {key: messages[-1][key] for key in ('id', 'text')} if messages else None
 
     def refresh_scope(self):
         with self.store.history.transaction():
             task = self.store.history.task(self.task_id)
             saved = task.get('attachment_uses', {})
-            saved.update(self.inferred_uses())
+            for identifier, inferred in self.inferred_uses().items():
+                previous = saved.get(identifier, {})
+                if not previous.get('declared') or previous.get('source_message') != inferred['source_message']:
+                    saved[identifier] = inferred
             for identifier, use in saved.items():
-                policy = constraints(self.store, self.task_id, identifier)
-                use['operations'] = [op for op in use['operations'] if policy[op] and (op != 'execute' or policy['read'])]
+                policy = constraints(self.store, self.task_id, identifier,
+                                     execution_source=use.get('source_message') if use.get('declared') else None)
+                use['operations'] = [op for op in use['operations'] if policy[op] is not False and (op != 'execute' or policy['read'])]
                 if use.get('purpose') in {'summary', 'overview'} and not policy['summarize']:
                     use['purpose'] = 'answer'
             task['attachment_uses'] = saved
@@ -119,6 +153,14 @@ class DocumentSession(DocumentOverview, DocumentProgress):
 
     def _uses(self):
         return self.store.history.task(self.task_id).get('attachment_uses', {})
+
+    def _check_execute(self, identifier):
+        use = self._uses().get(identifier, {})
+        if constraints(self.store, self.task_id, identifier,
+                       execution_source=use.get('source_message') if use.get('declared') else None)['execute'] is False:
+            raise DocumentRestriction('The current user instructions prohibit execution from this file.')
+        if 'execute' not in use.get('operations', []):
+            raise DocumentScopeError('Declare the user-delegated attachment scope before planning or executing its instructions.')
 
     def progress(self, attempts=None, signatures=None):
         with self.store.history.transaction():
@@ -172,11 +214,13 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         if last_result and last_result.get('operation') == 'overview' and any(x and x['attachment_id'] == last_result['attachment_id'] for x in overviews):
             last_result = dict(operation='overview', attachment_id=last_result['attachment_id'], note='Source preview is retained in overviews. Answer the overview now.')
         return dict(attachments=catalog, uses=self._uses(), coverage=self.coverage(), findings=self.notes(),
+                    note_rejections=self.store.history.task(self.task_id).get('document_note_rejections', []),
                     overviews=[value for value in overviews if value],
                     prior_progress=self.store.history.task(self.task_id).get('prior_progress', []), workflow=workflow,
                     procedure_sources=procedure_sources,
                     last_result=last_result, current_source=current_source,
-                    user_followups=user_messages(self.store, self.task_id)[-5:], instructions=INSTRUCTIONS)
+                    user_followups=user_messages(self.store, self.task_id)[-5:],
+                    user_requests=user_requests(self.store, self.task_id), instructions=INSTRUCTIONS)
 
     def workflow(self, offset=0):
         with self.store.history.lock:
@@ -313,10 +357,7 @@ class DocumentSession(DocumentOverview, DocumentProgress):
                             raise ValueError('Plan procedure steps in source order before executing later sections.')
                     self.store.require(self.task_id, owner[0])
                     self._check_read(owner[0])
-                    if not constraints(self.store, self.task_id, owner[0])['execute']:
-                        raise ValueError('The current user instructions do not delegate execution from this file.')
-                    if 'execute' not in self._uses().get(owner[0], {}).get('operations', []):
-                        raise ValueError('This automatic attachment has not been delegated for instruction execution.')
+                    self._check_execute(owner[0])
                     scope = self.scope(owner[0])
                     source = self.store.sections(self.task_id, owner[0], ids=[item['section_id']], **scope)
                     if not source['items'] or not history.db.execute("SELECT 1 FROM document_reads WHERE task_id=? AND section_id=? UNION SELECT 1 FROM document_scope_reads WHERE task_id=? AND section_id=? AND scope=?", (self.task_id, item['section_id'], self.task_id, item['section_id'], self.scope_key(scope))).fetchone():
@@ -333,33 +374,54 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         self.last_result = dict(operation=operation, **result)
         return self.last_result
 
-    def begin(self, step_id, goal_id, verification=None):
+    def validate_step(self, step_id):
+        """Validate ordering and source scope without changing the running step."""
         workflow = self.workflow()
         if not workflow["next_steps"] or workflow["next_steps"][0]["id"] != step_id:
             raise ValueError("Execute the first pending workflow step; completed steps cannot be replayed.")
         step = workflow['next_steps'][0]
         self._check_read(step['attachment_id'])
-        if not constraints(self.store, self.task_id, step['attachment_id'])['execute']:
-            raise ValueError('The current user instructions do not delegate this workflow.')
+        self._check_execute(step['attachment_id'])
         if not self.store.sections(self.task_id, step['attachment_id'], ids=[step['section_id']], **self.scope(step['attachment_id']))['items']:
             raise ValueError('This workflow step is outside the current requested source scope.')
-        saved = workflow['next_steps'][0].get('verification')
+        return step
+
+    def begin(self, step_id, goal_id, verification=None):
+        from axis.models import GoalCheck
+        step = self.validate_step(step_id)
+        saved = step.get('verification')
+        if step.get('goal_id') and step['goal_id'] != goal_id:
+            raise ValueError('Retain the running workflow goal identity: ' + step['goal_id'])
         check = verification.model_dump_json() if verification else None
-        if saved and saved != check:
+        if saved and GoalCheck.model_validate_json(saved) != verification:
             raise ValueError('Retain the saved verification postcondition when recovering this step: ' + saved)
         with self.store.history.transaction():
             self.store.history.db.execute("UPDATE workflow_steps SET status='running',goal_id=?,verification=COALESCE(verification,?) WHERE id=? AND task_id=?", (goal_id, check, step_id, self.task_id))
         self.current_step = step_id
 
-    def verified(self, state, matches):
+    def refine_verification(self, goal_id, previous, corrected):
+        """Persist a correction already checked against runtime evidence."""
+        from axis.models import GoalCheck
+        with self.store.history.transaction():
+            rows = self.store.history.db.execute(
+                "SELECT id,verification FROM workflow_steps WHERE task_id=? AND status='running' AND goal_id=?",
+                (self.task_id, goal_id)).fetchall()
+            for row in rows:
+                if row['verification'] and GoalCheck.model_validate_json(row['verification']) == previous:
+                    self.store.history.db.execute("UPDATE workflow_steps SET verification=? WHERE id=? AND task_id=?",
+                        (corrected.model_dump_json(), row['id'], self.task_id))
+
+    def verified(self, state, matches, *, accepted=None):
         if not self.current_step:
             return
-        from axis.models import ActionRecord
-        # Only runtime assertions of the predeclared postcondition can complete a
-        # workflow step. Model prose and document reads are never action evidence.
-        passed = [a for a in state.assertions if a.passed and not a.superseded_by and a.goal_id == state.current_goal_id
-                  and matches(state.current_verification, ActionRecord(tool='browser_assert', operation=a.assertion,
-                              target=a.target, result_data={'expected': a.expected, 'match': a.match}))]
+        from axis.models import GoalCheck, accepted_goal_assertions
+        step = self.validate_step(self.current_step)
+        if (step.get('goal_id') != state.current_goal_id or not step.get('verification')
+                or GoalCheck.model_validate_json(step['verification']) != state.current_verification):
+            raise ValueError('Retain the running workflow identity and verification contract.')
+        # The orchestrator supplies its already accepted evidence. Direct callers
+        # use the same rule, including freshness after the last interaction.
+        passed = accepted_goal_assertions(state, matches) if accepted is None else accepted
         if not passed or any(p.goal_id == state.current_goal_id for p in state.pending_changes.values()):
             raise ValueError("Workflow step needs a passing browser_assert for its declared postcondition.")
         with self.store.history.transaction():

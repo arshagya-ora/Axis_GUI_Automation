@@ -1,6 +1,7 @@
 """Attachment constraints come from user messages, never file roles or contents."""
 from __future__ import annotations
 
+import json
 import re
 
 
@@ -19,20 +20,37 @@ def overview_request(text):
         r'\bwhat\b.+\b(?:file|document|attachment)\b.+\babout\b', text))
 
 
-def user_messages(store, task_id):
+def user_requests(store, task_id):
     with store.history.lock:
         rows = store.history.db.execute(
-            "SELECT text FROM messages WHERE task_id=? AND role='user' AND delivery='applied' "
+            "SELECT id,text,attachments FROM messages WHERE task_id=? AND role='user' AND delivery='applied' "
             "AND intent IN ('new_task','follow_up') ORDER BY ordinal", (task_id,)).fetchall()
     task = store.history.task(task_id)
     original = task.get('instruction', '').split('\nFollow-up:', 1)[0]
-    messages = [row[0] for row in rows]
-    if original and (not messages or messages[0] != original):
-        messages.insert(0, original)
+    messages = [dict(id=row['id'], text=row['text'],
+                     attachment_ids=[item['attachment_id'] for item in json.loads(row['attachments'] or '[]')])
+                for row in rows]
+    if original and (not messages or messages[0]['text'] != original):
+        messages.insert(0, dict(id=None, text=original, attachment_ids=[]))
     return messages
 
 
-def constraints(store, task_id, identifier):
+def user_messages(store, task_id):
+    return [message['text'] for message in user_requests(store, task_id)]
+
+
+def attachment_requests(store, task_id, identifier):
+    catalog = store.catalog(task_id)
+    messages = []
+    for message in user_requests(store, task_id):
+        named = [item['id'] for item in catalog if item['filename'].casefold() in message['text'].casefold()]
+        selected = named or message['attachment_ids']
+        if not selected or identifier in selected:
+            messages.append(message)
+    return messages
+
+
+def constraints(store, task_id, identifier, *, execution_source=None):
     """Apply successive, file-scoped user clauses. Reading and summary differ.
 
     This is a conservative guard for explicit prohibitions; the planner still
@@ -42,16 +60,20 @@ def constraints(store, task_id, identifier):
     store.require(task_id, identifier)
     catalog = store.catalog(task_id)
     filename = store.get(identifier)['filename'].casefold()
-    result = {'read': True, 'summarize': True, 'upload': True, 'execute': False}
+    # None leaves execution intent to the planner; False is an explicit denial.
+    result = {'read': True, 'summarize': True, 'upload': True, 'execute': None}
     verbs = {
         'read': r'read(?:ing)?|inspect(?:ing)?',
         'summarize': r'summari[sz](?:e|ing)|analy[sz](?:e|ing)',
         'upload': r'upload(?:ing)?|attach(?:ing)?',
         'execute': r'follow|execute|configure|apply|perform|implement|carry out',
     }
-    for message in user_messages(store, task_id):
+    for request in attachment_requests(store, task_id, identifier):
+        if execution_source == {key: request[key] for key in ('id', 'text')}:
+            result['execute'] = None
+        message = request['text']
         # Keep filename dots intact. A named file applies to its sentence;
-        # an unqualified grant across multiple files must explicitly say both/all.
+        # Otherwise, use the message's attachments or an explicit collective grant.
         for sentence in re.split(r'(?<=[.!?])\s+|[;\n]', message.casefold()):
             named = [item['filename'].casefold() for item in catalog if item['filename'].casefold() in sentence]
             if named and filename not in named:
@@ -61,7 +83,7 @@ def constraints(store, task_id, identifier):
                 for operation, verb in verbs.items():
                     if re.search(rf"\b(?:do not|don't|never|must not)\s+(?:{verb})\b", clause):
                         result[operation] = False
-                    elif not negative and (named or len(catalog) == 1 or re.search(r'\b(both|all|every)\b', clause)):
+                    elif not negative and (named or identifier in request['attachment_ids'] or len(catalog) == 1 or re.search(r'\b(both|all|every)\b', clause)):
                         if re.search(rf'(?:(?:^|\band\s+)(?:please\s+)?(?:now\s+)?|\b(?:allow|permit|you may|you can now|go ahead and)\s+)(?:{verb})\b', clause):
                             result[operation] = True
                         elif operation == 'execute' and re.search(r'\buse\b.+\bto\s+(?:configure|apply|execute)\b', clause):
@@ -83,11 +105,12 @@ def requested_range(store, task_id, identifier):
     if not sheets:
         return {}
     selected = {}
-    for message in user_messages(store, task_id):
+    for request in attachment_requests(store, task_id, identifier):
+        message = request['text']
         names = [a['filename'].casefold() for a in catalog if a['filename'].casefold() in message.casefold()]
         if names and filename not in names:
             continue
-        if len(catalog) > 1 and not names:
+        if len(catalog) > 1 and not names and identifier not in request['attachment_ids']:
             continue
         if re.search(r'^\s*(?:please\s+)?(?:now\s+)?(?:read|inspect|summari[sz]e)\b.*?\b(?:whole|entire|all)\b.*?\b(?:workbook|file|sheet|rows)\b', message, re.I):
             selected = {}
