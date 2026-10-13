@@ -143,7 +143,7 @@ function renderConnection() {
         : "Connected";
   label.classList.toggle("ready", connected && state.stream !== "reconnecting");
   $("#connection-details").textContent =
-    `AXIS service: ${state.connected ? "connected" : "offline or not paired"}\nBrowser bridge: ${bridge.state}\nActivity stream: ${state.stream}${bridge.error ? "\n" + bridge.error : ""}`;
+    `ORACLE AXIS service: ${state.connected ? "connected" : "offline or not paired"}\nBrowser bridge: ${bridge.state}\nActivity stream: ${state.stream}${bridge.error ? "\n" + bridge.error : ""}`;
   const context =
     state.active?.conversation_id === state.selected
       ? state.active.browser_context
@@ -215,9 +215,9 @@ function renderComposer() {
   $("#composer-target").title = state.mode === "follow_up" ? "Instructions go to the current task" : "Start a new task";
   const hint = $("#composer-hint");
   hint.textContent = !api.token || state.pairingRequired
-    ? "Pair the local AXIS service in Settings to get started."
+    ? "Pair the local ORACLE AXIS service in Settings to get started."
     : !state.connected
-    ? "Connect AXIS in Settings to start a browser task."
+    ? "Connect ORACLE AXIS in Settings to start a browser task."
     : state.mode === "follow_up"
       ? "Instructions apply at the next safe step."
       : state.context
@@ -776,9 +776,9 @@ async function connect() {
     state.connected = true;
     state.pairingRequired = false;
     const feedbackText = $("#workspace-error").textContent;
-    if (feedbackText === "Pair the local AXIS service in Settings." ||
+    if (feedbackText === "Pair the local ORACLE AXIS service in Settings." ||
         feedbackText === "Pairing credential was rejected." ||
-        feedbackText === "AXIS service is offline or unreachable. Check the service address and startup instructions.")
+        feedbackText === "ORACLE AXIS service is offline or unreachable. Check the service address and startup instructions.")
       error("");
     state.active = status.active_task;
     state.stream = "connecting";

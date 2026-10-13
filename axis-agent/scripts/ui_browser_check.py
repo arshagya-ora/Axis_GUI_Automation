@@ -85,11 +85,11 @@ def main():
                     report['checks'].append('Unpacked MV3 loaded; empty production state has no sample task')
                     # Exercise the actual shared settings form and authenticated API.
                     page.get_by_role('button',name='Settings',exact=True).click()
-                    page.get_by_text('Pair AXIS service',exact=True).click()
+                    page.get_by_text('Pair ORACLE AXIS service',exact=True).click()
                     page.get_by_label('Service address',exact=True).fill(f'http://127.0.0.1:{port}')
                     page.get_by_label('UI pairing credential',exact=True).fill(token)
                     page.get_by_role('button',name='Save and connect',exact=True).click()
-                    page.get_by_text('AXIS service paired.',exact=True).wait_for()
+                    page.get_by_text('ORACLE AXIS service paired.',exact=True).wait_for()
                     page.get_by_role('button',name='Back to workspace').click()
                     page.wait_for_function("() => !document.querySelector('#send').disabled")
                     assert page.get_by_role('button',name='Attach files',exact=True).is_enabled()

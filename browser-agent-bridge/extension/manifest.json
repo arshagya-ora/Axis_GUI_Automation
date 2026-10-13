@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Browser Agent Bridge",
+  "name": "ORACLE AXIS",
   "version": "1.1.0",
   "description": "Expose Chrome browser-control tools to a local agent through Native Messaging.",
   "minimum_chrome_version": "116",
@@ -41,7 +41,7 @@
       "48": "icon48.png",
       "128": "icon128.png"
     },
-    "default_title": "Browser Agent Bridge"
+    "default_title": "ORACLE AXIS"
   },
   "side_panel": {
     "default_path": "sidepanel.html"

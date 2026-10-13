@@ -73,7 +73,7 @@ export function mountSettings(
   const connection = group("Connection"),
     agentStatus = el("span", "setting-value", "Checking…"),
     bridgeStatus = el("span", "setting-value", "Checking…");
-  row(connection, "globe", "AXIS agent", "Local task service", agentStatus);
+  row(connection, "globe", "ORACLE AXIS agent", "Local task service", agentStatus);
   row(
     connection,
     "link",
@@ -150,7 +150,7 @@ export function mountSettings(
     else feedback(connectionMessage, "");
   }
   const pairing = el("details");
-  pairing.append(el("summary", "", "Pair AXIS service"));
+  pairing.append(el("summary", "", "Pair ORACLE AXIS service"));
   const pairingForm = el("div", "settings-form");
   pairing.append(pairingForm);
   connection.append(pairing);
@@ -184,7 +184,7 @@ export function mountSettings(
             api.configure(candidate.url, candidate.token);
             token.value = "";
             token.placeholder = "Saved credential (enter to replace)";
-            feedback(pairMessage, "AXIS service paired.");
+            feedback(pairMessage, "ORACLE AXIS service paired.");
             await refresh();
             onPaired();
           },

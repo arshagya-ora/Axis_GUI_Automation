@@ -1,4 +1,4 @@
-# AXIS
+# ORACLE AXIS
 
 AXIS is a local browser assistant for the Chrome session the user already uses. A Python planner and navigator operate signed-in tabs through a Manifest V3 extension and native browser bridge. The side panel is a conversation workspace: describe a task, follow its progress, review changes when required, and read the outcome.
 
@@ -17,4 +17,4 @@ People doing browser-based research, document work, and operational workflows us
 
 ## Confirmed design preference
 
-The user selected a conversation-first layout with an Oracle Redwood visual identity. Keep every capability, revealing technical controls on demand. Preserve the AXIS name and logo geometry. Implement with the existing packaged JavaScript and CSS, without migrating to Oracle JET.
+The user selected a conversation-first layout with an Oracle Redwood visual identity. Keep every capability, revealing technical controls on demand. Use the ORACLE AXIS name, the user-supplied Oracle PNG logo, and locally bundled Oracle Sans for the displayed brand name. Implement with the existing packaged JavaScript and CSS, without migrating to Oracle JET.

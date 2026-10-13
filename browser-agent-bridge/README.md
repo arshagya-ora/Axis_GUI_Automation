@@ -1,6 +1,6 @@
 # Browser Agent Bridge
 
-<img src="extension/icon.svg" alt="AXIS cursor orbit logo" width="56">
+<img src="extension/icon.png" alt="Oracle logo" width="56">
 
 ### Chrome controls for the local AXIS runtime
 

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-12T18:25:51.601488Z",
-  "title": "Design System: AXIS Redwood",
+  "generatedAt": "2026-10-13T08:24:02.309325Z",
+  "title": "Design System: ORACLE AXIS Redwood",
   "extensions": {
     "colorMeta": {
       "canvas": {
@@ -169,6 +169,10 @@
       "status": {
         "displayName": "Status",
         "purpose": "Badges and compact phase labels."
+      },
+      "brand": {
+        "displayName": "ORACLE AXIS",
+        "purpose": "Bundled Oracle Sans for the displayed brand name only; other typography stays unchanged."
       }
     },
     "shadows": [
@@ -298,7 +302,7 @@
   ],
   "narrative": {
     "northStar": "The Redwood Conversation Workspace",
-    "overview": "AXIS uses the user-selected Oracle Redwood direction: warm neutral surfaces, a charcoal shell, and restrained red actions. The existing AXIS mark retains its geometry. The interface is compact and rectangular, with local sans typography and a consistent authored SVG stroke family.\n\nFlat surfaces, readable text, and explicit state carry the interface. Shared controls and review patterns connect the side panel, full-tab settings, and approval popup. Capabilities remain available through progressive disclosure; visual simplification does not change task ownership, execution modes, or approval semantics.",
+    "overview": "AXIS uses the user-selected Oracle Redwood direction: warm neutral surfaces, a charcoal shell, and restrained red actions. The ORACLE AXIS branding uses the user-supplied Oracle PNG without changing its colors or proportions. The interface is compact and rectangular, with local sans typography and a consistent authored SVG stroke family.\n\nFlat surfaces, readable text, and explicit state carry the interface. Shared controls and review patterns connect the side panel, full-tab settings, and approval popup. Capabilities remain available through progressive disclosure; visual simplification does not change task ownership, execution modes, or approval semantics.",
     "keyCharacteristics": [
       "Warm light surfaces and an explicit charcoal dark theme.",
       "Local sans typography with stronger leading for answers.",
@@ -325,7 +329,7 @@
     ],
     "dos": [
       "Do use semantic CSS variables so light, dark, and system appearance remain consistent across extension surfaces.",
-      "Do preserve the AXIS mark geometry and use the authored SVG family for interface icons.",
+      "Do preserve the supplied Oracle logo colors and proportions and use the authored SVG family for interface icons.",
       "Do retain visible keyboard focus, accessible names for icon controls, and text labels for status.",
       "Do let long content wrap and expose scrollable approval details with a visible continuation cue.",
       "Do keep native popover menus distinct from modal history and task-switch dialogs.",

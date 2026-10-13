@@ -35,7 +35,7 @@ export class AxisApi {
   async request(path, { method = "GET", body, signal, stream = false, binary = false } = {}) {
     if (!this.token)
       throw new ApiError(
-        "Pair the local AXIS service in Settings.",
+        "Pair the local ORACLE AXIS service in Settings.",
         "not_paired",
       );
     let response;
@@ -54,7 +54,7 @@ export class AxisApi {
     } catch (error) {
       if (signal?.aborted) throw error;
       throw new ApiError(
-        "AXIS service is offline or unreachable. Check the service address and startup instructions.",
+        "ORACLE AXIS service is offline or unreachable. Check the service address and startup instructions.",
       );
     }
     if (!response.ok) {

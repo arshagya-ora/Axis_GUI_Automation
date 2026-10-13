@@ -1,4 +1,12 @@
 /* AXIS: Oracle Redwood surfaces, one conversation, one current-task control strip. */
+@font-face {
+  font-family: "Oracle Axis Brand";
+  src: url("fonts/oraclesansvf.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+.brand-name { font-family: "Oracle Axis Brand", "Oracle Sans", "Segoe UI", system-ui, sans-serif; white-space: nowrap; }
 :root {
   color-scheme: light;
   --canvas: #fbf9f8;
@@ -114,7 +122,7 @@ a { color: var(--accent); text-underline-offset: 3px; }
 }
 .toolbar nav { display: flex; gap: 4px; }
 .brand { display: flex; align-items: center; gap: 8px; font-size: 16px; letter-spacing: 0.02em; min-width: 0; }
-.axis-mark { width: 24px; height: 24px; display: inline-block; flex-shrink: 0; background: url("icon.svg") center / contain no-repeat; }
+.axis-mark { width: 24px; height: 24px; display: inline-block; flex-shrink: 0; background: url("icon.png") center / contain no-repeat; }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; padding: 8px; border-color: transparent; width: 36px; height: 36px; flex-shrink: 0; }
 .toolbar .icon-button:hover, .toolbar .connection:hover { background: var(--shell-hover); }
 .toolbar :focus-visible { outline-color: var(--shell-warning); }
@@ -329,6 +337,7 @@ a { color: var(--accent); text-underline-offset: 3px; }
 #attachment-composer { min-height: 0; overflow-y: auto; }
 @media (max-width: 360px) {
   .toolbar { padding: 0 12px; }
+  .brand strong { font-size: 14px; }
   .conversation-heading { padding: 12px; }
   #conversation { padding: 16px 12px; }
   .settings-content { padding: 0 12px 16px; }
@@ -347,6 +356,9 @@ a { color: var(--accent); text-underline-offset: 3px; }
   .send-button { margin-left: auto; }
   .history-actions time { display: none; }
   .setting-row .segmented { flex-basis: 100%; }
+}
+@media (max-width: 220px) {
+  #workspace > .toolbar { flex-wrap: wrap; padding-block: 8px; }
 }
 @media (max-height: 640px) {
   .composer textarea { min-height: 44px; }

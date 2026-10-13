@@ -18,7 +18,7 @@ in the bridge. Python owns execution, so closing the panel does not stop a task.
    uv run python -m axis.ui_service
    ```
 
-3. Open AXIS → Settings → Connection → **Pair AXIS service**. The default service
+3. Open AXIS → Settings → Connection → **Pair ORACLE AXIS service**. The default service
    address is `http://127.0.0.1:8766`. Enter the `token` value from
    `axis-agent/.axis-ui/pairing.json`, then choose **Save and connect**. Keep this
    local credential private. It authorizes UI history and task controls; it is
@@ -211,9 +211,9 @@ additional gate and cannot override bridge decisions.
 
 The Oracle Redwood direction uses warm neutral surfaces, charcoal text, restrained
 red actions, and consistent rectangular controls. The compact charcoal header keeps
-the AXIS mark, History, New conversation, Settings, and one connection indicator.
+the Oracle mark and ORACLE AXIS name, History, New conversation, Settings, and one connection indicator.
 Select the indicator for service, bridge, and stream diagnostics. Typography uses
-locally available Oracle Sans with Segoe UI/system fallbacks; no font is downloaded.
+locally available Oracle Sans with Segoe UI/system fallbacks for body text. The ORACLE AXIS name uses bundled Oracle Sans; no font is fetched at runtime.
 
 Answers lead the timeline. Activity starts collapsed, with counters and execution
 details inside the disclosure. The current status, action, Pause/Resume, and Stop
