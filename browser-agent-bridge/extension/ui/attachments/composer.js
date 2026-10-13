@@ -1,4 +1,4 @@
-import { el, button } from "../dom.js";
+import { el, button, actionMenu } from "../dom.js";
 
 export function attachmentRefs(items = []) {
   return items.map(({ id }) => ({ attachment_id: id, role: "auto" }));
@@ -21,21 +21,34 @@ export function mountAttachments(root, api, state, { save, error, changed, focus
   picker.multiple = true;
   picker.accept = ".pdf,.docx,.pptx,.xlsx,.md,.txt,.csv,.json,.doc,.ppt,.xls";
   picker.hidden = true;
-  const add = button("Attach files", () => picker.click(), "attachment", "icon-button attachment-add");
-  add.title = "Attach files";
+  const skillNotice = el("p", "attachment-upload-progress");
+  skillNotice.setAttribute("role", "status");
+  skillNotice.hidden = true;
+  const add = actionMenu("Attach files", [
+    { label: "Attach files", icon: "attachment", action: () => {
+      skillNotice.hidden = true;
+      skillNotice.textContent = "";
+      picker.click();
+    } },
+    { label: "Add skill", icon: "cube", action: () => {
+      skillNotice.textContent = "Skill uploads aren’t available yet.";
+      skillNotice.hidden = false;
+    } },
+  ], { iconName: "attachment", className: "icon-button attachment-add" });
   const list = el("div", "attachment-list");
   const progress = el("p", "attachment-upload-progress");
   progress.setAttribute("role", "status");
   progress.hidden = true;
   const hint = el("p", "metadata", "Up to 8 files per task · 25 MiB each. Selected excerpts are sent to your configured model.");
   (document.getElementById("attachment-action") || root).append(add);
-  root.append(picker, progress, list, hint);
+  root.append(picker, progress, skillNotice, list, hint);
 
   function render(locked = disabled) {
     disabled = locked;
     const drafts = state.attachmentDrafts[state.selected] || [];
     hint.hidden = drafts.length === 0;
     add.disabled = disabled || uploading || drafts.length >= 8;
+    if (add.disabled) document.getElementById(add.getAttribute("aria-controls"))?.hidePopover();
     add.setAttribute("aria-label", uploading ? "Uploading…" : "Attach files");
     add.title = uploading ? "Uploading…" : "Attach files";
     const focusedFile = list.contains(document.activeElement) ? document.activeElement?.dataset.file : null;
