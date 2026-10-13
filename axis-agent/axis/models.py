@@ -171,6 +171,7 @@ class NavigatorOutcome(BaseModel):
     reason: str = ""
     final_answer: str | None = Field(default=None, max_length=64_000)
     needs_visual: bool = False
+    stop_condition_met: bool = False  # An explicit user condition, independent of tool budgets.
     steps: list[str] = Field(default_factory=list, max_length=64)
     completed_steps: list[StepResult] = Field(default_factory=list, max_length=64)
     blocker: Literal["missing_information", "scope_change", "environment", "targeting"] | None = None
@@ -223,6 +224,21 @@ class ActionRecord(BaseModel):
     postcondition_locator: dict[str, Any] | None = None
     postcondition: GoalCheck | None = None
     upload_files: list[str] = Field(default_factory=list)
+
+    @property
+    def invalidates_verification(self) -> bool:
+        """Unchanged viewport inspection preserves proof; actual changes do not.
+
+        Keep this rule shared by live checks and bounded-history recovery.
+        """
+        if not self.executed or self.tool not in {"browser_act", "browser_navigate", "browser_visual"}:
+            return False
+        if self.operation == 'capture':
+            return False
+        if self.operation in {'hover', 'scroll', 'focus'}:
+            changed = self.result_data.get('whatChanged') or {}
+            return not self.success or any(changed.get(key) for key in ('domChanged', 'urlChanged', 'navigated'))
+        return True
 
     @computed_field
     @property
@@ -286,10 +302,9 @@ def accepted_goal_assertions(state, matches):
             continue
         if state.last_interaction_by_tab.get(assertion.tab, 0) > assertion.sequence:
             continue
-        if not any(r.goal_id == assertion.goal_id and r.tab == assertion.tab and r.executed
-                   and r.sequence > assertion.sequence
-                   and r.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
-                   and r.operation != 'capture' for r in state.actions):
+        if not any(r.goal_id == assertion.goal_id and r.tab == assertion.tab
+                   and r.sequence > assertion.sequence and r.invalidates_verification
+                   for r in state.actions):
             accepted.append(assertion)
     return accepted
 

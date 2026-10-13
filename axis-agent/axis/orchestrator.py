@@ -51,6 +51,22 @@ from .models import (
 EventCallback = Callable[[AxisEvent], None]
 ApprovalCallback = Callable[[str, str | None, dict[str, Any]], bool]
 
+
+def explicit_browser_steps(request: str) -> list[BrowserStep]:
+    """Only preseed an unambiguous flat ordered list.
+
+    Restarted numbering and nested lists describe grouped tasks, not a single
+    linear workflow. Leave those intact for outcome decomposition by the agent.
+    """
+    items = list(re.finditer(r'(?m)^([ \t]*)(\d+)[.)][ \t]+([^\n]+)', request))
+    if (len(items) < 2 or len(items) > 64
+            or [int(item[2]) for item in items] != list(range(1, len(items) + 1))
+            or len({len(item[1].expandtabs()) for item in items}) != 1):
+        return []
+    return [BrowserStep(instruction=request[item.start(3):
+            items[index + 1].start() if index + 1 < len(items) else len(request)].strip()[:4000])
+            for index, item in enumerate(items)]
+
 # A schemeless/internal page a real content script cannot attach to, even
 # under a "*" host permission — chrome:// pages (no real origin) and
 # about:blank (no origin until it navigates) both hit
@@ -344,6 +360,7 @@ class AxisOrchestrator:
         self._visual_enabled = False
         self._base_navigator = navigator
         self.documents = None  # Set by the UI runner for tasks with attachments.
+        self.attachment_session = None
         self.recovery_counts = None
         self.browser_checkpoint = None
 
@@ -411,24 +428,31 @@ class AxisOrchestrator:
     async def start_task(self, task: str, *, task_id: str | None = None,
                          reference_context: dict[str, Any] | None = None) -> AxisResult:
         """Start an independent task while reusing the connected browser."""
+        attachments = self.documents or self.attachment_session
+        if attachments:
+            task = attachments.input_prompt(task)
+            self.attachment_session = attachments
+            self.documents = attachments if attachments.catalog() else None
         self.state = self.config.new_memory(task, extract_requirements(task))
+        if attachments:
+            self.state.original_request = task
         self.state.reference_context = reference_context or {}
-        numbered = re.findall(r'(?m)^\s*\d+[.)]\s+(.+?)(?=^\s*\d+[.)]\s+|\Z)', task, re.S | re.M)
-        if len(numbered) > 1 and not self.documents:
-            self.state.browser_steps = [BrowserStep(instruction=text.strip()[:4000]) for text in numbered[:64]]
+        if not self.documents:
+            self.state.browser_steps = explicit_browser_steps(task)
         for tab in self.browser.tabs.values():
             tab.task_created = False
         if task_id is not None:
             self.state.task_id = task_id
-        if self.documents:
+        if attachments:
             from axis.models import AttachmentRef
+            self.state.attachments = [AttachmentRef(attachment_id=a['id'], role=a['role']) for a in attachments.store.catalog(self.state.task_id)]
+        if self.documents:
             with self.documents.store.history.transaction():
                 saved = self.documents.store.history.task(self.state.task_id)
                 if not saved.get('instruction'):
                     saved['instruction'] = task
                     self.documents.store.history.save_task(saved)
             self.documents.refresh_scope()
-            self.state.attachments = [AttachmentRef(attachment_id=a['id'], role=a['role']) for a in self.documents.store.catalog(self.state.task_id)]
             checkpoint = self.documents.store.history.task(self.state.task_id).get('document_checkpoint', {})
             if checkpoint:
                 self.state.counters.total_steps = checkpoint.get('total_steps', 0)
@@ -510,7 +534,14 @@ class AxisOrchestrator:
         if self.state is None:
             return await self.start_task(follow_up)
         state = self.state
+        attachments = self.documents or self.attachment_session
+        if attachments:
+            follow_up = attachments.input_prompt(follow_up, follow_up=True)
+            self.attachment_session = attachments
+            self.documents = attachments if attachments.catalog() else None
         state.add_followup(follow_up)
+        if attachments:
+            state.follow_ups[-1] = follow_up
         added = extract_requirements(follow_up)
         state.requirements = _merge_requirements(state.requirements, added)
         application = named_gui(follow_up)
@@ -1034,6 +1065,20 @@ class AxisOrchestrator:
                         and not (record.code == 'INVALID_ARGUMENT' and any(
                             later.success and later.tool == record.tool
                             for later in gate.records[gate.records.index(record) + 1:]))]
+            # A local execution window is a scheduler yield, not a task failure.
+            # Real faults, user stop conditions and requests for information win.
+            budget_boundary = (gate.budget_scope is not None and not failures
+                and not gate.non_retryable and not gate.stopped and not outcome.stop_condition_met
+                and outcome.blocker not in {'environment', 'missing_information', 'scope_change'})
+            budget_yield = budget_boundary and gate.budget_scope == 'step'
+            if budget_boundary and outcome.status in {'failed', 'blocked', 'needs_plan', 'ask_user'}:
+                outcome.status = 'continue'
+                outcome.reason = ('Step browser-call budget reached; continue the remaining work with fresh evidence.'
+                                  if budget_yield else 'Run browser-call budget reached; preserve remaining work.')
+                outcome.final_answer = None
+            if outcome.stop_condition_met:
+                outcome.status = 'failed'
+            completion_proposed = outcome.status in {'goal_reached', 'task_complete'}
             recoverable = {"STALE_REFERENCE", "REF_NOT_FOUND", "LOCATOR_ACTIONABILITY_TIMEOUT", "LOCATOR_NOT_FOUND", "LOCATOR_STRICT_MODE_VIOLATION", "FRAME_TARGET_AMBIGUOUS", "FRAME_GEOMETRY_UNAVAILABLE"}
             tab = browser_state.tab
             if tab:
@@ -1043,7 +1088,8 @@ class AxisOrchestrator:
                 elif not failures:
                     state.visual_failures[tab] = 0
                 if ((outcome.needs_visual or state.visual_failures.get(tab, 0) >= 2)
-                        and not gate.non_retryable and self.config.run.visual_mode == "auto"
+                        and not gate.non_retryable and not outcome.stop_condition_met
+                        and self.config.run.visual_mode == "auto"
                         and tab not in state.visual_tabs
                         and not state.vision_disabled):
                     state.visual_tabs.add(tab)
@@ -1090,7 +1136,8 @@ class AxisOrchestrator:
                 if rejection:
                     outcome.status = "continue"
                     outcome.reason = rejection
-            state.last_error = rejection or (failures[-1].error if failures else None)
+            state.last_error = rejection or (failures[-1].error if failures else
+                'Step browser-call budget reached; continue from the current state.' if budget_yield else None)
             if any(RECOVERY_POLICY.get(record.code or "") == "reconcile_tab" for record in failures):
                 # Tab liveness is controller state. Reconcile it once instead
                 # of asking the model to guess or repeat an internal tab id.
@@ -1101,7 +1148,7 @@ class AxisOrchestrator:
             if gate.records:
                 self._update_progress(browser_state, gate.records)
             repeated_rejection = False
-            if rejection:
+            if rejection and outcome.status not in {'failed', 'ask_user'} and not budget_yield:
                 attempts = state.progress_by_tab.setdefault(tab or '', {})
                 signature = (state.current_goal_id,
                              state.current_verification.model_dump_json() if state.current_verification else None, tuple(
@@ -1109,8 +1156,9 @@ class AxisOrchestrator:
                     for key, p in state.pending_changes.items()), tuple(
                     sorted({(a.assertion, a.target or '', repr(a.expected), a.passed)
                             for a in state.assertions if a.goal_id == state.current_goal_id})))
-                repeated_rejection = attempts.get('verification_rejection') == signature
-                attempts['verification_rejection'] = signature
+                repeated_rejection = completion_proposed and attempts.get('verification_rejection') == signature
+                if completion_proposed:
+                    attempts['verification_rejection'] = signature
                 state.last_error = outcome.reason = rejection + ' Check the assertion method, target identity and scope; repeating the same assertion cannot resolve a mismatch.'
             elif outcome.status in {'goal_reached', 'task_complete'}:
                 state.progress_by_tab.setdefault(tab or '', {}).pop('verification_rejection', None)
@@ -1127,6 +1175,14 @@ class AxisOrchestrator:
                 raise _Stop(self._result("cancelled", reason="The user cancelled the run."))
             if gate.stopped == "paused":
                 raise _Stop(self._result("paused", reason="The run is paused; state is preserved."))
+            if outcome.stop_condition_met:
+                raise _Stop(self._result('failed', reason=outcome.reason,
+                                        answer=outcome.final_answer or outcome.summary))
+            if (budget_boundary and gate.budget_scope == 'run'
+                    and outcome.status not in {'task_complete', 'goal_reached'}):
+                raise _Stop(self._result('limit_reached',
+                    reason='The remaining browser-call budget cannot fit the next operation and its required verification.',
+                    recoverable=True))
             if repeated_rejection:
                 raise _Stop(self._result('failed', reason='VERIFICATION_MISMATCH: The same completion check remains unresolved after recovery. ' + rejection, recoverable=True))
             incompatible = next((r for r in failures if r.code == 'BRIDGE_PROTOCOL_MISMATCH'), None)
@@ -1252,6 +1308,8 @@ class AxisOrchestrator:
             "remaining_browser_actions": max(0, run.max_browser_actions - state.counters.browser_actions),
             "remaining_model_requests": max(0, run.max_model_requests - int(state.usage.requests)),
         }
+        if self.attachment_session and self.attachment_session.prompt_files():
+            context['files'] = self.attachment_session.prompt_files()
         if self.documents:
             context['documents'] = self.documents.context()
             if self._synthesis_reserve() and run.max_model_requests - int(state.usage.requests) <= self._synthesis_reserve():
@@ -1365,8 +1423,8 @@ class AxisOrchestrator:
             proof = [evidence.get(identifier) for identifier in update.evidence_ids]
             if not proof or any(item is None for item in proof):
                 return 'Step results need verified runtime evidence, not an unsupported summary.'
-            if any(p.sequence < max(e.sequence for e in proof) and p.tab in {e.tab for e in proof}
-                   for p in state.pending_changes.values()):
+            if any(p.goal_id == e.goal_id and p.tab == e.tab and p.sequence < e.sequence
+                   for p in state.pending_changes.values() for e in proof):
                 return 'Verify the outstanding action outcome before recording this step as complete.'
             step = state.browser_steps[index]
             step.result, step.evidence_ids = update.result, update.evidence_ids
@@ -1478,7 +1536,7 @@ class AxisOrchestrator:
             on_dispatch=lambda: self._emit("status", phase="action_started"),
         )
         self.browser.read_only = not task.requirements.mutation_allowed
-        deps = AxisDeps(browser=self.browser, gate=gate, documents=self.documents)
+        deps = AxisDeps(browser=self.browser, gate=gate, documents=self.documents or self.attachment_session)
         self._emit("status", phase="navigator_step_started", goal=state.goal)
         prompt = format_as_xml(state.model_dump(exclude_none=True,
             exclude={"recent_actions": {"__all__": {"extracted_data"}}}), root_tag="browser_state")
@@ -1507,6 +1565,8 @@ class AxisOrchestrator:
                 'authorized_login_origin': login.auth_url,
                 'instruction': 'Enter the supplied credential values exactly. Do not substitute masking text or placeholders.',
             }, root_tag='user_authorized_login')
+        if self.attachment_session and self.attachment_session.prompt_files():
+            prompt += '\n' + format_as_xml(self.attachment_session.prompt_files(), root_tag='task_files')
         if self.documents:
             prompt += '\n' + format_as_xml(self.documents.context(), root_tag='task_documents')
         model_prompt = [prompt, self.browser.visual_content(state.screenshot)] if state.screenshot else prompt
@@ -2060,8 +2120,7 @@ class AxisOrchestrator:
             state.counters.recovery_actions += 1
         record.sequence = state.next_sequence()
         record.goal_id = state.current_goal_id
-        if (record.tab and record.executed and record.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
-                and record.operation != 'capture'):
+        if record.tab and record.invalidates_verification:
             state.last_interaction_by_tab[record.tab] = record.sequence
         if record.tool == "browser_downloads" and record.tab is None:
             record.tab = state.bound_tab
@@ -2108,15 +2167,19 @@ class AxisOrchestrator:
             except (ValueError, TypeError, AttributeError):
                 pass
             changed = record.result_data.get('whatChanged') or {}
-            # Keep route changes separate from saved settings. Arbitrary buttons
-            # (including Edit/Cancel) remain conservative pending interactions.
+            # HTML controls can lack an ARIA role. Use their observed navigation
+            # container, never a control name or DOM-change flag, to recognize
+            # navigation. A save can rerender or redirect too.
+            context = re.search(r' context="([^"]*)', record.target or '')
+            navigation_context = bool(context and re.search(
+                r'(?:^| > )(?:navigation|menubar|tablist)\b', context[1]))
+            contextual_navigation = navigation_context and target_role in {'a', 'link', 'menuitem', 'tab'}
             route_change = (record.operation == 'click' and target_role in {'menuitem', 'tab'}
                             and (changed.get('urlChanged') or changed.get('navigated')))
             navigation = (record.success and not record.postcondition
                           and (record.tool == 'browser_navigate' or route_change or (
-                              not state.current_verification and record.operation == 'click'
-                              and (target_role in {'link', 'menuitem', 'tab'}
-                                   or any(changed.get(k) for k in ('domChanged', 'urlChanged', 'navigated'))))))
+                              record.operation == 'click' and (contextual_navigation or (
+                                  not state.current_verification and target_role in {'link', 'menuitem', 'tab'})))))
             key = f"{record.goal_id}:{record.tab}"
             if navigation:
                 key += ":navigation"
@@ -2261,9 +2324,10 @@ class AxisOrchestrator:
         if not record.executed:
             return
         data = record.result_data
-        if self.documents and record.operation == 'upload' and (record.success or record.code in {'TIMEOUT', 'BRIDGE_ERROR', 'BRIDGE_UNAVAILABLE'}):
+        attachments = self.documents or self.attachment_session
+        if attachments and record.operation == 'upload' and (record.success or record.code in {'TIMEOUT', 'BRIDGE_ERROR', 'BRIDGE_UNAVAILABLE'}):
             for identifier in record.upload_files:
-                item = self.documents.store.get(identifier)
+                item = attachments.store.get(identifier)
                 state.pending_uploads[identifier] = dict(filename=item['filename'], tab=record.tab,
                     source_url=record.source_url, sequence=record.sequence)
         def evidence(kind: str, detail: str, verified: bool = True) -> Evidence:
@@ -2416,9 +2480,8 @@ class AxisOrchestrator:
             if record not in failures or record.code not in {'ASSERTION_FAILED', 'UNSUPPORTED_ELEMENT_PROPERTY'}:
                 continue
             interaction = max((r.sequence for r in state.actions if r.tab == record.tab
-                and r.goal_id == record.goal_id and r.executed and r.sequence < record.sequence
-                and r.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
-                and r.operation != 'capture'), default=0)
+                and r.goal_id == record.goal_id and r.sequence < record.sequence
+                and r.invalidates_verification), default=0)
             attempt = {'identity': identity, 'interaction': interaction,
                        'page': self._page_fingerprint(browser_state, [])}
             if entry.get('failed_check') == attempt:
@@ -2451,8 +2514,7 @@ class AxisOrchestrator:
         if target.casefold() in user_text and not self._matches_goal_check(check, candidate):
             raise ValueError('An explicit user target must keep its literal identity; observe that target.')
         interactions = [r.sequence for r in [*state.actions, *records] if r.goal_id == state.current_goal_id
-                        and r.tab == tab and r.executed and r.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
-                        and r.operation != 'capture']
+                        and r.tab == tab and r.invalidates_verification]
         interactions.extend(p.sequence for p in state.pending_changes.values() if p.goal_id == state.current_goal_id and p.tab == tab)
         after = max([state.last_interaction_by_tab.get(tab, 0), *interactions])
         unique = any(a.passed and not a.superseded_by and a.goal_id == state.current_goal_id and a.tab == tab

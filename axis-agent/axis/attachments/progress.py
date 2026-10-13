@@ -39,7 +39,7 @@ class DocumentProgress:
             db = self.store.history.db
             full_reads = {r[0] for r in db.execute('SELECT section_id FROM document_reads WHERE task_id=?', (self.task_id,))}
             scoped_reads = [(r['section_id'], r['scope'], json.loads(r['scope'])) for r in db.execute('SELECT section_id,scope FROM document_scope_reads WHERE task_id=?', (self.task_id,))]
-            for item in self.store.catalog(self.task_id):
+            for item in self.catalog():
                 scope = self.scope(item['id'])
                 key = self.scope_key(scope)
                 where, args, _ = self.store.section_filter(item['id'], **scope)
@@ -89,7 +89,7 @@ class DocumentProgress:
             if items and size + len(json.dumps(item)) > max_chars:
                 break
             examined += 1
-            if self._reading_restricted(item['attachment_id']):
+            if item['attachment_id'] in self._prompt_attachment_ids() or self._reading_restricted(item['attachment_id']):
                 continue
             scope = self.scope(item['attachment_id'])
             if scope.get('cell_range') or scope.get('sheet'):

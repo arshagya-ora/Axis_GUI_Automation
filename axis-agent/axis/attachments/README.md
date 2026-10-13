@@ -16,7 +16,9 @@ additional agent, database server, or orchestration framework.
    available for website upload even when document reading fails.
 4. Describe the goal and select Approval (default) or Automatic mode. New files
    use `auto` and can be read and uploaded together; no role choice is required.
-   File instructions are followed only when the user delegates that work.
+   Markdown attachments are included in full with the chat instruction as the
+   input prompt. Instructions in other files are followed when the user delegates
+   that work.
    Say which files, sheets, or cells to use and what to do with them. Explicit
    restrictions and later changes come from your messages.
 
@@ -24,7 +26,7 @@ The API accepts old role fields for compatibility; they no longer grant or deny
 operations. Reading, summarizing, uploading, and executing instructions are
 separate uses. For example, "Read rows 2 through 4, columns A through E. Do not
 summarize the entire workbook" permits the exact read without a permission prompt.
-Attachment contents cannot authorize actions or override your instructions.
+Other attachment contents cannot authorize actions or override your instructions.
 
 Example: attach `MAPD.xlsx`, `workflow.md`, and a supporting PDF.
 Ask AXIS to follow the entire workflow in order, use
@@ -44,7 +46,8 @@ controls. A long file may require a larger execution budget.
 | `.docx` | Body paragraphs, headings, and tables in document order |
 | `.pptx` | Slide text, tables, grouped text shapes, and speaker notes |
 | `.pdf` | Page-indexed text extraction |
-| `.md`, `.txt` | UTF-8 text with exact line locations and lossless long-line slices |
+| `.md` | Full UTF-8 text included in the input prompt, preserving formatting |
+| `.txt` | UTF-8 text with exact line locations and lossless long-line slices |
 | `.csv` | CSV rows with their headers and values |
 | `.doc`, `.ppt`, `.xls` | Original-file website upload; save in a modern Office format to read contents |
 
@@ -116,8 +119,8 @@ restart the service and reattach the file after resolving model access.
 The planner remains tool-free: its typed `document_request` selects outline,
 read, enumerate, search, notes, plan, skip, or workflow operations. The orchestrator executes them
 locally and provides bounded results on the next planner pass. No browser session
-is required for document-only questions. File instructions are task-scoped source
-material, not authority to expand the user's request.
+is required for document-only questions. Markdown text is part of the input
+prompt; other file instructions remain task-scoped source material.
 
 Workflow steps point to read source sections. The ledger records pending,
 running, verified, and skipped steps, with explanations for non-applicable

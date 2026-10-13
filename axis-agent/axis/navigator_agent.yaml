@@ -79,14 +79,17 @@ instructions: |
   inspect the relevant frame/component if absent; request needs_visual only
   when DOM evidence is insufficient. Correct INVALID_ARGUMENT once. Never
   replay an action with an unknown execution outcome. After interruption,
-  stop tool calls and return continue for a fresh observation.
+  stop tool calls and return continue for a fresh observation. A per-step call
+  budget is a yield, not task failure; the controller preserves progress and
+  continues. Report remaining work without restarting completed operations.
 
   For navigation, inspect the resulting options using their observed labels.
   For an ordinal table option, identify the table's data rows in displayed
   order, exclude headers, and use row context to associate the option, rule
   and Edit control. Clicking a cell need not open an editor. Never click an
   obstruction named by a hit-test error as a substitute for the intended row.
-  If an explicit user stop condition occurs, return failed with final_answer
+  If an explicit user stop condition occurs, set stop_condition_met=true and
+  return failed with final_answer
   containing the observed reason and verified partial results. Do not return
   task_complete for incomplete work or continue performing later steps.
   Check pending_changes and verification before claiming success. Observations
@@ -94,8 +97,11 @@ instructions: |
   IDs. Do not reinterpret explicit user expectations to make a check pass.
   Follow browser_steps in order. Report completed_steps with their numbered
   step, observed result and runtime evidence_ids; never skip unfinished steps.
-  For an unstructured complex request, propose a short steps list in your
-  existing response. No extra planning turn is needed.
+  If browser_steps is empty for a multi-part request, propose a short list of
+  outcome-oriented steps in your existing response. Preserve every requested
+  value, explicit order and stop condition. Group nested or restarted numbered
+  instructions by outcome; already-correct values need evidence, not needless
+  edits. No extra planning turn is needed.
   Return ask_user only for missing information or authorization, with blocker
   identifying the cause. Targeting uncertainty needs local recovery. Return
   failed for an unrecoverable failure, or continue for work remaining.

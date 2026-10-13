@@ -33,6 +33,45 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         self.current_step = None
         self.refresh_scope()
 
+    def input_prompt(self, request, *, follow_up=False):
+        """Append original Markdown text, preserving whitespace and line endings."""
+        identifiers = None
+        if follow_up:
+            messages = user_requests(self.store, self.task_id)
+            identifiers = set(messages[-1]['attachment_ids']) if messages and messages[-1]['text'] == request else set()
+        parts, included = [request], []
+        for item in sorted(self.store.catalog(self.task_id), key=lambda item: item['created_at']):
+            if Path(item['filename']).suffix.lower() != '.md':
+                continue
+            if identifiers is not None and item['id'] not in identifiers:
+                continue
+            self.store.require(self.task_id, item['id'])
+            try:
+                text = self.store.path(item['id']).read_bytes().decode('utf-8-sig')
+            except UnicodeError as error:
+                raise ValueError('Markdown attachment must be UTF-8 encoded: ' + item['filename']) from error
+            parts.append(text)
+            included.append(item['id'])
+        with self.store.history.transaction():
+            task = self.store.history.task(self.task_id)
+            task['prompt_attachment_ids'] = list(dict.fromkeys([*task.get('prompt_attachment_ids', []), *included]))
+            self.store.history.save_task(task)
+        if included:
+            self.last_result = None
+        return '\n\n'.join(parts)
+
+    def _prompt_attachment_ids(self):
+        return set(self.store.history.task(self.task_id).get('prompt_attachment_ids', []))
+
+    def prompt_files(self):
+        included = self._prompt_attachment_ids()
+        return [dict(id=item['id'], filename=item['filename']) for item in self.store.catalog(self.task_id)
+                if item['id'] in included]
+
+    def catalog(self):
+        included = self._prompt_attachment_ids()
+        return [item for item in self.store.catalog(self.task_id) if item['id'] not in included]
+
     def configure_uses(self, uses, request):
         """Persist uses grounded in user text, never in attachment instructions."""
         with self.store.history.transaction():
@@ -92,7 +131,7 @@ class DocumentSession(DocumentOverview, DocumentProgress):
 
     def inferred_uses(self):
         """Bootstrap clear document requests; ambiguity stays with the planner."""
-        catalog = self.store.catalog(self.task_id)
+        catalog = self.catalog()
         from .scope import requested_range
         uses = {}
         for item in catalog:
@@ -152,7 +191,10 @@ class DocumentSession(DocumentOverview, DocumentProgress):
                     self.last_result = None
 
     def _uses(self):
-        return self.store.history.task(self.task_id).get('attachment_uses', {})
+        included = self._prompt_attachment_ids()
+        return {identifier: use for identifier, use in
+                self.store.history.task(self.task_id).get('attachment_uses', {}).items()
+                if identifier not in included}
 
     def _check_execute(self, identifier):
         use = self._uses().get(identifier, {})
@@ -186,7 +228,7 @@ class DocumentSession(DocumentOverview, DocumentProgress):
 
     def context(self):
         catalog = [{k: item[k] for k in ("id", "filename", "role", "status", "search_status", "sections", "warnings")}
-                   for item in self.store.catalog(self.task_id)]
+                   for item in self.catalog()]
         for item in catalog:
             item['warnings'] = item['warnings'][:6]
         workflow = self.workflow()
@@ -220,14 +262,22 @@ class DocumentSession(DocumentOverview, DocumentProgress):
                     procedure_sources=procedure_sources,
                     last_result=last_result, current_source=current_source,
                     user_followups=user_messages(self.store, self.task_id)[-5:],
-                    user_requests=user_requests(self.store, self.task_id), instructions=INSTRUCTIONS)
+                    user_requests=[{**message, 'attachment_ids': [identifier for identifier in message['attachment_ids']
+                                   if identifier not in self._prompt_attachment_ids()]}
+                                   for message in user_requests(self.store, self.task_id)], instructions=INSTRUCTIONS)
 
     def workflow(self, offset=0):
         with self.store.history.lock:
             db = self.store.history.db
-            counts = dict(db.execute("SELECT status,count(*) FROM workflow_steps WHERE task_id=? GROUP BY status", (self.task_id,)).fetchall())
+            where, args = 'w.task_id=?', [self.task_id]
+            included = self._prompt_attachment_ids()
+            if included:
+                where += ' AND s.attachment_id NOT IN (' + ','.join('?' for _ in included) + ')'
+                args.extend(included)
+            source = 'FROM workflow_steps w JOIN attachment_sections s ON s.id=w.section_id WHERE ' + where
+            counts = dict(db.execute('SELECT w.status,count(*) ' + source + ' GROUP BY w.status', args).fetchall())
             exhaustive = [identifier for identifier, use in self._uses().items() if use['coverage'] == 'all' and 'execute' in use['operations']]
-            rows = db.execute("SELECT w.*,s.location,s.attachment_id FROM workflow_steps w JOIN attachment_sections s ON s.id=w.section_id WHERE task_id=? AND status NOT IN ('verified','skipped') ORDER BY ordinal LIMIT 9 OFFSET ?", (self.task_id, offset)).fetchall()
+            rows = db.execute("SELECT w.*,s.location,s.attachment_id " + source + " AND w.status NOT IN ('verified','skipped') ORDER BY w.ordinal LIMIT 9 OFFSET ?", (*args, offset)).fetchall()
             missing = []
             for identifier in exhaustive:
                 where, args, _ = self.store.section_filter(identifier, **self.scope(identifier))
@@ -263,10 +313,10 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         elif operation == "search":
             if not request.query:
                 raise ValueError("Search requires a query.")
-            for item in self.store.catalog(self.task_id):
+            for item in self.catalog():
                 if (identifier == item['id']) or (not identifier and not self._reading_restricted(item['id'])):
                     self._check_read(item['id'])
-            result = self.store.search(self.task_id, request.query, identifier)
+            result = self.store.search(self.task_id, request.query, identifier, excluded=self._prompt_attachment_ids())
             # Ranked candidates are not exhaustive and are not read evidence.
             result.update(search_complete=False, note='Ranked candidates only. Use enumerate to exhaust the requested source scope.')
             scoped = []
@@ -448,7 +498,7 @@ class DocumentSession(DocumentOverview, DocumentProgress):
                     continue
                 if (not item['read'] and not item['complete']) or (use['coverage'] == 'all' and not item['complete']):
                     errors.append(f"Required attachment coverage is incomplete: {identifier}; {item['read']}/{item['total']} sections read. Next section IDs: {item['next_section_ids']}. Use read with advance=true or enumerate.")
-        for item in self.store.catalog(self.task_id):
+        for item in self.catalog():
             if item['id'] not in self._uses() and not coverage[item['id']]['read']:
                 errors.append('Declare the intended use and required coverage of attachment ' + item['id'])
         return errors

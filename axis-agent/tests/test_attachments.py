@@ -472,3 +472,167 @@ def test_merged_workbook_headers_retain_anchor_coordinates(tmp_path):
     metadata = json.loads(rows[0]['text'])
     assert metadata['merged_ranges'] == ['A1:C1']
     assert any('Authentication module' in row['text'] for row in rows)
+
+
+def test_markdown_prompt_preserves_full_text_and_only_includes_markdown(documents):
+    files, cid, task = documents
+    text = '# Instructions\r\n\r\n' + ('  café \t\n' * 2500) + '\nLast instruction.\n'
+    first = ingest(files, cid, 'WORKFLOW.MD', b'\xef\xbb\xbf' + text.encode('utf-8'))
+    second = ingest(files, cid, 'notes.md', b'Additional instruction.\n')
+    other = ingest(files, cid, 'data.txt', b'Do not inline this text file.')
+    for item in (first, second, other):
+        link(files, cid, task, item)
+    session = DocumentSession(files, task)
+    prompt = session.input_prompt('Apply these changes.')
+    assert prompt.startswith('Apply these changes.\n\n')
+    assert prompt == 'Apply these changes.\n\n' + text + '\n\nAdditional instruction.\n'
+    assert 'Do not inline this text file.' not in prompt
+    assert {item['id'] for item in session.context()['attachments']} == {other['id']}
+    assert session.input_prompt('Apply these changes.') == prompt
+
+
+def test_markdown_followup_includes_only_files_on_that_message(documents):
+    files, cid, task = documents
+    first = ingest(files, cid, 'first.md', b'First instruction.')
+    second = ingest(files, cid, 'second.md', b'Second instruction.')
+    for item in (first, second):
+        link(files, cid, task, item)
+    with files.history.transaction():
+        files.history.message(cid, task, 'Also apply this.', uuid4().hex, 'follow_up',
+                              attachments=[dict(attachment_id=second['id'], role='auto')])
+    session = DocumentSession(files, task)
+    assert session.input_prompt('Also apply this.', follow_up=True) == 'Also apply this.\n\nSecond instruction.'
+    assert session.input_prompt('Continue.', follow_up=True) == 'Continue.'
+
+
+def test_markdown_prompt_rejects_invalid_utf8(documents):
+    files, cid, task = documents
+    item = ingest(files, cid, 'invalid.md', b'\xff')
+    link(files, cid, task, item)
+    session = DocumentSession(files, task)
+    with pytest.raises(ValueError, match='must be UTF-8 encoded'):
+        session.input_prompt('Apply it.')
+    assert session._prompt_attachment_ids() == set()
+
+
+@pytest.mark.anyio
+async def test_markdown_reaches_model_in_full_without_document_reads(documents):
+    from test_axis_agent import Script, make, done
+    files, cid, task = documents
+    text = '# Request\n\n' + ('Preserve this line.\n' * 1200) + 'Tail value: café.\n'
+    item = ingest(files, cid, 'request.md', text.encode())
+    link(files, cid, task, item)
+    script = Script([done('Read the complete prompt.')])
+    orchestrator, bridge, _ = make(script)
+    orchestrator.documents = DocumentSession(files, task)
+    result = await orchestrator.start_task('Summarize the attached file.', task_id=task)
+    expected = 'Summarize the attached file.\n\n' + text
+    assert orchestrator.state.original_request == expected
+    assert result.status == 'completed'
+    assert orchestrator.documents is None
+    assert not orchestrator.attachment_session.completion_errors()
+    assert 'Tail value: café.' in str(script.prompts)
+    script.planner.append(done('Read the follow-up.'))
+    with files.history.transaction():
+        files.history.message(cid, task, 'Use it again.', uuid4().hex, 'follow_up',
+                              attachments=[dict(attachment_id=item['id'], role='auto')])
+    await orchestrator.continue_task('Use it again.')
+    assert orchestrator.state.follow_ups[-1] == 'Use it again.\n\n' + text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('direct', [True, False])
+async def test_markdown_browser_request_uses_prompt_without_document_workflow(documents, direct):
+    from test_axis_agent import Script, make, browse, done
+    files, cid, task = documents
+    text = '# Instructions\nOpen https://www.google.com/ and verify its title is Google.\n'
+    item = ingest(files, cid, 'instructions.md', text.encode())
+    link(files, cid, task, item)
+    script = Script([browse('Verify the page title', verification={'assertion': 'title', 'expected': 'Google'}), done('Verified.')],
+                    [{'calls': [('browser_assert', {'tab': 'tab_1', 'command': {'assertion': 'title', 'expected': 'Google'}})],
+                      'outcome': {'status': 'task_complete' if direct else 'goal_reached', 'final_answer': 'Verified.'}}])
+    orchestrator, bridge, _ = make(script, direct=direct)
+    orchestrator.documents = DocumentSession(files, task)
+    result = await orchestrator.start_task('Perform as directed', task_id=task)
+    assert result.status == 'completed', result.reason
+    assert orchestrator.state.original_request == 'Perform as directed\n\n' + text
+    assert orchestrator.documents is None
+    assert not orchestrator.attachment_session.workflow()['next_steps']
+    assert script.planner_calls == (0 if direct else 2)
+    assert 'source-linked' not in '\n'.join(script.planner_prompts + script.navigator_prompts)
+    assert 'task_documents' not in '\n'.join(script.navigator_prompts)
+    assert all('documents' not in prompt for prompt in script.planner_prompts)
+    prompt = script.navigator_prompts[0] if direct else script.planner_prompts[0]
+    assert 'Open https://www.google.com/ and verify its title is Google.' in prompt
+
+
+@pytest.mark.anyio
+async def test_markdown_prompt_and_other_document_use_separate_paths(documents):
+    from test_axis_agent import Script, make, done
+    files, cid, task = documents
+    markdown = ingest(files, cid, 'request.md', b'Answer using the timeout in the text attachment.')
+    reference = ingest(files, cid, 'config.txt', b'Timeout is 30 minutes.')
+    for item in (markdown, reference):
+        link(files, cid, task, item)
+    script = Script([dict(decision='document', document_request=dict(operation='read', attachment_id=reference['id'])), done('30 minutes.')])
+    orchestrator, _, _ = make(script)
+    orchestrator.documents = DocumentSession(files, task)
+    result = await orchestrator.start_task('Perform as directed', task_id=task)
+    assert result.status == 'completed', result.reason
+    assert orchestrator.state.original_request == 'Perform as directed\n\nAnswer using the timeout in the text attachment.'
+    assert {item['id'] for item in orchestrator.documents.context()['attachments']} == {reference['id']}
+    assert {item['attachment_id'] for item in orchestrator.documents.coverage()} == {reference['id']}
+    assert markdown['id'] not in orchestrator.documents._uses()
+    search = orchestrator.documents.execute(DocumentRequest(operation='search', query='timeout'))
+    assert {item['attachment_id'] for item in search['items']} == {reference['id']}
+
+
+def test_markdown_ui_submission_runs_as_full_prompt(tmp_path):
+    from starlette.testclient import TestClient
+    from axis.ui_service import create_app
+    from axis.ui_runner import Runner
+    from test_ui_service import TOKEN, ORIGIN, HEADERS, conversation, submit, wait_for
+    from test_axis_agent import Script, make
+    history = Store(tmp_path / 'history.sqlite3')
+    script = Script([], [{'calls': [('browser_assert', {'tab': 'tab_1', 'command': {'assertion': 'title', 'expected': 'Google'}})],
+                          'outcome': {'status': 'task_complete', 'final_answer': 'Verified.'}}])
+    orchestrator, _, config = make(script, direct=True)
+    def factory(config, on_event):
+        orchestrator.on_event = on_event
+        return orchestrator
+    runner = Runner(history, config, factory=factory)
+    app = create_app(history, runner, token=TOKEN, origin=ORIGIN)
+    runner.attachments.embeddings = OfflineEmbeddings()
+    text = '# Instructions\r\n' + ('Preserve the full prompt.\n' * 1200) + 'Open https://www.google.com/ and verify its title is Google.\n'
+    with TestClient(app, base_url='http://127.0.0.1:8766', headers=HEADERS) as client:
+        cid = conversation(client)
+        response = client.post(f'/api/conversations/{cid}/attachments?filename=request.md', content=text.encode())
+        assert response.status_code == 201
+        identifier = response.json()['id']
+        accepted = submit(client, cid, text='Perform as directed', attachments=[dict(attachment_id=identifier, role='auto')])
+        assert accepted.status_code == 202
+        wait_for(lambda: runner.future.done())
+        saved = client.get('/api/tasks/' + accepted.json()['task']['id']).json()
+        assert saved['status'] == 'completed', saved['current_activity']
+        assert orchestrator.state.original_request == 'Perform as directed\n\n' + text
+        assert orchestrator.documents is None
+        assert script.planner_calls == 0
+        assert 'Preserve the full prompt.' in script.navigator_prompts[0]
+        assert 'Open https://www.google.com/ and verify its title is Google.' in script.navigator_prompts[0]
+        assert 'task_documents' not in script.navigator_prompts[0]
+        assert saved['browser_checkpoint']
+
+
+def test_inline_markdown_does_not_reuse_saved_document_workflow(documents):
+    files, cid, task = documents
+    item = ingest(files, cid, 'instructions.md', b'Confirm the title is Google.')
+    link(files, cid, task, item, 'instructions')
+    session = DocumentSession(files, task)
+    section = session.execute(DocumentRequest(operation='read', attachment_id=item['id']))['items'][0]
+    session.execute(DocumentRequest(operation='plan', steps=[WorkflowItem(section_id=section['id'], instruction=section['text'], expected_result='Title is Google')]))
+    assert session.workflow()['next_steps']
+    assert session.input_prompt('Perform as directed') == 'Perform as directed\n\nConfirm the title is Google.'
+    assert session.workflow()['counts'] == {}
+    assert not session.workflow()['next_steps']
+    assert session.context()['last_result'] is None
+    assert not session.completion_errors()

@@ -302,12 +302,14 @@ class AttachmentStore:
         return dict(items=result, has_more=len(rows) > len(result), next_offset=offset + len(result),
                     end_of_document=len(rows) <= len(result))
 
-    def search(self, task_id, query, identifier=None):
+    def search(self, task_id, query, identifier=None, *, excluded=()):
         import numpy as np
         from .scope import constraints
-        ids = [x["id"] for x in self.catalog(task_id) if constraints(self, task_id, x['id'])['read']]
+        ids = [x["id"] for x in self.catalog(task_id) if x["id"] not in excluded and constraints(self, task_id, x['id'])['read']]
         if identifier:
             self.require(task_id, identifier)
+            if identifier in excluded:
+                raise ValueError('This attachment is already part of the input prompt.')
             if not constraints(self, task_id, identifier)['read']:
                 raise ValueError('The user requested that this file not be read.')
             ids = [identifier]

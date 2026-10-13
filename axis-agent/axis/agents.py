@@ -237,6 +237,7 @@ class StepGate:
     refresh_tabs: set[str] = field(default_factory=set)
     recovery_attempts: int = 0
     actions_used: int = 0
+    budget_scope: str | None = None  # step yields; run exhaustion preserves resumable work
     interrupted: bool = False
     interrupt_reason: str | None = None
     unknown_outcome: bool = False
@@ -294,14 +295,8 @@ class StepGate:
         result['error']['retryable'] = code in LOCAL_RECOVERY_CODES and not self.interrupted
         return result
 
-    def check(
-        self, tool: str, kwargs: dict[str, Any], approval_detail: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        """Return a refusal envelope if this call must not reach the bridge."""
-        tab = kwargs.get("tab")
-        operation = _command_operation(kwargs)
-        args = self._safe_args(kwargs)
-
+    def check_control(self, tool: str, kwargs: dict[str, Any], required_calls: int = 1) -> dict[str, Any] | None:
+        """Reserve capacity without dispatching, authorizing, or changing the page."""
         def refuse(code: str, message: str) -> dict[str, Any]:
             return self.reject(tool, kwargs, code, message)
 
@@ -319,15 +314,32 @@ class StepGate:
                 f"Remaining actions were cancelled because {self.interrupt_reason}. "
                 "Report what happened; a fresh observation follows.",
             )
-        if self.actions_used >= self.max_actions:
-            self._interrupt("the per-step action budget was reached")
-            return refuse(
-                "ACTION_BUDGET_EXHAUSTED",
-                f"This step allows at most {self.max_actions} browser actions. Report now.",
-            )
-        if self.actions_used >= self.remaining_total_actions:
-            self._interrupt("the total browser action budget was reached")
-            return refuse("ACTION_BUDGET_EXHAUSTED", "The run's browser action budget is exhausted.")
+        # A paired action/check must fit together. Check lifetime capacity first:
+        # a fresh step cannot repair a run with only one call left for a pair.
+        for scope, limit in (("run", self.remaining_total_actions), ("step", self.max_actions)):
+            remaining = max(0, limit - self.actions_used)
+            if remaining < required_calls:
+                self.budget_scope = scope
+                self._interrupt(f"the {scope} browser call budget cannot fit the next operation")
+                message = ("Yield this step; the controller will continue with fresh evidence."
+                           if scope == "step" else "The run has insufficient browser calls; preserve remaining work.")
+                return self.reject(tool, kwargs, "ACTION_BUDGET_EXHAUSTED", message,
+                                   {"scope": scope, "required_calls": required_calls, "remaining_calls": remaining})
+        return None
+
+    def check(
+        self, tool: str, kwargs: dict[str, Any], approval_detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a refusal envelope if this call must not reach the bridge."""
+        control = self.check_control(tool, kwargs)
+        if control is not None:
+            return control
+        tab = kwargs.get("tab")
+        operation = _command_operation(kwargs)
+
+        def refuse(code: str, message: str) -> dict[str, Any]:
+            return self.reject(tool, kwargs, code, message)
+
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
         if mutating and (tab in self.uncertain_tabs or self.unknown_outcome):
             return refuse("OUTCOME_UNVERIFIED", "Inspect and verify the previous outcome before another change; do not replay the submission.")
@@ -593,11 +605,10 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
                         "error": None if complete else {"code": "BATCH_STOPPED", "message": deps.gate.interrupt_reason or "An action or postcondition failed."}}
             if postcondition is not None:
                 # Never commit a change when its paired check cannot fit.
-                available = min(deps.gate.max_actions, deps.gate.remaining_total_actions) - deps.gate.actions_used
-                if available < 2:
-                    deps.gate._interrupt('the next complete action and check require two remaining calls')
-                    return _refusal(kwargs.get('tab'), 'ACTION_BUDGET_EXHAUSTED',
-                                    'Yield before this operation; neither the action nor its check executed.')
+                control = deps.gate.check_control(function.__name__,
+                    {**kwargs, "tab": kwargs.get("tab", rest[0] if rest else None)}, required_calls=2)
+                if control is not None:
+                    return control
                 if isinstance(command, bt.Fill) and postcondition.assertion == "value" and postcondition.expected != command.value:
                     raise ModelRetry("A fill postcondition must verify the requested value.")
                 if isinstance(command, bt.Check) and postcondition.assertion == "checked" and postcondition.expected != (command.action == "check"):
