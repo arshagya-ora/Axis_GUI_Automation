@@ -238,6 +238,8 @@ async def test_repeated_completion_mismatch_stops_after_one_recovery():
 @pytest.mark.parametrize('gui', [True, False])
 def test_synthesis_reserve_applies_to_research_not_gui(gui):
     controller, _, _ = ready()
+    controller.config.run.max_model_requests = 60
+    controller.config.run.synthesis_reserve_requests = 3
     controller.state.original_request = 'Enable Feature on the current page.' if gui else 'Research retry behavior.'
     assert controller._synthesis_reserve() == (0 if gui else 3)
     controller.state.usage.requests = 60

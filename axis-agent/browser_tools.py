@@ -864,6 +864,10 @@ class BrowserRuntime:
                     True,
                 ) from exc
             text = _safe_bridge_message(raw_text)
+            if method in {'locator.fill', 'locator.fillRef'} and raw_text == 'text must be a non-empty string':
+                raise ToolFault('BRIDGE_PROTOCOL_MISMATCH',
+                    'The loaded extension does not support clearing fields. Reload or upgrade '
+                    'the browser extension before continuing.', False, data) from exc
             if method == 'locator.getAttribute' and raw_text == 'name must be a non-empty string':
                 raise ToolFault('BRIDGE_PROTOCOL_MISMATCH',
                     'The loaded extension expects an older attribute protocol. Reload or upgrade '

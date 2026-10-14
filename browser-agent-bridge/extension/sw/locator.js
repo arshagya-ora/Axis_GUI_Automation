@@ -566,7 +566,7 @@ export function createLocatorHandlers({
     const tabId = assertTabId(params.tabId);
     await assertTabAllowed(tabId, 'locator.fill');
     const text = typeof params.text === 'string' ? params.text : params.value;
-    assertString(text, 'text');
+    assertFillText(text);
     const index = Number.isInteger(params.index) && params.index >= 0 ? params.index : 0;
     const frameTarget = await resolveFrameTarget(tabId, params);
     const readiness = params.force === true ? null : await waitForLocatorActionable(tabId, { ...params, index, _ignoreTopLevelTextLocator: true }, 'fill', frameTarget);
@@ -965,12 +965,12 @@ export function createLocatorHandlers({
     const tabId = assertTabId(params.tabId);
     await assertTabAllowed(tabId, 'locator.fillRef');
     const text = typeof params.text === 'string' ? params.text : params.value;
-    assertString(text, 'text');
+    assertFillText(text);
     // Focus + select the field in-page so real input replaces its content. This
     // works for input/textarea/contentEditable (a triple-click would only select
     // one line of a textarea).
     const { frameId, frameTarget, target } = await focusRef(tabId, params, 'locator.fillRef', params.replace !== false);
-    await dispatchRealTextInput(tabId, text);
+    await dispatchRealTextInput(tabId, text, params);
     await recordAction(tabId, 'locator.fillRef', { ref: params.ref, snapshotId: target.snapshotId || params.snapshotId || null, text, frameId }, { element: target.element });
     return refActionResult(params, frameTarget, target, frameId);
   }
@@ -1146,9 +1146,21 @@ export function createLocatorHandlers({
     });
   }
 
-  async function dispatchRealTextInput(tabId, text) {
+  function assertFillText(text) {
+    if (typeof text !== 'string') {
+      const error = new Error('text must be a string');
+      error.code = 'INVALID_ARGUMENT';
+      throw error;
+    }
+  }
+
+  async function dispatchRealTextInput(tabId, text, params = {}) {
     await attachDebugger(tabId);
-    await cdp(tabId, 'Input.insertText', { text });
+    // The caller selected the old content. Empty insertText does not reliably
+    // delete that selection; use a real key so input/change handlers run.
+    if (text === '' && params.replace === false) return;
+    if (text === '') await keyboardDispatcher.press(tabId, 'Backspace', {});
+    else await cdp(tabId, 'Input.insertText', { text });
   }
 
   async function runLocatorScript(tabId, params, action, frameTarget) {

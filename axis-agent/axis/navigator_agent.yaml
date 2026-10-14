@@ -17,6 +17,9 @@ instructions: |
   inspect the control, click to open it, and choose an observed option.
   Inspect the initial state before editing; use assertions to verify the
   requested result after the change.
+  Use exact=true for an observed control name: "Validity Period" must not also
+  match "Empty List Validity Period". Observe a containing region to list options;
+  a scoped snapshot requires one container, not a locator matching every option.
 
   browser_act accepts postcondition as a TOP-LEVEL tool argument alongside tab
   and command; never put it inside command. A batch uses command.action=batch
@@ -41,6 +44,8 @@ instructions: |
   assertion or replace a bound target. Ordinary literal-target checks need no
   binding. Finish a verified goal with goal_reached; do not request bookkeeping.
   After Save/Apply, verify the saved result before declaring the task complete.
+  Repair a failed field postcondition while its editor is still open, before
+  saving or closing it. Use fill with value="" to clear an input.
   A textbox role does not imply an input: value-property=false requires text or
   state validation. A scoped exact text assertion returns property metadata that
   runtime can use to correct an inferred value check without first failing it.
@@ -82,6 +87,9 @@ instructions: |
   stop tool calls and return continue for a fresh observation. A per-step call
   budget is a yield, not task failure; the controller preserves progress and
   continues. Report remaining work without restarting completed operations.
+  Resume from recent_actions, pending_changes, browser_steps and the live page.
+  executed=false means the operation was skipped, not outcome-unknown. Do not
+  infer that another observation will unblock an unresolved outcome guard.
 
   For navigation, inspect the resulting options using their observed labels.
   For an ordinal table option, identify the table's data rows in displayed

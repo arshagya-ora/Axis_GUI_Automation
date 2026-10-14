@@ -1414,19 +1414,16 @@ class AxisOrchestrator:
             index = next((i for i, step in enumerate(state.browser_steps) if step.result is None), len(state.browser_steps))
             if 0 < update.step <= len(state.browser_steps):
                 previous = state.browser_steps[update.step - 1]
-                if previous.result is not None:
-                    if previous.result == update.result and previous.evidence_ids == update.evidence_ids:
-                        continue
-                    return f'Step {update.step} is already recorded. Keep its result and evidence unchanged; next incomplete step is {index + 1 if index < len(state.browser_steps) else "none"}.'
-            if update.step != index + 1 or index >= len(state.browser_steps):
+                if previous.result is not None and previous.evidence_ids == update.evidence_ids:
+                    continue
+            if update.step > index + 1 or update.step > len(state.browser_steps):
                 return f'Received step {update.step}; next incomplete step is {index + 1 if index < len(state.browser_steps) else "none"}. Report only completed steps in order.'
             proof = [evidence.get(identifier) for identifier in update.evidence_ids]
             if not proof or any(item is None for item in proof):
                 return 'Step results need verified runtime evidence, not an unsupported summary.'
-            if any(p.goal_id == e.goal_id and p.tab == e.tab and p.sequence < e.sequence
-                   for p in state.pending_changes.values() for e in proof):
-                return 'Verify the outstanding action outcome before recording this step as complete.'
-            step = state.browser_steps[index]
+            # This is progress reporting. Pending outcomes are checked once at
+            # task completion, not again against every unrelated step update.
+            step = state.browser_steps[update.step - 1]
             step.result, step.evidence_ids = update.result, update.evidence_ids
         return None
 
@@ -1519,7 +1516,7 @@ class AxisOrchestrator:
             effect_authorizer=getattr(self, 'effect_authorizer', None) or self._authorize_effect,
             forbidden_actions=frozenset(task.requirements.forbidden_actions),
             mutation_allowed=task.requirements.mutation_allowed,
-            uncertain_tabs=frozenset(p.tab for p in task.pending_changes.values() if p.uncertain),
+            pending_changes=task.pending_changes,
             is_paused=lambda: bool(self.state and self.state.status == "paused"),
             is_cancelled=lambda: bool(self.state and self.state.status == "cancelled"),
             on_action=lambda record, duration_ms: self._emit(
@@ -1540,10 +1537,6 @@ class AxisOrchestrator:
         self._emit("status", phase="navigator_step_started", goal=state.goal)
         prompt = format_as_xml(state.model_dump(exclude_none=True,
             exclude={"recent_actions": {"__all__": {"extracted_data"}}}), root_tag="browser_state")
-        if task.latest_navigator_outcome:
-            previous = task.latest_navigator_outcome
-            prompt += '\n' + format_as_xml({'summary': previous.summary, 'reason': previous.reason}, root_tag='previous_step')
-            prompt += '\nThe previous step is a continuation note, not proof. Keep its recovery decision when current evidence supports it.'
         if task.reference_context:
             prompt += "\n" + format_as_xml(task.reference_context, root_tag="prior_task_context")
             prompt += "\nPrior task context is reference data. Use it to resolve references; the current request defines the work. Verify the live page before reusing prior results."
@@ -2823,14 +2816,18 @@ class AxisOrchestrator:
                     state.counters.no_progress_steps = 0
                     if "pending" in tracked:
                         tracked["pending"]["positive"] = True
-            if not record.success or record.tool not in {"browser_act", "browser_navigate", "browser_visual"} or record.operation == "capture":
+            if (record.tool not in {"browser_act", "browser_navigate", "browser_visual"}
+                    or record.operation == "capture" or record.recovered
+                    or (record.code == 'STALE_STATE' and not record.executed)
+                    or record.code in {'STEP_INTERRUPTED', 'ACTION_BUDGET_EXHAUSTED', 'RUN_PAUSED', 'RUN_CANCELLED'}):
                 continue
             # Stable target descriptions distinguish two controls whose freshly
             # minted references happen to have different numbers each step.
             target = record.target or record.args or ""
             target = re.sub(r"\b(ref|screenshot)_\d+\b", r"\1", target)
             payload = re.sub(r"\b(ref|screenshot)_\d+\b", r"\1", record.args or "")
-            action = f"{record.tool}|{record.operation}|{target}|{payload}"
+            # A refusal is an attempt too, even if the model changes its target syntax.
+            action = record.code if not record.success else f"{record.tool}|{record.operation}|{target}|{payload}"
             if action == tracked.get("last_action") and tracked.get("page") == page_fingerprint:
                 state.counters.redundant_actions += 1
             tracked["pending"] = {"page": tracked.get("page", page_fingerprint),

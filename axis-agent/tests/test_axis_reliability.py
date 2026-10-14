@@ -764,7 +764,7 @@ def test_missing_field_observations_do_not_invent_a_baseline():
     assert orchestrator.state.change_history == []
 
 
-def test_completed_step_reports_are_idempotent_and_conflicts_identify_the_step():
+def test_completed_step_reports_ignore_rephrasing_and_accept_new_evidence():
     from axis.models import BrowserStep, StepResult
     orchestrator, _, _ = ready()
     state = orchestrator.state
@@ -773,23 +773,28 @@ def test_completed_step_reports_are_idempotent_and_conflicts_identify_the_step()
     first = StepResult(step=1, result='Edited', evidence_ids=[proof.id])
     assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[first])) is None
     assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[first])) is None
-    conflicting = first.model_copy(update={'result': 'Changed result'})
-    error = orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[conflicting]))
-    assert 'Step 1 is already recorded' in error and 'next incomplete step is 2' in error
-    second = StepResult(step=2, result='Saved', evidence_ids=[proof.id])
-    assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[first, second])) is None
+    rephrased = first.model_copy(update={'result': 'Changed result'})
+    assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[rephrased])) is None
+    assert state.browser_steps[0].result == 'Edited'
+    saved = state.add_evidence('assertion', 'Persisted result', verified=True)
+    upgraded = first.model_copy(update={'result': 'Verified after saving', 'evidence_ids': [saved.id]})
+    second = StepResult(step=2, result='Saved', evidence_ids=[saved.id])
+    assert orchestrator._record_browser_steps(NavigatorOutcome(status='continue', completed_steps=[upgraded, second])) is None
+    assert state.browser_steps[0].evidence_ids == [saved.id]
+    assert state.browser_steps[1].result == 'Saved'
 
 
 @pytest.mark.anyio
-async def test_next_step_receives_the_previous_recovery_decision():
+async def test_next_step_uses_runtime_state_instead_of_replaying_model_recovery_prose():
     script = Script([], [
         {'outcome': {'status': 'continue', 'summary': 'Saved view is a div.', 'reason': 'Use exact text, not the value property.'}},
         {'outcome': {'status': 'failed', 'reason': 'Fixture stopped'}},
     ])
     orchestrator, _, _ = make(script, direct=True)
     await orchestrator.run('Inspect settings')
-    assert '<previous_step>' in script.navigator_prompts[1]
-    assert 'Use exact text, not the value property.' in script.navigator_prompts[1]
+    assert '<previous_step>' not in script.navigator_prompts[1]
+    assert 'Use exact text, not the value property.' not in script.navigator_prompts[1]
+    assert '<pending_changes' in script.navigator_prompts[1]
 
 
 @pytest.mark.anyio

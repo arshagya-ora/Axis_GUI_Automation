@@ -31,7 +31,7 @@ from pydantic_ai.models import Model
 import browser_tools as bt
 from browser_tools import BrowserRuntime
 
-from .models import ActionRecord, AxisConfig, GoalCheck, NavigatorOutcome, PlanDecision, clip
+from .models import ActionRecord, AxisConfig, GoalCheck, NavigatorOutcome, PendingChange, PlanDecision, clip
 
 # Pydantic AI emits model, tool, retry, and run spans through OpenTelemetry.
 # Browser/page content and Oracle prompts are deliberately excluded; operators
@@ -222,7 +222,7 @@ class StepGate:
     effect_authorizer: Callable[[str, str | None, dict[str, Any]], bool] | None = None
     forbidden_actions: frozenset[str] = frozenset()
     mutation_allowed: bool = True
-    uncertain_tabs: frozenset[str] = frozenset()
+    pending_changes: dict[str, PendingChange] | None = None
     is_paused: Callable[[], bool] = lambda: False
     is_cancelled: Callable[[], bool] = lambda: False
     on_action: Callable[[ActionRecord, int], None] | None = None
@@ -240,7 +240,6 @@ class StepGate:
     budget_scope: str | None = None  # step yields; run exhaustion preserves resumable work
     interrupted: bool = False
     interrupt_reason: str | None = None
-    unknown_outcome: bool = False
     non_retryable: bool = False
     stopped: str | None = None
     # Total time this step spent inside the bridge, for run-level attribution.
@@ -264,6 +263,19 @@ class StepGate:
     assertion_ms: int = 0
     timing_depth: int = 0
 
+    def uncertain(self, tab: str | None = None) -> bool:
+        if self.pending_changes is not None:
+            return any(p.uncertain and (tab is None or p.tab == tab) for p in self.pending_changes.values())
+        # Standalone gates have no controller to reconcile an unknown outcome.
+        return any(r.executed and r.code in UNKNOWN_OUTCOME_CODES
+                   and r.tool in MUTATING_TOOLS
+                   and (r.tool == 'browser_navigate' or r.operation in MUTATING_ACTIONS)
+                   and (tab is None or r.tab == tab) for r in self.records)
+
+    @property
+    def unknown_outcome(self) -> bool:
+        return self.uncertain()
+
     def _interrupt(self, reason: str) -> None:
         if not self.interrupted:
             self.interrupted = True
@@ -284,7 +296,7 @@ class StepGate:
         self.refusals += 1
         if code in LOCAL_RECOVERY_CODES and self.recovery_attempts < 3:
             self.recovery_attempts += 1
-            if tab:
+            if tab and code != 'OUTCOME_UNVERIFIED':
                 self.refresh_tabs.add(tab)
         else:
             self._interrupt(message)
@@ -341,7 +353,7 @@ class StepGate:
             return self.reject(tool, kwargs, code, message)
 
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
-        if mutating and (tab in self.uncertain_tabs or self.unknown_outcome):
+        if mutating and self.uncertain(tab):
             return refuse("OUTCOME_UNVERIFIED", "Inspect and verify the previous outcome before another change; do not replay the submission.")
         if mutating and tab in self.refresh_tabs:
             return refuse('OBSERVATION_REQUIRED', 'Observe this tab after the page change or targeting failure before another action.')
@@ -452,8 +464,8 @@ class StepGate:
                 # turn; do not make the gate reject that correction.
                 pass
             elif mutating and code in UNKNOWN_OUTCOME_CODES:
-                self.unknown_outcome = True
-                # Keep reads available, but prohibit further mutations this step.
+                # Keep reads available; live pending state blocks mutations until verified.
+                pass
             elif code in NON_RETRYABLE_CODES:
                 self.non_retryable = True
                 self._interrupt(f"a non-retryable failure occurred ({code})")
@@ -556,6 +568,10 @@ class StepGate:
         self.effects.append((mutated, verified))
         if record.success:
             for earlier in self.records[:-1]:
+                if (tool == 'browser_assert' and self.pending_changes is not None
+                        and earlier.code in UNKNOWN_OUTCOME_CODES | {'OUTCOME_UNVERIFIED'}
+                        and earlier.tab == record.tab and not self.uncertain(record.tab)):
+                    earlier.recovered = True
                 if (earlier.code in (LOCAL_RECOVERY_CODES - {'OUTCOME_UNVERIFIED'}) | {'INVALID_ARGUMENT'}
                         and earlier.tool == record.tool
                         and (earlier.code == 'INVALID_ARGUMENT' or earlier.operation == record.operation)
@@ -613,6 +629,13 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
                     raise ModelRetry("A fill postcondition must verify the requested value.")
                 if isinstance(command, bt.Check) and postcondition.assertion == "checked" and postcondition.expected != (command.action == "check"):
                     raise ModelRetry("The postcondition must match the requested checked state.")
+                target = getattr(command, 'target', None)
+                if isinstance(target, bt.RefTarget) and postcondition.assertion in {'value', 'checked'}:
+                    observed = re.match(r'^(\w+)\s+"([^"\n]+)"', deps.browser.describe_ref(target.ref) or '')
+                    locator = postcondition.locator
+                    if observed and locator and (locator.role, locator.name) == observed.groups():
+                        postcondition = postcondition.model_copy(update={
+                            'locator': locator.model_copy(update={'exact': True})})
                 action_locator = getattr(getattr(command, "target", None), "locator", None) or getattr(command, "locator", None)
                 if postcondition.assertion in {"value", "checked"} and action_locator is not None and action_locator != postcondition.locator:
                     raise ModelRetry("Use the same scoped locator for the action and its field postcondition.")

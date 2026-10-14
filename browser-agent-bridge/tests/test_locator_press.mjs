@@ -22,14 +22,14 @@ function readyResult() {
 
 async function setup() {
   const { createLocatorHandlers } = await importLocatorModule();
-  const calls = { press: [], typeText: [], record: [], scripts: [] };
+  const calls = { press: [], typeText: [], record: [], scripts: [], cdp: [], focus: [] };
   const handlers = createLocatorHandlers({
     assertTabId: (v) => v,
     assertTabAllowed: async () => {},
     assertString: (v, name) => { if (typeof v !== 'string' || !v) throw new Error(`${name} required`); return v; },
     recordAction: async (tabId, action, meta) => { calls.record.push({ action, meta }); },
     attachDebugger: async () => {},
-    cdp: async () => ({}),
+    cdp: async (tabId, method, params) => { calls.cdp.push({ method, params }); return {}; },
     captureElementScreenshot: async () => '',
     resolveFrameTarget: async (tabId) => ({ target: { tabId }, frame: { frameId: 0 }, frameSelector: null }),
     keyboardDispatcher: {
@@ -39,6 +39,10 @@ async function setup() {
     sleep,
     defaultTimeoutMs: 50,
     chromeApi: {
+      tabs: { sendMessage: async (tabId, message) => {
+        calls.focus.push(message);
+        return { ok: true, target: { element: readyResult().element, actionability: { actionable: true } } };
+      } },
       scripting: {
         executeScript: async (opts) => { calls.scripts.push(opts.args?.[0]); return [{ result: readyResult() }]; }
       }
@@ -85,3 +89,29 @@ test('locator.pressSequentially accepts value as a text alias', async () => {
   await handlers.locatorPressSequentially({ tabId: 1, selector: 'input', value: 'world', stable: false });
   assert.equal(calls.typeText[0].text, 'world');
 });
+
+for (const method of ['locatorFill', 'locatorFillRef']) {
+  test(`${method} clears selected content with a real deletion key`, async () => {
+    const { handlers, calls } = await setup();
+    const result = await handlers[method]({ tabId: 1, selector: 'input', ref: 'f0:field', text: '', stable: false });
+    assert.equal(result.ok, true);
+    assert.deepEqual(calls.press.map(c => c.key), ['Backspace']);
+    assert.equal(calls.cdp.length, 0);
+    if (method === 'locatorFillRef') assert.equal(calls.focus[0].select, true);
+    else assert.ok(calls.scripts.some(s => s.action === 'prepareTextInput' && s.replace));
+    assert.equal(calls.record[0].meta.text, '');
+  });
+
+  test(`${method} rejects invalid text before touching the page`, async () => {
+    const { handlers, calls } = await setup();
+    await assert.rejects(handlers[method]({ tabId: 1, selector: 'input', ref: 'f0:field', text: 42 }),
+      error => error.code === 'INVALID_ARGUMENT');
+    assert.equal(calls.scripts.length + calls.focus.length + calls.press.length + calls.cdp.length, 0);
+  });
+
+  test(`${method} appending empty text does not delete a character`, async () => {
+    const { handlers, calls } = await setup();
+    await handlers[method]({ tabId: 1, selector: 'input', ref: 'f0:field', text: '', replace: false, stable: false });
+    assert.equal(calls.press.length + calls.cdp.length, 0);
+  });
+}

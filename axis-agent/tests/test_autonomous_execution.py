@@ -195,12 +195,13 @@ def test_partial_report_retains_verified_browser_step_results():
 
 
 def test_unresolved_submission_refuses_further_changes_but_allows_verification():
-    gate = StepGate(max_actions=12, remaining_total_actions=20, uncertain_tabs=frozenset({'tab_1'}))
+    pending = {'submit': PendingChange(tab='tab_1', sequence=1, uncertain=True)}
+    gate = StepGate(max_actions=12, remaining_total_actions=20, pending_changes=pending)
     refused = gate.check('browser_act', {'tab': 'tab_1', 'command': bt.Click(action='click',
         target=bt.LocatorTarget(kind='locator', locator=bt.Locator(role='button', name='Save')))})
     assert refused['error']['code'] == 'OUTCOME_UNVERIFIED'
     assert gate.actions_used == 0
-    fresh_gate = StepGate(max_actions=12, remaining_total_actions=20, uncertain_tabs=frozenset({'tab_1'}))
+    fresh_gate = StepGate(max_actions=12, remaining_total_actions=20, pending_changes=pending)
     assert fresh_gate.check('browser_assert', {'tab': 'tab_1', 'command': bt.TextAssertion(
         assertion='text', locator=bt.Locator(selector='#status'), expected='Saved')}) is None
 
