@@ -1,5 +1,5 @@
 ---
-name: AXIS Redwood
+name: ORACLE AXIS Redwood
 description: A warm, compact conversation workspace for local browser tasks.
 colors:
   canvas: '#fbf9f8'
@@ -38,6 +38,11 @@ colors:
   dark-warning: '#e8c46f'
   dark-focus: '#eea59c'
 typography:
+  brand:
+    fontFamily: '"Oracle Axis Brand", "Oracle Sans", "Segoe UI", system-ui, sans-serif'
+    fontSize: 16px
+    fontWeight: 700
+    lineHeight: 1.5
   headline:
     fontFamily: '"Oracle Sans", "Segoe UI", system-ui, sans-serif'
     fontSize: 20px
@@ -144,13 +149,13 @@ components:
     textColor: '{colors.green}'
 ---
 
-# Design System: AXIS Redwood
+# Design System: ORACLE AXIS Redwood
 
 ## Overview
 
 **Creative North Star: "The Redwood Conversation Workspace"**
 
-AXIS uses the user-selected Oracle Redwood direction: warm neutral surfaces, a charcoal shell, and restrained red actions. The existing AXIS mark retains its geometry. The interface is compact and rectangular, with local sans typography and a consistent authored SVG stroke family.
+AXIS uses the user-selected Oracle Redwood direction: warm neutral surfaces, a charcoal shell, and restrained red actions. The ORACLE AXIS branding uses the user-supplied Oracle PNG without changing its colors or proportions. The interface is compact and rectangular, with local sans typography and a consistent authored SVG stroke family.
 
 Flat surfaces, readable text, and explicit state carry the interface. Shared controls and review patterns connect the side panel, full-tab settings, and approval popup. Capabilities remain available through progressive disclosure; visual simplification does not change task ownership, execution modes, or approval semantics.
 
@@ -195,7 +200,7 @@ Dark mode overrides the documented dark-prefixed values and shadow. Shell-text, 
 
 ## Typography
 
-**Body font:** locally available Oracle Sans, then Segoe UI, system-ui, and sans-serif. The extension does not bundle or fetch a webfont. Headings use the same stack; there is no separate display face. Technical code retains browser monospace behavior without a newly prescribed font family.
+**Body font:** locally available Oracle Sans, then Segoe UI, system-ui, and sans-serif. The ORACLE AXIS name alone uses locally bundled [Oracle Sans](https://www.oracle.com/asset/web/fonts/oraclesansvf.woff2) under the scoped family "Oracle Axis Brand"; it makes no runtime font request. Other headings and body text keep the existing stack. The toolbar name is 16px, reduced to 14px at widths up to 360px. At 220px and below, its controls wrap to preserve access under browser zoom. Technical code retains browser monospace behavior without a newly prescribed font family.
 
 The compact ramp supports narrow panels. Weight distinguishes headings; answer prose gains room through leading.
 
@@ -249,7 +254,7 @@ With reduced motion not requested, buttons transition background and border colo
 
 Controls, inputs, chips, and menus use the control radius. Composer, user messages, approval cards, and task-switch dialogs use the surface radius. Menu items and appearance segments use the smaller item radius. Thin borders define controls and review containers; the drawer and toolbar keep straight outer edges.
 
-The AXIS mark remains the local icon.svg at 24px. Interface SVGs use a 24-unit viewBox, a 1.7-unit current-color stroke, and rounded caps/joins. Most render at 20px, with 16px variants in compact contexts. Preserve the existing geometry and SVG authoring approach.
+The Oracle mark uses the supplied local icon.png at 24px, with derived PNG sizes for extension and notification icons. Interface SVGs use a 24-unit viewBox, a 1.7-unit current-color stroke, and rounded caps/joins. Most render at 20px, with 16px variants in compact contexts. Preserve the existing geometry and SVG authoring approach.
 
 ## Components
 
@@ -279,7 +284,7 @@ Execution approvals lead with Action, Target, Destination, and the supplied prop
 
 ### Navigation and history
 
-A charcoal toolbar holds the AXIS mark, connection status, and named icon controls. History uses a native modal dialog with search, date groups, selected-row tint, and per-conversation actions. Rename and deletion confirmation appear inline. Task ownership changes use a separate native modal task-switch dialog.
+A charcoal toolbar holds the Oracle mark and ORACLE AXIS name, connection status, and named icon controls. History uses a native modal dialog with search, date groups, selected-row tint, and per-conversation actions. Rename and deletion confirmation appear inline. Task ownership changes use a separate native modal task-switch dialog.
 
 Action menus are native auto popovers with menu semantics, not dialogs. Arrow Up/Down, Home/End, Escape, and Tab are handled; action and keyboard dismissal restore trigger focus. Native outside dismissal closes the popover, and resizing closes it. Popovers can appear within the history dialog without its scrolling region clipping them.
 
@@ -294,7 +299,7 @@ Current work has one live Pause/Resume and Stop control set in the task strip. T
 ### Do:
 
 - **Do** use semantic CSS variables so light, dark, and system appearance remain consistent across extension surfaces.
-- **Do** preserve the AXIS mark geometry and use the authored SVG family for interface icons.
+- **Do** preserve the supplied Oracle logo colors and proportions and use the authored SVG family for interface icons.
 - **Do** retain visible keyboard focus, accessible names for icon controls, and text labels for status.
 - **Do** let long content wrap and expose scrollable approval details with a visible continuation cue.
 - **Do** keep native popover menus distinct from modal history and task-switch dialogs.

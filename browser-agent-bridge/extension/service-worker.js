@@ -1380,7 +1380,7 @@ async function notifyApprovalPrompt(category, method) {
   await chrome.notifications.create(APPROVAL_NOTIFICATION_ID, {
     type: 'basic',
     iconUrl: 'icon128.png',
-    title: 'Browser Agent Bridge approval needed',
+    title: 'ORACLE AXIS approval needed',
     message: `${method} needs approval (${category}). A review window has been opened.`
   }).catch(() => {});
 }

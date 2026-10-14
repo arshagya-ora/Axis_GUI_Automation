@@ -36,7 +36,7 @@ export function renderChat(root, state, actions) {
           el(
             "p",
             "",
-            "Give AXIS a browser task. Its activity and outcome will appear here.",
+            "Give ORACLE AXIS a browser task. Its activity and outcome will appear here.",
           ),
         );
         if (!state.connected)
@@ -58,7 +58,7 @@ export function renderChat(root, state, actions) {
         const node = el("article", `message ${message.role}`);
         node.setAttribute(
           "aria-label",
-          message.role === "user" ? "You" : "AXIS",
+          message.role === "user" ? "You" : "ORACLE AXIS",
         );
         let text = message.text;
         if (message.intent === "extend_budget") {

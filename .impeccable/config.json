@@ -1,0 +1,35 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "design-system-font",
+        "value": "sans",
+        "files": [
+          "browser-agent-bridge/extension/sidepanel.html"
+        ],
+        "createdAt": "2026-10-13T08:18:23.766Z",
+        "reason": "Agent: HTML detector splits the existing documented Oracle Sans fallback; no standalone sans font was introduced."
+      },
+      {
+        "rule": "design-system-font",
+        "value": "sans",
+        "files": [
+          "browser-agent-bridge/extension/approval.html"
+        ],
+        "createdAt": "2026-10-13T08:18:23.846Z",
+        "reason": "Agent: HTML detector splits the existing documented Oracle Sans fallback; no standalone sans font was introduced."
+      },
+      {
+        "rule": "design-system-font",
+        "value": "oracle axis brand",
+        "files": [
+          "browser-agent-bridge/extension/approval.html"
+        ],
+        "createdAt": "2026-10-13T08:18:23.923Z",
+        "reason": "User confirmed locally bundled Oracle Sans for the brand name; this normalized HTML token is the documented Oracle Axis Brand font alias."
+      }
+    ]
+  }
+}

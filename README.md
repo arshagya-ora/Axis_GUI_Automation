@@ -1,7 +1,7 @@
 <p align="center">
-  <img src="browser-agent-bridge/extension/icon.svg" alt="AXIS cursor orbit logo" width="88">
+  <img src="browser-agent-bridge/extension/icon.png" alt="Oracle logo" width="88">
 </p>
-<h1 align="center">AXIS</h1>
+<h1 align="center">ORACLE AXIS</h1>
 <p align="center"><strong>A browser assistant for the Chrome session you already use</strong></p>
 
 AXIS pairs a **planner** with a **navigator**. The planner decides what to do; the navigator observes and operates your open Chrome tabs through the bundled Browser Agent Bridge. A local service powers the side panel, while the CLI offers the same runtime from a terminal.
