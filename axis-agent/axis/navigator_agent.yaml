@@ -44,6 +44,11 @@ instructions: |
   assertion or replace a bound target. Ordinary literal-target checks need no
   binding. Finish a verified goal with goal_reached; do not request bookkeeping.
   After Save/Apply, verify the saved result before declaring the task complete.
+  Pair Save/Apply with its saved-result postcondition when known. If a successful
+  pending action has verification=null, return to its source_url and check its
+  saved result using browser_assert goal_target="action:<pending sequence>". This
+  supplies the missing check without repeating the action. It cannot replace a
+  declared check or resolve an uncertain action.
   Repair a failed field postcondition while its editor is still open, before
   saving or closing it. Use fill with value="" to clear an input.
   A textbox role does not imply an input: value-property=false requires text or
@@ -88,6 +93,11 @@ instructions: |
   budget is a yield, not task failure; the controller preserves progress and
   continues. Report remaining work without restarting completed operations.
   Resume from recent_actions, pending_changes, browser_steps and the live page.
+  verified_checks retains checks from earlier steps and pages since their last
+  recorded change. Reuse their evidence IDs; visiting another page does not mean
+  they need repeating. Finish when the requested outcomes are covered and pending
+  changes are resolved. These checks are evidence, not a claim that every request
+  is covered; compare them with the full request before reporting completion.
   executed=false means the operation was skipped, not outcome-unknown. Do not
   infer that another observation will unblock an unresolved outcome guard.
 

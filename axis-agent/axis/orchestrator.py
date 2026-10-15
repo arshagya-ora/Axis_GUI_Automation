@@ -24,7 +24,7 @@ from pydantic_ai import Agent, ModelHTTPError, RunCancelled, UsageLimitExceeded,
 import browser_tools as bt
 from browser_tools import BrowserRuntime, ToolFault
 
-from .agents import AxisDeps, RECOVERY_POLICY, UNKNOWN_OUTCOME_CODES, StepGate, browser_context
+from .agents import AxisDeps, RECOVERY_POLICY, UNKNOWN_OUTCOME_CODES, StepGate, StepBudgetYield, browser_context
 from .execution import automatic_scope, external_effect, origin
 from .login import authorized_login_action, login_destination_matches, parse_login_intent
 from .models import (
@@ -470,6 +470,7 @@ class AxisOrchestrator:
                 self.state.pending_uploads = checkpoint.get('pending_uploads', {})
                 self.state.pending_changes = {key:PendingChange.model_validate(value) for key,value in checkpoint.get('pending_changes', {}).items()}
                 self.state.last_interaction_by_tab = checkpoint.get('last_interaction_by_tab', {})
+                self.state.last_edit_by_page = checkpoint.get('last_edit_by_page', {})
                 self.state.current_goal_id = checkpoint.get('current_goal_id')
                 self.state.current_goal = checkpoint.get('current_goal')
                 if checkpoint.get('current_verification'):
@@ -1116,12 +1117,14 @@ class AxisOrchestrator:
                     rejection = "Goal verification required: " + "; ".join(
                         f"{p.tab}: observe search results for {p.search_query!r}" if p.search_query is not None else
                         f"{p.tab}: observe URL {p.expected_url!r}" if p.expected_url else
-                        f"{p.tab}: run {p.verification.model_dump_json(exclude_none=True) if p.verification else 'a goal-specific check'}"
+                        f"{p.tab}: run {p.verification.model_dump_json(exclude_none=True)}" if p.verification else
+                        f"{p.tab}: action {p.sequence} ({p.target or 'unknown target'}) on {p.source_url or 'unknown page'} has no postcondition. "
+                        f'Verify its saved result with browser_assert goal_target="action:{p.sequence}"; do not repeat the action'
                         for p in pending) + "."
                     passed = next((a for a in reversed(state.assertions) if a.passed and not a.superseded_by
                                    and any(a.goal_id == p.goal_id and a.tab == p.tab and a.sequence > p.sequence
                                            for p in pending)), None)
-                    if passed:
+                    if passed and any(p.verification for p in pending):
                         rejection += ' The passing check does not match the required method, expectation or scoped target: ' + passed.model_dump_json(
                             include={'assertion', 'expected', 'target'})
                 elif not self._current_goal_verified():
@@ -1435,7 +1438,7 @@ class AxisOrchestrator:
         fields = ('browser_steps', 'pending_changes', 'assertions', 'evidence', 'facts', 'change_history',
                   'current_goal', 'current_goal_id', 'current_verification', 'goal_number',
                   'sequence', 'evidence_number', 'visited_urls', 'successful_actions', 'last_interaction_by_tab',
-                  'requirements', 'counters', 'direct_navigation_done', 'bound_application')
+                  'requirements', 'counters', 'direct_navigation_done', 'bound_application', 'last_edit_by_page')
         saved = state.model_dump(mode='json', include=set(fields))
         saved['model_requests'] = int(state.usage.requests)
         tab = self.browser.tabs.get(state.bound_tab)
@@ -1530,6 +1533,7 @@ class AxisOrchestrator:
             ),
             on_record=self._register_action,
             bind_verification=lambda tab, command, target: self._bind_verification_target(tab, command, target, gate.records),
+            bind_pending_verification=self._bind_pending_verification,
             on_dispatch=lambda: self._emit("status", phase="action_started"),
         )
         self.browser.read_only = not task.requirements.mutation_allowed
@@ -1568,6 +1572,8 @@ class AxisOrchestrator:
         try:
             try:
                 outcome = await self._run_agent(self.navigator, model_prompt, deps=deps)
+            except StepBudgetYield:
+                outcome = NavigatorOutcome(status='continue', reason='Browser call budget reached; resume from runtime evidence.')
             except _VisionUnavailable:
                 task.vision_disabled = True
                 task.visual_tabs.clear()
@@ -2085,6 +2091,7 @@ class AxisOrchestrator:
             memory_truncated=state.memory_truncated,
             pending_changes=list(state.pending_changes.values()),
             browser_steps=state.browser_steps,
+            verified_checks=self._verified_checks(),
         )
         state.last_browser_state = browser_state
         login = parse_login_intent('\n'.join([state.original_request, *state.follow_ups]))
@@ -2220,6 +2227,7 @@ class AxisOrchestrator:
                     pass
             state.pending_changes[key] = PendingChange(
                 goal_id=record.goal_id, tab=record.tab, sequence=record.sequence,
+                source_url=record.source_url, target=record.target,
                 count=(previous.count if previous else 0) + 1,
                 expected_url=(record.result_data.get('whatChanged') or {}).get('toUrl') if (record.success
                     and login and record.operation == 'click' and re.match(r'^link\b', record.target or '', re.I)) else
@@ -2231,6 +2239,8 @@ class AxisOrchestrator:
                 navigation=navigation, uncertain=record.code in UNKNOWN_OUTCOME_CODES,
             )
             state.counters.mutation_count += 1
+            if not navigation and record.source_url:
+                state.last_edit_by_page[record.source_url] = record.sequence
         self._collect_record_evidence(record)
 
     @staticmethod
@@ -2482,6 +2492,46 @@ class AxisOrchestrator:
             entry['failed_check'] = attempt
         return None
 
+    def _verified_checks(self):
+        """A compact view of existing evidence; navigating does not erase task outcomes."""
+        state = self.state
+        evidence = {e.id: e for e in state.evidence}
+        latest = {}
+        for a in state.assertions:
+            e = evidence.get(a.evidence_id)
+            if (a.goal_id != state.current_goal_id or not e or not e.source_url
+                    or a.sequence <= state.last_edit_by_page.get(e.source_url, 0)):
+                continue
+            key = (e.source_url, a.tab, a.target, a.assertion, repr(a.expected))
+            latest[key] = (a, e)
+        return [dict(page=e.source_url, tab=a.tab, assertion=a.assertion,
+                     target=a.target, expected=a.expected, evidence_id=a.evidence_id)
+                for a, e in latest.values() if a.passed and e.verified and not a.superseded_by][-64:]
+
+    def _bind_pending_verification(self, tab, command, sequence):
+        """Supply a missing check explicitly; never replace a declared or uncertain outcome."""
+        state = self.state
+        pending = next((p for p in state.pending_changes.values()
+                        if p.sequence == sequence and p.tab == tab and p.goal_id == state.current_goal_id), None)
+        if (not pending or pending.uncertain or pending.navigation or pending.login_stage
+                or pending.search_query is not None):
+            raise ValueError('Choose a known-successful pending action on this tab; uncertain outcomes retain their existing recovery rules.')
+        locator = getattr(command, 'locator', None)
+        if (not pending.source_url or pending.source_url != self.browser.safe_url(self.browser.tab(tab).url)
+                or locator is None or not any(getattr(locator, k, None) for k in ('name', 'label', 'text', 'selector'))
+                or command.assertion not in {'text', 'value', 'checked', 'visible', 'hidden', 'enabled', 'disabled', 'count'}
+                or getattr(command, 'contains', False) or getattr(command, 'regex', False)):
+            raise ValueError('Verify the saved result on the action\'s original page with a specific exact locator and assertion.')
+        expected = getattr(command, 'expected', getattr(command, 'count', True))
+        scoped = locator.model_dump(exclude_none=True)
+        target = next(scoped[k] for k in ('name', 'label', 'text', 'selector') if scoped.get(k))
+        check = GoalCheck(assertion=command.assertion, expected=expected, target=target, locator=scoped, tab=tab)
+        if pending.verification is not None and pending.verification != check:
+            raise ValueError('This action already has a postcondition. Preserve its method, target and expected result.')
+        pending.verification = check
+        pending.verification_locator = scoped
+        pending.verification_url = pending.source_url
+
     def _bind_verification_target(self, tab, command, target, records=()):
         """Bind an inferred label before its assertion, using a fresh unique scoped target."""
         state = self.state
@@ -2556,6 +2606,8 @@ class AxisOrchestrator:
         return (assertion.passed and not assertion.superseded_by
                 and assertion.goal_id == change.goal_id and assertion.tab == change.tab
                 and assertion.sequence > change.sequence
+                and (not change.verification_url or any(e.id == assertion.evidence_id
+                    and e.source_url == change.verification_url for e in self.state.evidence))
                 and self._matches_goal_check(change.verification, record)
                 and (not change.verification_locator or self._locator_refines(
                     change.verification_locator, json.loads(assertion.target or '{}').get('locator'),

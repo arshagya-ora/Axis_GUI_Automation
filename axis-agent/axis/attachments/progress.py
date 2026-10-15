@@ -158,6 +158,7 @@ class DocumentProgress:
                 current_verification=state.current_verification.model_dump(mode='json') if state.current_verification else None,
                 assertions=[value.model_dump(mode='json') for value in state.assertions],
                 last_interaction_by_tab=state.last_interaction_by_tab,
+                last_edit_by_page=state.last_edit_by_page,
                 model_requests=int(state.usage.requests), browser_actions=state.counters.browser_actions,
                 mutation_count=state.counters.mutation_count, verified_mutation_count=state.counters.verified_mutation_count,
                 successful_actions=state.successful_actions,

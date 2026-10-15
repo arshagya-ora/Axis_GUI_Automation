@@ -1714,8 +1714,8 @@ def browser_wait(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: WaitCo
 
 def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: AssertCommand,
                    goal_target: NonEmpty | None = None) -> dict[str, Any]:
-    """Verify a condition. In AXIS, goal_target explicitly binds the declared target
-    to this scoped locator after a fresh count=1 check; omit for ordinary checks.
+    """Verify a condition. goal_target: a label binds a declared goal after count=1;
+    "action:N" supplies the missing check for successful pending action sequence N.
     """
     rt = ctx.deps
     try:

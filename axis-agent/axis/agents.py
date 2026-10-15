@@ -228,6 +228,7 @@ class StepGate:
     on_action: Callable[[ActionRecord, int], None] | None = None
     on_record: Callable[[ActionRecord, bool], None] | None = None
     bind_verification: Callable[[str, Any, str], None] | None = None
+    bind_pending_verification: Callable[[str, Any, int], None] | None = None
     on_dispatch: Callable[[], None] | None = None
     # Called for a call the gate refused before it ever reached the bridge
     # (budget, interruption, pause/cancel, denied approval) — never stored in
@@ -262,6 +263,7 @@ class StepGate:
     preflight_ms: int = 0
     assertion_ms: int = 0
     timing_depth: int = 0
+    budget_summary_requested: bool = False
 
     def uncertain(self, tab: str | None = None) -> bool:
         if self.pending_changes is not None:
@@ -747,7 +749,14 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             if error.get("code") in TOOL_FAILED_CODES:
                 raise ToolFailed(error.get("message") or "This browser operation is not retryable.")
             return refusal
-        if function is bt.browser_assert and named.get("goal_target"):
+        if function is bt.browser_assert and re.fullmatch(r'action:[1-9]\d*', named.get('goal_target') or ''):
+            if deps.gate.bind_pending_verification is None:
+                raise ModelRetry('An action sequence can only bind a pending action with no declared postcondition.')
+            try:
+                deps.gate.bind_pending_verification(tab, command, int(named['goal_target'].split(':')[1]))
+            except ValueError as error:
+                raise ModelRetry(str(error)) from error
+        elif function is bt.browser_assert and named.get("goal_target"):
             if deps.gate.bind_verification is None:
                 raise ModelRetry("No active planner verification is available to bind.")
             try:
@@ -853,9 +862,21 @@ def validate_browser_args(function: Callable[..., Any]) -> Callable[..., None]:
     return validator
 
 
+class StepBudgetYield(Exception):
+    """Return to the controller after one opportunity to summarize a budget yield."""
+
+
 def browser_validation_hooks() -> Hooks:
     """Record schema/args-validator failures that occur before tool execution."""
     hooks = Hooks()
+    @hooks.on.before_model_request
+    def bound_budget_summary(ctx: Any, request_context: Any) -> Any:
+        gate = ctx.deps.gate
+        if gate.budget_scope and gate.interrupted:
+            if gate.budget_summary_requested:
+                raise StepBudgetYield()
+            gate.budget_summary_requested = True
+        return request_context
     tool_names = [f.__name__ for f in DEFAULT_TOOL_FUNCTIONS] + list(OPTIONAL_TOOL_FUNCTIONS)
 
     @hooks.on.tool_validate_error(tools=tool_names)

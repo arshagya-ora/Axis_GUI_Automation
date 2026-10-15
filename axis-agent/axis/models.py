@@ -348,6 +348,8 @@ class PendingChange(BaseModel):
     goal_id: str | None = None
     tab: str
     sequence: int
+    source_url: str | None = None
+    target: str | None = None
     count: int = 1
     expected_url: str | None = None
     search_query: str | None = None
@@ -355,6 +357,7 @@ class PendingChange(BaseModel):
     search_submitted: bool = False
     verification: GoalCheck | None = None
     verification_locator: dict[str, Any] | None = None
+    verification_url: str | None = None
     login_stage: Literal["input", "submit"] | None = None
     navigation: bool = False
     uncertain: bool = False
@@ -454,6 +457,7 @@ class BrowserState(BaseModel):
     pending_changes: list[PendingChange] = Field(default_factory=list)
     browser_steps: list[BrowserStep] = Field(default_factory=list)
     remaining_model_requests: int = 0
+    verified_checks: list[dict[str, Any]] = Field(default_factory=list)
     remaining_work: list[str] = Field(default_factory=list)
     source_register: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -483,6 +487,7 @@ class TaskRunState(BaseModel):
     reference_context: dict[str, Any] = Field(default_factory=dict)
     change_history: list[dict[str, Any]] = Field(default_factory=list)
     field_observations: dict[str, dict[str, Any]] = Field(default_factory=dict, exclude=True)
+    last_edit_by_page: dict[str, int] = Field(default_factory=dict)
     attachments: list[AttachmentRef] = Field(default_factory=list, max_length=8)
     execution_kind: Literal["browser", "document"] = "browser"
     document_coverage: dict[str, dict[str, list[list[int]]]] = Field(default_factory=dict)
