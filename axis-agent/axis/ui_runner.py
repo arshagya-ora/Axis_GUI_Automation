@@ -121,14 +121,29 @@ class Runner:
 
     def _reference_context(self, task):
         request = self._user_request(task)
-        prior = task.get('reference_context', {}).get('request')
-        if prior:
-            request = prior + '\nFollow-up: ' + request
+        prior = task.get('reference_context', {})
+        if prior.get('request'):
+            request = prior['request'] + '\nFollow-up: ' + request
+        # Markdown is inlined for the original run, but is absent from message text.
+        # Keep those sources as reference data, without restarting their old work.
+        sources = {item['id']: item for item in prior.get('prompt_attachments', [])}
+        if self.attachments:
+            files = {item['id']: item for item in self.attachments.catalog(task['id'])}
+            for identifier in task.get('prompt_attachment_ids', []):
+                if identifier in files:
+                    sources.pop(identifier, None)
+                    sources[identifier] = {
+                        'id': identifier, 'filename': files[identifier]['filename'],
+                        'text': self.attachments.path(identifier).read_bytes().decode('utf-8-sig'),
+                    }
         tab = (task.get('browser_checkpoint') or {}).get('tab') or {}
-        return {'request': request[:MAX_REQUEST], 'status': task['status'],
-                'change_history': (task.get('browser_checkpoint') or {}).get('change_history', [])[:8],
-                'outcome': ((task.get('result') or {}).get('answer') or '')[:800],
-                'tab': {key: tab[key] for key in ('url', 'title') if key in tab}}
+        context = {'request': request[:MAX_REQUEST], 'status': task['status'],
+                   'change_history': (task.get('browser_checkpoint') or {}).get('change_history', [])[:8],
+                   'outcome': ((task.get('result') or {}).get('answer') or '')[:800],
+                   'tab': {key: tab[key] for key in ('url', 'title') if key in tab}}
+        if sources:
+            context['prompt_attachments'] = list(sources.values())
+        return context
 
     def change_mode(self, task_id, mode):
         with self.lock, self.store.transaction():
