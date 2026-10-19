@@ -341,3 +341,34 @@ def test_saved_workflow_binding_is_accepted_after_checkpoint_lags_persistence(do
         verification=bound.model_dump())))
     assert controller.state.current_verification == bound
     assert controller.state.current_goal_id == 'goal_1'
+
+
+@pytest.mark.anyio
+async def test_paired_field_check_completes_goal_without_duplicate_assertions():
+    locator = {'role':'textbox','name':'Full Name *','exact':True,'within':{'selector':'form'}}
+    script = Script([browse('Set the name',verification={'assertion':'value','expected':'Alex','target':'Full Name'}),done('Name set.')],
+        [{'calls':[('browser_act',{'tab':'tab_1','command':{'action':'fill','target':{'kind':'locator','locator':locator},'value':'Alex'},
+          'postcondition':{'assertion':'value','locator':locator,'expected':'Alex'}})],'outcome':{'status':'goal_reached'}}])
+    controller, bridge, _ = make(script)
+    result = await controller.run('Fill the registration form.')
+    assert result.status == 'completed', result.reason
+    assert bridge.methods.count('locator.fill') == 1
+    assert bridge.methods.count('expect.locator.toHaveValue') == 1
+    assert 'expect.locator.toHaveCount' not in bridge.methods
+    assert controller.state.current_verification.locator
+
+
+@pytest.mark.parametrize('invalid', ['different_field','wrong_value','later_edit'])
+def test_reusing_postcondition_preserves_field_identity_and_freshness(invalid):
+    controller, _, _ = ready()
+    controller.state.current_verification = GoalCheck(assertion='value',expected='Alex',target='Full Name')
+    locator = {'role':'textbox','name':'Other Field' if invalid == 'different_field' else 'Full Name *','exact':True,'within':{'selector':'form'}}
+    expected = 'Wrong' if invalid == 'wrong_value' else 'Alex'
+    command = bt.ValueAssertion(assertion='value',locator=bt.Locator(**locator),expected=expected)
+    record(controller,'value',expected,locator)
+    if invalid == 'later_edit':
+        item = action()
+        controller._register_action(item,True)
+        controller.state.actions.append(item)
+    controller._bind_field_postcondition('tab_1',command)
+    assert controller.state.current_verification.locator is None

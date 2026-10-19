@@ -36,6 +36,11 @@
       }
       return true;
     }
+    if (message?.type === 'FILL_ACCESSIBILITY_REF_DATE') {
+      fillRefDate(message).then(target => sendResponse({ ok: true, target }), error =>
+        sendResponse({ ok: false, error: error.message, code: error.code || 'INVALID_ARGUMENT' }));
+      return true;
+    }
     if (message?.type === 'SELECT_ACCESSIBILITY_REF_OPTIONS') {
       try {
         sendResponse({ ok: true, ...selectRefOptions(message) });
@@ -208,6 +213,15 @@
     return summarizeRefTarget(ref, entry);
   }
 
+  async function fillRefDate(message) {
+    const { ref, entry } = lookupRefEntry(message);
+    const a11y = globalThis.__browserAgentBridgeDomA11y;
+    if (!a11y.isVisible(entry.element) || !a11y.isEditable(entry.element))
+      throw Object.assign(new Error('The date input is not visible and editable.'), { code: 'TARGET_DISABLED' });
+    await a11y.fillNativeDate(entry.element, message.value);
+    return summarizeRefTarget(ref, entry);
+  }
+
   function selectAllContent(element) {
     const tag = element.tagName ? element.tagName.toLowerCase() : '';
     if (tag === 'input' || tag === 'textarea') {
@@ -303,6 +317,8 @@
       element: {
         ref,
         tagName: element.tagName.toLowerCase(),
+        type: element.getAttribute('type') || '',
+        editable: a11y.isEditable(element),
         href: (element.closest?.('a[href]') || element).href || '',
         download: (element.closest?.('a[href]') || element).hasAttribute('download'),
         id: element.id || '',

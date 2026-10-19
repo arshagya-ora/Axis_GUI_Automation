@@ -110,7 +110,6 @@ tools:
   tool_search: false
   # Actions the orchestrator's approval callback is consulted for.
   approval_required_actions:
-    - upload
     - drag
 
 memory:

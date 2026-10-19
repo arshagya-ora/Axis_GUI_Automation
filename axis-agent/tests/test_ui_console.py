@@ -130,5 +130,6 @@ def test_unexpected_failure_traceback_is_opt_in_and_terminal_only(tmp_path, capl
         assert 'LOCAL_ONLY_PROVIDER_DIAGNOSTIC' not in json.dumps(snapshot)
         assert 'LOCAL_ONLY_PROVIDER_DIAGNOSTIC' not in json.dumps(store.events(0))
         record = next(record for record in caplog.records if record.message.startswith('AXIS UI runner failed'))
-        assert bool(record.exc_info) is debug
+        assert record.exc_info is None  # Traceback text is redacted before logging.
+        assert ('Traceback (most recent call last)' in record.getMessage()) is debug
         assert ('LOCAL_ONLY_PROVIDER_DIAGNOSTIC' in caplog.text) is debug

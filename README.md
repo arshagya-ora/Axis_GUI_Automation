@@ -1,7 +1,7 @@
 <p align="center">
-  <img src="browser-agent-bridge/extension/icon.png" alt="Oracle logo" width="88">
+  <img src="browser-agent-bridge/extension/icon.svg" alt="AXIS cursor orbit logo" width="88">
 </p>
-<h1 align="center">ORACLE AXIS</h1>
+<h1 align="center">AXIS</h1>
 <p align="center"><strong>A browser assistant for the Chrome session you already use</strong></p>
 
 AXIS pairs a **planner** with a **navigator**. The planner decides what to do; the navigator observes and operates your open Chrome tabs through the bundled Browser Agent Bridge. A local service powers the side panel, while the CLI offers the same runtime from a terminal.
@@ -12,13 +12,13 @@ AXIS pairs a **planner** with a **navigator**. The planner decides what to do; t
 
 ## The interface
 
-The Oracle Redwood side panel puts answers first, with activity on demand and one current-task control strip above the composer. These are illustrative captures from the repository's local UI fixture.
+The Chrome side panel keeps the task, its progress, and the next action together. These are illustrative captures from the repository's local UI fixture.
 
 | Completed answer | Dark appearance | Connection and settings |
 | :---: | :---: | :---: |
 | <img src="docs/images/axis-answer.png" alt="AXIS side panel showing a completed answer and task activity" width="260"> | <img src="docs/images/axis-answer-dark.png" alt="AXIS completed answer in dark appearance" width="260"> | <img src="docs/images/axis-settings.png" alt="AXIS settings showing service and bridge connections" width="260"> |
 
-The workspace also supports [action-sized approval prompts](docs/images/axis-approval.png), attachments, searchable history with row menus, and light, dark, or system appearance. Connection and Appearance lead Settings; technical controls live under Advanced. The [UI guide](docs/AXIS_UI.md) covers these flows in detail.
+The workspace also supports [action-sized approval prompts](docs/images/axis-approval.png), attachments, conversation history, pause/resume, and light or dark appearance. The [UI guide](docs/AXIS_UI.md) covers these flows in detail.
 
 ## How AXIS works
 
@@ -71,7 +71,7 @@ From the repository root, enter `axis-agent` and start the local UI service:
 
 ```powershell
 cd axis-agent
-uv run python -m axis.ui_service
+
 ```
 
 In the extension, open **Settings → Connection → Pair AXIS service**. Use `http://127.0.0.1:8766` and the `token` from the local `axis-agent/.axis-ui/pairing.json` file. The service prints the pairing file path at startup. The workspace reports **Connected** when both the service and bridge are ready.
@@ -79,7 +79,7 @@ In the extension, open **Settings → Connection → Pair AXIS service**. Use `h
 For a terminal task, use the CLI instead of the UI service:
 
 ```powershell
-uv run python -m axis.cli "Open Hacker News and summarize the top five stories."
+uv run python -m axis.cli "Open Hacker News and summarize the top five stories."uv run python -m axis.ui_service
 ```
 
 Use `--approve` for human checkpoints, `--capture` for requested evidence capture, or `--debug` for a full local trace. The CLI and UI service share one browser owner, so run one at a time. See [the agent guide](axis-agent/README.md) and `uv run python -m axis.cli --help` for more options.

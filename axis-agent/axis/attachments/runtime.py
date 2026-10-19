@@ -34,43 +34,17 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         self.refresh_scope()
 
     def input_prompt(self, request, *, follow_up=False):
-        """Append original Markdown text, preserving whitespace and line endings."""
-        identifiers = None
-        if follow_up:
-            messages = user_requests(self.store, self.task_id)
-            identifiers = set(messages[-1]['attachment_ids']) if messages and messages[-1]['text'] == request else set()
-        parts, included = [request], []
-        for item in sorted(self.store.catalog(self.task_id), key=lambda item: item['created_at']):
-            if Path(item['filename']).suffix.lower() != '.md':
-                continue
-            if identifiers is not None and item['id'] not in identifiers:
-                continue
-            self.store.require(self.task_id, item['id'])
-            try:
-                text = self.store.path(item['id']).read_bytes().decode('utf-8-sig')
-            except UnicodeError as error:
-                raise ValueError('Markdown attachment must be UTF-8 encoded: ' + item['filename']) from error
-            parts.append(text)
-            included.append(item['id'])
-        with self.store.history.transaction():
-            task = self.store.history.task(self.task_id)
-            task['prompt_attachment_ids'] = list(dict.fromkeys([*task.get('prompt_attachment_ids', []), *included]))
-            self.store.history.save_task(task)
-        if included:
-            self.last_result = None
-        return '\n\n'.join(parts)
+        """Keep attachments in the document catalog, separate from user instructions."""
+        return request
 
     def _prompt_attachment_ids(self):
-        return set(self.store.history.task(self.task_id).get('prompt_attachment_ids', []))
+        return set()
 
     def prompt_files(self):
-        included = self._prompt_attachment_ids()
-        return [dict(id=item['id'], filename=item['filename']) for item in self.store.catalog(self.task_id)
-                if item['id'] in included]
+        return []
 
     def catalog(self):
-        included = self._prompt_attachment_ids()
-        return [item for item in self.store.catalog(self.task_id) if item['id'] not in included]
+        return self.store.catalog(self.task_id)
 
     def configure_uses(self, uses, request):
         """Persist uses grounded in user text, never in attachment instructions."""
@@ -226,31 +200,51 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         if item['status'] != 'ready':
             raise ValueError('Attachment content is not readable yet: ' + item['status'] + '. Wait for processing or request a readable file; the original can still be uploaded.')
 
+    def procedure_context(self):
+        """Retain exact, already-read sources for unfinished work across planner turns."""
+        candidates = []
+        for identifier, use in self._uses().items():
+            if 'execute' not in use['operations'] or self._reading_restricted(identifier):
+                continue
+            scope = self.scope(identifier)
+            read = self.read_section_ids(scope)
+            where, args, _ = self.store.section_filter(identifier, **scope)
+            with self.store.history.lock:
+                rows = self.store.history.db.execute(f'''SELECT id FROM attachment_sections
+                    WHERE {where} AND (
+                        NOT EXISTS (SELECT 1 FROM workflow_steps w WHERE w.task_id=? AND w.section_id=attachment_sections.id)
+                        OR EXISTS (SELECT 1 FROM workflow_steps w WHERE w.task_id=? AND w.section_id=attachment_sections.id
+                                   AND w.status IN ('pending','running')))
+                    ORDER BY ordinal''', (*args, self.task_id, self.task_id)).fetchall()
+            candidates.extend((identifier, row['id'], scope) for row in rows if row['id'] in read)
+        items, size = [], 0
+        for identifier, section_id, scope in candidates:
+            source = self.store.sections(self.task_id, identifier, ids=[section_id], **scope)['items']
+            if not source:
+                continue
+            item = source[0]
+            item['section_id'] = item.pop('id')
+            length = len(json.dumps(item))
+            if items and (len(items) >= 24 or size + length > 16000):
+                break
+            items.append(item)
+            size += length
+        return dict(items=items, has_more=len(candidates) > len(items))
+
     def context(self):
         catalog = [{k: item[k] for k in ("id", "filename", "role", "status", "search_status", "sections", "warnings")}
                    for item in self.catalog()]
         for item in catalog:
             item['warnings'] = item['warnings'][:6]
         workflow = self.workflow()
-        procedure_sources = []
-        for identifier, use in self._uses().items():
-            if 'execute' not in use['operations'] or self._reading_restricted(identifier):
-                continue
-            with self.store.history.lock:
-                rows = self.store.history.db.execute('''SELECT s.id,s.location,s.text FROM attachment_sections s
-                    JOIN document_reads r ON r.section_id=s.id AND r.task_id=?
-                    WHERE s.attachment_id=? ORDER BY s.ordinal LIMIT ?''',
-                    (self.task_id, identifier, 24-len(procedure_sources))).fetchall()
-            procedure_sources.extend(dict(section_id=row['id'], attachment_id=identifier,
-                location=row['location'], text=row['text'][:600]) for row in rows)
-            if len(procedure_sources) >= 24:
-                break
+        procedure_sources = self.procedure_context()
         current_source = None
-        if self.current_step:
-            step = next((x for x in workflow['next_steps'] if x['id'] == self.current_step), None)
-            if step:
-                self._check_read(step['attachment_id'])
-                current_source = self.store.sections(self.task_id, step['attachment_id'], ids=[step['section_id']], **self.scope(step['attachment_id']))
+        step = next((x for x in workflow['next_steps'] if x['id'] == self.current_step), None)
+        if step is None and workflow['next_steps']:
+            step = workflow['next_steps'][0]
+        if step and not self._reading_restricted(step['attachment_id']):
+            self._check_read(step['attachment_id'])
+            current_source = self.store.sections(self.task_id, step['attachment_id'], ids=[step['section_id']], **self.scope(step['attachment_id']))
         overviews = [self.saved_overview(identifier) for identifier, use in self._uses().items() if use.get('purpose') == 'overview']
         last_result = self.last_result
         if last_result and last_result.get('operation') == 'overview' and any(x and x['attachment_id'] == last_result['attachment_id'] for x in overviews):
@@ -259,7 +253,8 @@ class DocumentSession(DocumentOverview, DocumentProgress):
                     note_rejections=self.store.history.task(self.task_id).get('document_note_rejections', []),
                     overviews=[value for value in overviews if value],
                     prior_progress=self.store.history.task(self.task_id).get('prior_progress', []), workflow=workflow,
-                    procedure_sources=procedure_sources,
+                    procedure_sources=procedure_sources["items"],
+                    procedure_sources_has_more=procedure_sources["has_more"],
                     last_result=last_result, current_source=current_source,
                     user_followups=user_messages(self.store, self.task_id)[-5:],
                     user_requests=[{**message, 'attachment_ids': [identifier for identifier in message['attachment_ids']

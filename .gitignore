@@ -114,3 +114,6 @@ P0_P3_*.md
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local Hermes agent checkout.
+/hermes-agent-main/

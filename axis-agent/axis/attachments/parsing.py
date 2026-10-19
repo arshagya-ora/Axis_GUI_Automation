@@ -116,8 +116,16 @@ def parse(path: Path) -> tuple[list[dict], list[str]]:
                 if (ws.max_row and ws.max_row > 50000 or ws.max_column and ws.max_column > 1000
                         or (ws.max_row or 0) * (ws.max_column or 0) > 2_000_000):
                     raise ValueError("Sheet exceeds 50,000 rows or 1,000 columns.")
+                # Some exporters write A1:A1 despite having many data rows.
+                # Stream actual XML cells and enforce limits on observed data too.
+                ws.reset_dimensions()
+                values[ws.title].reset_dimensions()
                 headers = ""
+                visited_cells = 0
                 for index, (row, cached) in enumerate(zip(ws.iter_rows(), values[ws.title].iter_rows()), 1):
+                    visited_cells += len(row)
+                    if index > 50000 or len(row) > 1000 or visited_cells > 2_000_000:
+                        raise ValueError("Sheet exceeds 50,000 rows, 1,000 columns, or 2,000,000 cells.")
                     cells = []
                     for col, (cell, cache) in enumerate(zip(row, cached), 1):
                         if cell.value is None:
@@ -143,18 +151,44 @@ def parse(path: Path) -> tuple[list[dict], list[str]]:
     elif suffix == ".docx":
         from docx import Document
         from docx.table import Table
+        from docx.text.paragraph import Paragraph
+        from docx.oxml.ns import qn
+
+        def blocks(element, parent, depth=0):
+            if depth > 32:
+                raise ValueError("Word nesting exceeds 32 levels.")
+            for child in element:
+                if child.tag == qn('w:p'):
+                    yield Paragraph(child, parent)
+                elif child.tag == qn('w:tbl'):
+                    yield Table(child, parent)
+                elif child.tag in {qn('w:sdt'), qn('w:sdtContent'), qn('w:customXml')}:
+                    yield from blocks(child, parent, depth + 1)
+
+        def cell_text(cell, depth=0):
+            if depth > 32:
+                raise ValueError("Word table nesting exceeds 32 levels.")
+            parts = []
+            for block in blocks(cell._tc, cell):
+                if isinstance(block, Table):
+                    for row in block.rows:
+                        parts.append(" | ".join(cell_text(c, depth + 1) for c in row.cells))
+                else:
+                    parts.append(block.text)
+            return "\n".join(parts)
+
         document = Document(path)
         heading = ""
-        for index, block in enumerate(document.iter_inner_content(), 1):
+        for index, block in enumerate(blocks(document.element.body, document), 1):
             if isinstance(block, Table):
-                headers = " | ".join(c.text for c in block.rows[0].cells)[:400] if block.rows else ''
+                headers = " | ".join(cell_text(c) for c in block.rows[0].cells)[:400] if block.rows else ''
                 for number, row in enumerate(block.rows, 1):
-                    add(f"block {index}, table row {number} | {heading}", f"First table row: {headers}\n" + " | ".join(c.text for c in row.cells))
+                    add(f"block {index}, table row {number} | {heading}", f"First table row: {headers}\n" + " | ".join(cell_text(c) for c in row.cells))
             else:
                 if block.style and block.style.name.startswith("Heading"):
                     heading = block.text[:180]
                 add(f"block {index} | {heading}", block.text)
-        warnings.append("Text and tables extracted. Images, embedded objects, and visual layout require visual review.")
+        warnings.append("Body text, content controls, and nested tables extracted. Headers, footers, revisions, images, embedded objects, and visual layout require separate review.")
     elif suffix == ".pptx":
         from pptx import Presentation
         def shapes(items, location):

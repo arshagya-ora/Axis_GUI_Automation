@@ -1,5 +1,5 @@
 (() => {
-  if (globalThis.__browserAgentBridgeDomA11y) return;
+  if (globalThis.__browserAgentBridgeDomA11y?.fillNativeDate) return;
 
   function accessibleName(el, root = el?.getRootNode?.() || document) {
     if (isAriaHidden(el)) return '';
@@ -271,7 +271,30 @@
     return locator.exact ? source.trim() === needle.trim() : source.includes(needle);
   }
 
+  async function fillNativeDate(element, value) {
+    const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
+    if (element.tagName?.toLowerCase() !== 'input' || element.type !== 'date')
+      fail('INVALID_ARGUMENT', 'Native date filling requires an input of type date.');
+    if (!isEditable(element)) fail('TARGET_DISABLED', 'The date input is not editable.');
+    // Validate without changing the live field; browsers sanitize invalid dates.
+    const probe = element.ownerDocument.createElement('input');
+    probe.type = 'date';
+    probe.value = value;
+    if (typeof value !== 'string' || probe.value !== value)
+      fail('INVALID_ARGUMENT', 'Use a valid ISO date (YYYY-MM-DD), or an empty string to clear it.');
+    const view = element.ownerDocument.defaultView;
+    const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value').set;
+    element.focus({ preventScroll: true });
+    setter.call(element, value);
+    element.dispatchEvent(new view.Event('input', { bubbles: true, composed: true }));
+    element.dispatchEvent(new view.Event('change', { bubbles: true }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    if (!element.isConnected || element.value !== value)
+      fail('INPUT_VALUE_NOT_RETAINED', 'The date input did not retain the requested value; inspect its current state.');
+  }
+
   globalThis.__browserAgentBridgeDomA11y = {
+    fillNativeDate,
     accessibleName,
     implicitRole,
     firstExplicitRole,

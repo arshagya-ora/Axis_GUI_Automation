@@ -841,7 +841,7 @@ class BrowserRuntime:
         if not self._url_allowed(url or current_url):
             raise ToolFault("FIREWALL_DENIED", "This URL is blocked by browser policy.")
         if not self._capabilities_checked and method != "extension.info":
-            self._negotiate_capabilities()
+            self.refresh_capabilities()
         if self.advertised_methods is not None and method not in self.advertised_methods and not method.startswith("native."):
             raise ToolFault(
                 "CAPABILITY_UNAVAILABLE",
@@ -903,22 +903,23 @@ class BrowserRuntime:
                 raise ToolFault("BRIDGE_UNAVAILABLE", text, True, data) from exc
             raise ToolFault("BRIDGE_ERROR", text, False, data) from exc
 
-    def _negotiate_capabilities(self) -> None:
-        """Best-effort one-time handshake; older/fake bridges remain compatible."""
+    def refresh_capabilities(self) -> None:
+        """Read the loaded extension capabilities, including after a reload."""
         self._capabilities_checked = True
         try:
             info = self.client.rpc("extension.info", {}) or {}
             methods = info.get("methods", info.get("tools")) if isinstance(info, dict) else None
             if isinstance(methods, list) and methods:
                 self.advertised_methods = frozenset(item for item in methods if isinstance(item, str))
+            self.capability_warning = None
             capabilities = info.get('capabilities', {}) if isinstance(info, dict) else {}
             if isinstance(capabilities, dict):
                 self.bridge_capabilities = frozenset(k for k, v in capabilities.items() if v is True)
             if isinstance(info, dict) and (methods or info.get('version')) and not {
-                    'valuePropertyEvidence', 'attributeParameter'}.issubset(self.bridge_capabilities):
+                    'valuePropertyEvidence', 'attributeParameter', 'nativeDateFill', 'privateValueAssertions'}.issubset(self.bridge_capabilities):
                 self.capability_warning = (
                     'The connected extension lacks current control-verification capabilities. '
-                    'Reload or upgrade the browser extension before relying on custom-control value checks. '
+                    'Reload or upgrade the browser extension for native date filling and hidden-password verification. '
                     'A value timeout is not evidence that a property is unsupported.')
             patterns = self.client.rpc("native.sitePatterns", {}) or {}
             for item in patterns.get("patterns", []) if isinstance(patterns, dict) else []:
@@ -1760,6 +1761,15 @@ def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Asse
                 params["url"] = expected
             else:
                 params["expected"] = expected
+        if command.assertion == 'value':
+            if not rt._capabilities_checked or (rt.advertised_methods is not None and 'privateValueAssertions' not in rt.bridge_capabilities):
+                rt.refresh_capabilities()
+            if rt.advertised_methods is not None and 'privateValueAssertions' not in rt.bridge_capabilities and 'locator.count' in rt.advertised_methods:
+                target = rt._rpc('locator.count', {'tabId': state.raw_id, **_locator_params(command.locator)}, tab=tab)
+                elements = target.get('elements', [])
+                if target.get('count') == 1 and len(elements) == 1 and elements[0].get('type') == 'password':
+                    raise ToolFault('BRIDGE_PROTOCOL_MISMATCH',
+                        'Reload the browser extension for hidden-password verification, then resume this task.')
         try:
             actual = rt._rpc(methods[command.assertion], params, tab=tab)
         except ToolFault as fault:
@@ -1767,10 +1777,13 @@ def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Asse
                 raise
             detail = fault.detail if isinstance(fault.detail, dict) else {}
             diagnostic = detail.get("diagnostic") or detail
+            candidates = diagnostic.get('candidates') or []
+            element = (diagnostic.get('last') or {}).get('element') or (candidates[0] if diagnostic.get('count') == 1 and len(candidates) == 1 else {})
+            if command.assertion == 'value' and element.get('type') == 'password' and rt.advertised_methods is not None and 'privateValueAssertions' not in rt.bridge_capabilities:
+                raise ToolFault('BRIDGE_PROTOCOL_MISMATCH', 'Reload the browser extension for hidden-password verification; do not reveal or refill the password to work around this error.')
             return _ok(tab, {"assertion": command.assertion, "passed": False, "expected": expected,
                              "actual": diagnostic.get("actual"), "count": diagnostic.get("count"),
-                             "message": str(fault) + (' ' + rt.capability_warning
-                                  if command.assertion == 'value' and rt.capability_warning else ''),
+                             "message": str(fault),
                              "detail": fault.detail,
                              "match": "regex" if getattr(command, "regex", False) else "contains" if getattr(command, "contains", False) else "exact"})
         return _ok(tab, {"assertion": command.assertion, "passed": True, "expected": expected, "actual": actual,

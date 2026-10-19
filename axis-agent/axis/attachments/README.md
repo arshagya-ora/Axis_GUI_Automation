@@ -16,9 +16,8 @@ additional agent, database server, or orchestration framework.
    available for website upload even when document reading fails.
 4. Describe the goal and select Approval (default) or Automatic mode. New files
    use `auto` and can be read and uploaded together; no role choice is required.
-   Markdown attachments are included in full with the chat instruction as the
-   input prompt. Instructions in other files are followed when the user delegates
-   that work.
+   All attachments, including Markdown, are read through document tools.
+   AXIS follows their instructions when your request delegates that work.
    Say which files, sheets, or cells to use and what to do with them. Explicit
    restrictions and later changes come from your messages.
 
@@ -43,10 +42,10 @@ controls. A long file may require a larger execution budget.
 | Format | Reading support |
 | --- | --- |
 | `.xlsx` | Sheet/row/cell locations, merge coordinates, raw values, formulas and cached results, number formats; direct range reads |
-| `.docx` | Body paragraphs, headings, and tables in document order |
+| `.docx` | Body paragraphs, headings, block content controls, and nested tables in document order |
 | `.pptx` | Slide text, tables, grouped text shapes, and speaker notes |
 | `.pdf` | Page-indexed text extraction |
-| `.md` | Full UTF-8 text included in the input prompt, preserving formatting |
+| `.md` | UTF-8 text with line locations and preserved Markdown formatting |
 | `.txt` | UTF-8 text with exact line locations and lossless long-line slices |
 | `.csv` | CSV rows with their headers and values |
 | `.doc`, `.ppt`, `.xls` | Original-file website upload; save in a modern Office format to read contents |
@@ -119,8 +118,15 @@ restart the service and reattach the file after resolving model access.
 The planner remains tool-free: its typed `document_request` selects outline,
 read, enumerate, search, notes, plan, skip, or workflow operations. The orchestrator executes them
 locally and provides bounded results on the next planner pass. No browser session
-is required for document-only questions. Markdown text is part of the input
-prompt; other file instructions remain task-scoped source material.
+is required for document-only questions. File contents remain source material;
+the user request determines whether to read, upload, or carry out their instructions.
+
+The planner's working source packet follows unfinished workflow sections instead
+of repeatedly presenting the start of a file. It preserves full section text and
+structured cells within a bounded packet, with an explicit continuation flag.
+The next pending/running step's exact source is restored after recovery. Scoped
+Excel reads use the same coverage rules as full reads, including combined column
+slices; narrowing the task filters retained sources to the new scope.
 
 Workflow steps point to read source sections. The ledger records pending,
 running, verified, and skipped steps, with explanations for non-applicable
@@ -161,7 +167,7 @@ workflow records, removes original bytes, and clears the reusable embedding cach
 From the repository root:
 
 ```powershell
-uv run python -m pytest axis-agent/tests/test_attachments.py -q
+uv run python -m pytest axis-agent/tests/test_attachments.py axis-agent/tests/test_attachment_workflows.py axis-agent/tests/test_office_configuration.py -q
 node --test browser-agent-bridge/tests/test_ui_attachments.mjs
 ```
 
@@ -177,3 +183,17 @@ reasoning model or a real product site:
 # From axis-agent; use an installed Playwright Chromium executable if necessary.
 uv run python -m axis.attachments.check_ui --executable "C:\path\to\chrome.exe"
 ```
+
+## Hermes reference
+
+The local Hermes reference uses explicit attachment context in
+`gateway/run.py::_build_document_context_note` and automatic paginated document
+conversion in `tools/file_tools.py::_read_extracted_document` with format readers
+in `tools/read_extract.py`. The useful principle is a clear path from stored file
+to readable source, with continuation and extraction limitations exposed.
+AXIS retains its structured cells, task scopes, and verified workflow ledger;
+these are needed to apply configurations and recover progress reliably.
+
+Parser changes apply when files are newly ingested. Reattach existing Word/Excel
+files to rebuild their extracted sections. Runtime working-context fixes also
+apply to existing saved tasks after restarting the service.

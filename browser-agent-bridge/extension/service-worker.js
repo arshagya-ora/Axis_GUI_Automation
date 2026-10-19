@@ -841,7 +841,7 @@ async function extensionInfo() {
     version: chrome.runtime.getManifest().version,
     extensionId: chrome.runtime.id,
     nativeStatus,
-    capabilities: { valuePropertyEvidence: true, attributeParameter: true },
+    capabilities: { valuePropertyEvidence: true, attributeParameter: true, nativeDateFill: true, privateValueAssertions: true },
     tools: Object.keys(rpcRouter).filter(method => method !== 'permission.check')
   };
 }

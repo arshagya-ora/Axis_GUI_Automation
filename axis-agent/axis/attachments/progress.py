@@ -33,37 +33,45 @@ class DocumentProgress:
     def scope_key(scope):
         return json.dumps(scope, sort_keys=True)
 
+    def read_section_ids(self, scope):
+        """Sections whose recorded reads cover this scope, including column slices."""
+        with self.store.history.lock:
+            db = self.store.history.db
+            read = {r[0] for r in db.execute('SELECT section_id FROM document_reads WHERE task_id=?', (self.task_id,))}
+            records = db.execute('SELECT section_id,scope FROM document_scope_reads WHERE task_id=?', (self.task_id,)).fetchall()
+        key = self.scope_key(scope)
+        intervals = {}
+        for section_id, recorded_key in records:
+            recorded = json.loads(recorded_key)
+            if recorded_key == key:
+                read.add(section_id)
+            elif scope['cell_range'] and recorded.get('cell_range') and recorded.get('sheet') == scope['sheet']:
+                from openpyxl.utils.cell import range_boundaries
+                a, _, b, _ = range_boundaries(recorded['cell_range'])
+                intervals.setdefault(section_id, []).append((a, b))
+        if scope['cell_range']:
+            from openpyxl.utils.cell import range_boundaries
+            x, _, y, _ = range_boundaries(scope['cell_range'])
+            for section_id, chunks in intervals.items():
+                next_column = x
+                for a, b in sorted(chunks):
+                    if a > next_column:
+                        break
+                    next_column = max(next_column, b + 1)
+                if next_column > y:
+                    read.add(section_id)
+        return read
+
     def coverage(self):
         result = []
         with self.store.history.lock:
             db = self.store.history.db
-            full_reads = {r[0] for r in db.execute('SELECT section_id FROM document_reads WHERE task_id=?', (self.task_id,))}
-            scoped_reads = [(r['section_id'], r['scope'], json.loads(r['scope'])) for r in db.execute('SELECT section_id,scope FROM document_scope_reads WHERE task_id=?', (self.task_id,))]
             for item in self.catalog():
                 scope = self.scope(item['id'])
                 key = self.scope_key(scope)
                 where, args, _ = self.store.section_filter(item['id'], **scope)
                 rows = db.execute(f'SELECT id,ordinal,location FROM attachment_sections WHERE {where} ORDER BY ordinal', args).fetchall()
-                read = set(full_reads)
-                intervals = {}
-                for section_id, recorded_key, recorded in scoped_reads:
-                    if recorded_key == key:
-                        read.add(section_id)
-                    elif scope['cell_range'] and recorded.get('cell_range') and recorded.get('sheet') == scope['sheet']:
-                        from openpyxl.utils.cell import range_boundaries
-                        a, _, b, _ = range_boundaries(recorded['cell_range'])
-                        intervals.setdefault(section_id, []).append((a, b))
-                if scope['cell_range']:
-                    from openpyxl.utils.cell import range_boundaries
-                    x, _, y, _ = range_boundaries(scope['cell_range'])
-                    for section_id, chunks in intervals.items():
-                        next_column = x
-                        for a, b in sorted(chunks):
-                            if a > next_column:
-                                break
-                            next_column = max(next_column, b+1)
-                        if next_column > y:
-                            read.add(section_id)
+                read = self.read_section_ids(scope)
                 missing = [dict(row) for row in rows if row['id'] not in read]
                 scanned = db.execute('SELECT 1 FROM document_scans WHERE task_id=? AND attachment_id=? AND scope=?', (self.task_id, item['id'], key)).fetchone()
                 result.append(dict(attachment_id=item['id'], filename=item['filename'], **scope,

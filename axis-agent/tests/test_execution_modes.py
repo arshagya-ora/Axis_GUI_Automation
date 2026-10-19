@@ -44,7 +44,7 @@ def test_approval_default_and_idempotent_decision(service):
 
 
 @pytest.mark.parametrize('action', ['stop', 'mode', 'deny'])
-def test_invalidation_and_denial_never_authorize(service, action):
+def test_stop_and_denial_block_but_mode_change_rechecks_pending_action(service, action):
     client, runner, store = service
     task = submit(client, conversation(client), text='Prepare a Gmail draft').json()['task']
     with ThreadPoolExecutor() as pool:
@@ -56,7 +56,7 @@ def test_invalidation_and_denial_never_authorize(service, action):
             client.patch(f'/api/tasks/{task["id"]}/execution-mode', json={'execution_mode': 'automatic'})
         else:
             client.post(f'/api/tasks/{task["id"]}/approvals/{pending["id"]}', json={'decision': 'deny'})
-        assert pending_call.result(2) is False
+        assert pending_call.result(2) is (action == 'mode')
 
 
 def test_automatic_scope_does_not_invent_recipients_or_send_drafts():
@@ -118,7 +118,7 @@ def test_redirected_login_completes_after_positive_app_check():
     assert not verify_completion(state, page).valid
 
 
-def test_login_values_remain_exact_in_debug_events():
+def test_login_values_are_redacted_in_debug_events():
     emitted = []
     orchestrator = AxisOrchestrator.__new__(AxisOrchestrator)
     orchestrator.state = TaskRunState(original_request=(
@@ -126,7 +126,7 @@ def test_login_values_remain_exact_in_debug_events():
     orchestrator.on_event = emitted.append
     orchestrator._elapsed_ms = lambda: 0
     orchestrator._emit('browser_action', args='fill fixture-user with fixture-secret')
-    assert emitted and 'fixture-secret' in str(emitted[0].detail)
+    assert emitted and 'fixture-secret' not in str(emitted[0].detail)
     assert 'fixture-user' in str(emitted[0].detail)
 
 
@@ -154,7 +154,7 @@ def test_automatic_login_actions_do_not_create_per_field_approvals(service):
     with ThreadPoolExecutor() as pool:
         pending_call = pool.submit(runner.approvals.authorize, 'browser_act', 'fill', changed_host)
         pending = wait_for(lambda: runner.active().get('pending_approval'))
-        assert 'fixture-secret' in str(pending)
+        assert 'fixture-secret' not in str(pending)
         client.post(f'/api/tasks/{task["id"]}/approvals/{pending["id"]}', json={'decision': 'deny'})
         assert pending_call.result(2) is False
 

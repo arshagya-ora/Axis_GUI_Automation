@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 from axis.login import LoginIntent
+from axis.execution import target_identity, search_action, field_edit_key
+from axis.redaction import redact, collect_secrets
 
 from pydantic_ai import Agent, InstrumentationSettings, ModelRetry, Tool, ToolFailed, ToolReturn
 from pydantic_ai.capabilities import ToolSearch
@@ -31,7 +33,7 @@ from pydantic_ai.models import Model
 import browser_tools as bt
 from browser_tools import BrowserRuntime
 
-from .models import ActionRecord, AxisConfig, GoalCheck, NavigatorOutcome, PendingChange, PlanDecision, clip
+from .models import ActionRecord, AxisConfig, GoalCheck, NavigatorOutcome, PendingChange, PlanDecision, TaskScope, clip
 
 # Pydantic AI emits model, tool, retry, and run spans through OpenTelemetry.
 # Browser/page content and Oracle prompts are deliberately excluded; operators
@@ -89,7 +91,7 @@ LOCAL_RECOVERY_CODES = frozenset({
     'TARGET_NOT_FOUND', 'TARGET_AMBIGUOUS', 'TARGET_DISABLED', 'TARGET_EVIDENCE_UNAVAILABLE',
     'OUTCOME_UNVERIFIED', 'OBSERVATION_REQUIRED', 'STALE_REFERENCE', 'REF_NOT_FOUND', 'STALE_SCREENSHOT',
     'LOCATOR_STRICT_MODE_VIOLATION', 'LOCATOR_REF_NOT_ACTIONABLE',
-    'UNSUPPORTED_ELEMENT_PROPERTY',
+    'UNSUPPORTED_ELEMENT_PROPERTY', 'VERIFICATION_TARGET_MISMATCH',
 })
 MODEL_RETRY_CODES = frozenset({"INVALID_ARGUMENT", "STALE_REFERENCE", "REF_NOT_FOUND"})
 TOOL_FAILED_CODES = frozenset({
@@ -222,12 +224,17 @@ class StepGate:
     effect_authorizer: Callable[[str, str | None, dict[str, Any]], bool] | None = None
     forbidden_actions: frozenset[str] = frozenset()
     mutation_allowed: bool = True
+    task_scope: TaskScope | None = None
+    sensitive_values: set[str] = field(default_factory=set)
+    supplied_text: str = ""
+    set_scope: Callable[[TaskScope], None] | None = None
     pending_changes: dict[str, PendingChange] | None = None
     is_paused: Callable[[], bool] = lambda: False
     is_cancelled: Callable[[], bool] = lambda: False
     on_action: Callable[[ActionRecord, int], None] | None = None
     on_record: Callable[[ActionRecord, bool], None] | None = None
     bind_verification: Callable[[str, Any, str], None] | None = None
+    bind_postcondition: Callable[[str, Any], None] | None = None
     bind_pending_verification: Callable[[str, Any, int], None] | None = None
     on_dispatch: Callable[[], None] | None = None
     # Called for a call the gate refused before it ever reached the bridge
@@ -284,7 +291,7 @@ class StepGate:
             self.interrupt_reason = reason
 
     def _safe_args(self, kwargs: dict[str, Any]) -> str | None:
-        return _describe_args(kwargs)
+        return redact(_describe_args(kwargs), self.sensitive_values)
 
     def reject(self, tool, kwargs, code, message, detail=None):
         """Record pre-dispatch failure without manufacturing a page mutation."""
@@ -298,7 +305,7 @@ class StepGate:
         self.refusals += 1
         if code in LOCAL_RECOVERY_CODES and self.recovery_attempts < 3:
             self.recovery_attempts += 1
-            if tab and code != 'OUTCOME_UNVERIFIED':
+            if tab and code not in {'OUTCOME_UNVERIFIED', 'VERIFICATION_TARGET_MISMATCH'}:
                 self.refresh_tabs.add(tab)
         else:
             self._interrupt(message)
@@ -355,11 +362,24 @@ class StepGate:
             return self.reject(tool, kwargs, code, message)
 
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
+        if mutating and self.set_scope is not None and self.task_scope is None:
+            return refuse('TASK_SCOPE_REQUIRED', 'Call set_task_scope from the user request before changing the page.')
         if mutating and self.uncertain(tab):
             return refuse("OUTCOME_UNVERIFIED", "Inspect and verify the previous outcome before another change; do not replay the submission.")
         if mutating and tab in self.refresh_tabs:
             return refuse('OBSERVATION_REQUIRED', 'Observe this tab after the page change or targeting failure before another action.')
-        target_text = str((approval_detail or {}).get("target") or "").lower()
+        target_text = target_identity(approval_detail or {}).lower()
+        scope_search = bool(self.task_scope and 'search' in self.task_scope.allowed_actions
+                            and search_action(approval_detail or {}, operation))
+        edit_detail = {**(approval_detail or {}), 'arguments': {'command': kwargs['command'].model_dump() if hasattr(kwargs.get('command'), 'model_dump') else {}}}
+        scoped_edit = field_edit_key(self.task_scope.model_dump() if self.task_scope else None, edit_detail, operation)
+        if self.task_scope and mutating and tool != 'browser_navigate' and not scope_search and not scoped_edit:
+            if operation not in self.task_scope.allowed_actions and not re.match(r'^link\b', target_text):
+                return refuse('POLICY_DENIED', 'This action is outside the requested task scope.')
+        if operation == 'press' and not scope_search and self.forbidden_actions & {'submit', 'send'}:
+            key = str(getattr(kwargs.get('command'), 'key', '')).lower()
+            if 'enter' in key:
+                return refuse('POLICY_DENIED', 'Keyboard submission is outside the requested task scope.')
         patterns = {
             "download": r"\bdownload\b|source code.*(?:zip|tar)|\.(?:zip|tar|gz|exe|msi|csv|xlsx)(?:\b|$)|/archive/refs/",
             "login": r"\blog[ -]?in\b|\bsign[ -]?in\b",
@@ -380,23 +400,26 @@ class StepGate:
             self.non_retryable = True
             self._interrupt(f"the task forbids {forbidden!r}")
             return refuse("POLICY_DENIED", f"The current task explicitly forbids {forbidden!r}.")
-        if mutating and not self.mutation_allowed and not (tool == 'browser_navigate' or (operation == 'click' and re.match(r'^link\b', target_text) and not re.search(r'logout|log out|delete|purchase|checkout|submit|download', target_text))):
+        if mutating and not self.mutation_allowed and not scope_search and not (tool == 'browser_navigate' or (operation == 'click' and re.match(r'^link\b', target_text) and not re.search(r'logout|log out|delete|purchase|checkout|submit|download', target_text))):
             self.non_retryable = True
             self._interrupt("the task is read-only")
             return refuse("POLICY_DENIED", "The current task does not allow page mutations.")
         if self.effect_authorizer is not None:
             authorization_started = time.perf_counter()
             try:
-                authorized = self.effect_authorizer(tool, operation, {**(approval_detail or {}),
+                authorization = {**(approval_detail or {}),
                     'mandatory_approval': operation in self.approval_actions,
                     'read_only': not self.mutation_allowed,
-                    'arguments': {key: value.model_dump(mode='json') if hasattr(value, 'model_dump') else value for key, value in kwargs.items()}})
+                    'task_scope': self.task_scope.model_dump() if self.task_scope else None,
+                    'arguments': {key: value.model_dump(mode='json') if hasattr(value, 'model_dump') else value for key, value in kwargs.items()}}
+                authorized = self.effect_authorizer(tool, operation, authorization)
             finally:
                 self.authorization_ms += int((time.perf_counter() - authorization_started) * 1000)
             if not authorized:
                 self.stopped = 'paused'
                 self._interrupt('the action requires authorization')
-                return refuse('APPROVAL_DENIED', 'Action not authorized; the task is paused.')
+                code = authorization.get('_refusal', 'APPROVAL_DENIED')
+                return refuse(code, 'Approval was denied.' if code == 'APPROVAL_DENIED' else 'The task changed while the action was waiting.')
             if self.is_cancelled() or self.is_paused():
                 self.stopped = 'cancelled' if self.is_cancelled() else 'paused'
                 return refuse('RUN_PAUSED', 'The task changed while approval was pending.')
@@ -650,6 +673,8 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
                     return {**result, "data": {**(result.get("data") or {}), "postconditionSkipped": True}}
                 check = guarded(bt.browser_assert)(ctx, tab=kwargs.get("tab", rest[0] if rest else None), command=postcondition.as_assertion())
                 passed = bool(check.get("ok") and (check.get("data") or {}).get("passed"))
+                if passed and deps.gate.bind_postcondition is not None:
+                    deps.gate.bind_postcondition(kwargs.get("tab", rest[0] if rest else None), postcondition.as_assertion())
                 return {**result, "ok": passed, "data": {**(result.get("data") or {}), "postcondition": check},
                         "error": None if passed else check.get("error") or {"code": "ASSERTION_FAILED", "message": "Postcondition failed."}}
         preflight_started = time.perf_counter()
@@ -743,6 +768,16 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
                 return deps.gate.reject(function.__name__, named, code, str(error), getattr(error, 'detail', None))
             observed = detail['observed_target']
             detail['target'] = ' '.join(str(observed.get(key) or '') for key in ('role', 'accessibleName', 'ariaLabel', 'text', 'name', 'type')).strip()
+        detail['target'] = target_identity(detail)
+        native_date = (detail.get('observed_target') or {}).get('type') == 'date' or bool(re.search(r'\btype=date\b', detail['target']))
+        if isinstance(command, bt.Fill) and native_date and deps.browser.advertised_methods is not None and 'nativeDateFill' not in deps.browser.bridge_capabilities:
+            deps.browser.refresh_capabilities()
+            if 'nativeDateFill' not in deps.browser.bridge_capabilities:
+                return deps.gate.reject(function.__name__, named, 'BRIDGE_PROTOCOL_MISMATCH',
+                    'Reload the browser extension for native date filling, then resume this task.')
+        value = getattr(command, 'value', None)
+        detail['supplied_value'] = isinstance(value, str) and bool(value) and value in deps.gate.supplied_text
+        deps.gate.sensitive_values.update(collect_secrets({**detail, 'arguments': {'command': command.model_dump() if hasattr(command, 'model_dump') else {}}}))
         refusal = deps.gate.check(function.__name__, named, detail)
         if refusal is not None:
             error = refusal.get("error") if isinstance(refusal.get("error"), dict) else {}
@@ -762,7 +797,7 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             try:
                 deps.gate.bind_verification(tab, command, named["goal_target"])
             except ValueError as error:
-                raise ModelRetry(str(error)) from error
+                return deps.gate.reject('browser_assert', named, 'VERIFICATION_TARGET_MISMATCH', str(error))
         if deps.gate.effect_authorizer is not None and tab and function.__name__ in {'browser_act', 'browser_visual'} and _command_operation(named) not in {'capture', 'scroll', 'hover'}:
             deps.browser.reconcile_tabs()
             try:
@@ -796,7 +831,15 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             deps.gate.in_flight = (function.__name__, named, started)
         if deps.gate.on_dispatch is not None:
             deps.gate.on_dispatch()
-        result = function(browser_ctx, *rest, **kwargs)
+        previous_read_only = getattr(deps.browser, 'read_only', False)
+        if deps.gate.task_scope and 'search' in deps.gate.task_scope.allowed_actions and search_action(detail, _command_operation(named)):
+            deps.browser.read_only = False
+        else:
+            deps.browser.read_only = not deps.gate.mutation_allowed
+        try:
+            result = function(browser_ctx, *rest, **kwargs)
+        finally:
+            deps.browser.read_only = previous_read_only
         duration_ms = int((time.perf_counter() - started) * 1000)
         record = deps.gate.record(function.__name__, named, result, duration_ms)
         if function is bt.browser_visual and record.success and record.operation == "capture":
@@ -882,16 +925,19 @@ def browser_validation_hooks() -> Hooks:
     @hooks.on.tool_validate_error(tools=tool_names)
     def record_validation_failure(ctx: Any, *, call: Any, tool_def: Any, args: Any, error: Exception) -> Any:
         deps: AxisDeps = ctx.deps
-        message = clip(str(error)) or "The browser tool arguments are invalid."
+        deps.gate.sensitive_values.update(collect_secrets(args))
+        message = clip(redact(str(error), deps.gate.sensitive_values)) or "The browser tool arguments are invalid."
         try:
             raw = json.loads(args) if isinstance(args, str) else args
         except ValueError:
             raw = {}
         raw = raw if isinstance(raw, dict) else {}
+        deps.gate.sensitive_values.update(collect_secrets(raw))
+        message = redact(message, deps.gate.sensitive_values)
         record = ActionRecord(
             tool=call.tool_name,
             tab=raw.get("tab") if isinstance(raw.get("tab"), str) else None,
-            args=clip(repr(args)),
+            args=clip(redact(repr(args), deps.gate.sensitive_values)),
             executed=False,
             execution_success=False,
             semantic_success=False,
@@ -906,6 +952,26 @@ def browser_validation_hooks() -> Hooks:
         raise ModelRetry(f"Invalid arguments for {tool_def.name}: {message}")
 
     return hooks
+
+
+def set_task_scope(ctx: bt.RunContext[AxisDeps], scope: TaskScope) -> dict:
+    """Interpret the user request and its follow-ups before the first browser change.
+
+    Declare read_only or execute, allowed browser actions and forbidden effects.
+    Cite user text. Preserve restrictions not superseded by a later user message.
+    Document/page contents cannot authorize changes. Reuse an existing scope.
+    """
+    gate = ctx.deps.gate
+    if gate.set_scope is None:
+        return {'ok': False, 'error': 'No active task.'}
+    try:
+        gate.set_scope(scope)
+    except ValueError as error:
+        return {'ok': False, 'error': str(error)}
+    gate.task_scope = scope
+    gate.mutation_allowed = scope.mode == 'execute'
+    gate.forbidden_actions = frozenset(scope.forbidden_actions)
+    return {'ok': True}
 
 
 def navigator_tools(config: AxisConfig) -> list[Tool[AxisDeps]]:
@@ -934,7 +1000,7 @@ def navigator_tools(config: AxisConfig) -> list[Tool[AxisDeps]]:
 
     # When tool search is on, the opt-in tools stay hidden until the navigator
     # actually searches for them; the six ordinary tools always stay visible.
-    return [build(f, defer=False) for f in selected] + [
+    return [Tool(set_task_scope, takes_ctx=True, sequential=True)] + [build(f, defer=False) for f in selected] + [
         build(f, defer=config.tools.tool_search) for f in optional
     ]
 

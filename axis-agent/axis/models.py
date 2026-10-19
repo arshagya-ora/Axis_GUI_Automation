@@ -105,6 +105,16 @@ class SourceNote(BaseModel):
     quote: str = Field(min_length=8, max_length=800)
 
 
+class TaskScope(BaseModel):
+    """Requested effects, interpreted from user messages once per task update."""
+
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["read_only", "execute"]
+    allowed_actions: list[str] = Field(default_factory=list, max_length=24)
+    forbidden_actions: list[str] = Field(default_factory=list, max_length=24)
+    user_evidence: str = Field(min_length=1, max_length=1000)
+
+
 class PlanDecision(BaseModel):
     """The planner's typed decision. The planner has no tools; this is its
     only channel, and it is the only place overall completion is decided."""
@@ -112,6 +122,7 @@ class PlanDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: Literal["browse", "document", "complete", "ask_user", "fail"]
+    task_scope: TaskScope | None = None
     document_request: DocumentRequest | None = None
     attachment_uses: list[AttachmentUse] = Field(default_factory=list, max_length=8)
     document_notes: list[DocumentNote] = Field(default_factory=list, max_length=24)
@@ -495,6 +506,8 @@ class TaskRunState(BaseModel):
     document_complete_units: dict[str, set[str]] = Field(default_factory=dict)
     follow_ups: list[str] = Field(default_factory=list)
     requirements: TaskRequirements = Field(default_factory=TaskRequirements)
+    task_scope: TaskScope | None = None
+    sensitive_values: set[str] = Field(default_factory=set, exclude=True)
     bound_tab: str | None = None
     bound_application: str | None = None
     authorized_origins: dict[str, list[str]] = Field(default_factory=dict)
@@ -801,7 +814,7 @@ class ToolsConfig(BaseModel):
     visual: bool = False
     debug_recording: bool = False
     tool_search: bool = False
-    approval_required_actions: list[str] = Field(default_factory=lambda: ["upload", "drag"])
+    approval_required_actions: list[str] = Field(default_factory=lambda: ["drag"])
 
 
 class MemoryConfig(BaseModel):
