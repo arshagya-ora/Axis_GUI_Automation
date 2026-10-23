@@ -519,10 +519,19 @@ class Runner:
         except Exception as error:
             # Full unexpected exceptions are local, opt-in terminal diagnostics.
             # The persisted/client error below remains independent and concise.
-            log.error('AXIS UI runner failed (%s).', type(error).__name__, exc_info=self.debug)
+            from axis.redaction import redact
+            import traceback
+            secrets = getattr(getattr(self.orchestrator, 'state', None), 'sensitive_values', set())
+            log.error('AXIS UI runner failed (%s).%s', type(error).__name__,
+                      '\n' + redact(traceback.format_exc(), secrets) if self.debug else '')
             try:
                 with self.lock:
-                    self._finish(task_id, AxisResult(status='failed', reason='AXIS could not finish this task. Check the browser bridge and local provider configuration, then start a new task.'))
+                    reason = ('The model provider connection failed or timed out.' if type(error).__name__ in {'ModelAPIError', 'APITimeoutError', 'APIConnectionError'} else
+                              'The model could not produce a valid action after correction.' if type(error).__name__ == 'UnexpectedModelBehavior' else
+                              'AXIS stopped because of an internal error. Progress has been preserved.')
+                    controller = self.orchestrator
+                    result = controller._result('failed', reason=reason, recoverable=True) if controller and hasattr(controller, '_result') else AxisResult(status='failed', reason=reason)
+                    self._finish(task_id, result)
             except (OSError, sqlite3.Error):
                 self._storage_failed()
 
@@ -533,6 +542,7 @@ class Runner:
             self.orchestrator.browser.upload_roots = tuple(self.attachments.path(a['id']).parent for a in self.attachments.catalog(task_id))
 
     def _finish(self, task_id, result):
+        self.approvals.invalidate(task_id)
         task = self.store.task(task_id)
         task.update(status=result.status, current_activity=result.reason[:1000], result=safe_result(result),
                     owns_runtime=result.status not in TERMINAL or result.status == 'limit_reached',

@@ -472,7 +472,8 @@ async def test_protocol_mismatch_stops_once_and_preserves_pending_work():
 
     bridge.responses['locator.getAttribute'] = legacy
     result = await controller.start_task('Inspect the status on the current page.')
-    assert result.status == 'failed'
+    assert result.status == 'paused'
+    assert controller.state.status == 'paused'
     assert 'BRIDGE_PROTOCOL_MISMATCH' in result.reason
     assert 'Reload or upgrade' in result.reason
     assert result.recoverable
@@ -497,3 +498,42 @@ def test_newer_native_property_evidence_vetoes_an_older_custom_control_observati
     state.actions.append(check)
     assert not controller._refine_verification(GoalCheck(assertion='text', expected='Enabled', target=FIELD))
     assert state.pending_changes
+
+
+@pytest.mark.anyio
+async def test_password_capability_block_preserves_fill_and_resume_refreshes_bridge(monkeypatch):
+    locator = {'role': 'textbox', 'name': 'Password', 'exact': True, 'within': {'selector': 'form'}}
+    script = Script([browse('Set password', verification={
+        'assertion': 'value', 'expected': 'fixture-secret', 'target': 'Password'})],
+        [{'calls': [('browser_act', {'tab': 'tab_1', 'command': {
+            'action': 'fill', 'target': {'kind': 'locator', 'locator': locator}, 'value': 'fixture-secret'},
+            'postcondition': {'assertion': 'value', 'locator': locator, 'expected': 'fixture-secret'}})],
+          'outcome': {'status': 'blocked', 'stop_condition_met': True}}])
+    controller, bridge, _ = make(script)
+    bridge.responses['extension.info'] = {'version': '1.1.0', 'methods': [
+        'tabs.list', 'page.accessibilityTree', 'locator.count', 'locator.fill', 'expect.locator.toHaveValue'],
+        'capabilities': {}}
+    bridge.responses['locator.count'] = {'count': 1, 'elements': [{'type': 'password'}]}
+    result = await controller.start_task('Fill the form. Password: fixture-secret')
+    assert result.status == 'paused', result.reason
+    assert result.recoverable
+    assert bridge.methods.count('locator.fill') == 1
+    assert 'expect.locator.toHaveValue' not in bridge.methods
+    assert script.planner_calls == 1
+    state = controller.state
+    pending = dict(state.pending_changes)
+    assert pending
+    calls = state.counters.browser_actions
+    bridge.responses['extension.info']['capabilities'] = dict.fromkeys(
+        ['valuePropertyEvidence', 'attributeParameter', 'nativeDateFill', 'privateValueAssertions'], True)
+    async def resumed_loop():
+        assert controller.state is state
+        assert state.pending_changes == pending
+        assert state.counters.browser_actions == calls
+        assert state.status == 'active'
+        assert controller.browser.capability_warning is None
+        assert 'privateValueAssertions' in controller.browser.bridge_capabilities
+        return controller._result('paused', reason='Fixture ends here.')
+    monkeypatch.setattr(controller, '_loop', resumed_loop)
+    await controller.resume_run()
+    assert bridge.methods.count('locator.fill') == 1

@@ -36,9 +36,54 @@ def origin(url):
     return f'{parts.scheme}://{parts.hostname}:{port}'
 
 
+def target_identity(detail):
+    observed = detail.get('observed_target') or {}
+    if observed:
+        identity = ' '.join(str(observed.get(key) or '') for key in ('role', 'accessibleName', 'ariaLabel', 'name', 'type')).strip()
+        if identity:
+            return identity
+    return str(detail.get('target') or '').split(' context=', 1)[0]
+
+
+def search_action(detail, operation):
+    target = target_identity(detail).lower()
+    return operation in {'fill', 'press', 'click'} and bool(re.search(r'\bsearch(?:box)?\b', target))
+
+
+def field_edit_key(scope, detail, operation):
+    """Unmodified editing keys are part of filling an observed input."""
+    command = (detail.get('arguments') or {}).get('command') or {}
+    observed = detail.get('observed_target') or {}
+    key = command.get('key')
+    if not command.get('target') or observed.get('editable') is False:
+        return False
+    editable = observed.get('editable') is True or (
+        observed.get('tagName', '').lower() in {'input', 'textarea'}
+        and observed.get('type', '').lower() not in {'button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden'})
+    if not observed and detail.get('target_type') == 'ref':
+        editable = bool(re.match(r'^(textbox|searchbox|spinbutton)\b', target_identity(detail), re.I))
+    return bool(scope and scope.get('mode') == 'execute' and 'fill' in scope.get('allowed_actions', [])
+                and 'press' not in scope.get('forbidden_actions', []) and operation == 'press' and editable
+                and key in {'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Backspace', 'Delete'})
+
+
 def automatic_scope(instruction, detail, operation):
     """Conservative scope filter; ambiguous effects still require approval."""
     request = instruction.lower()
+    user_request = request
+    detail = {**detail, 'target': target_identity(detail)}
+    scope = detail.get('task_scope')
+    if scope:
+        allowed = set(scope.get('allowed_actions', []))
+        if read_only_navigation(detail, operation):
+            return True
+        if 'search' in allowed and search_action(detail, operation):
+            return True
+        if scope.get('mode') != 'execute' or (operation not in allowed and not field_edit_key(scope, detail, operation)):
+            return False
+        # Intent is already interpreted; do not reclassify it using keywords.
+        request = ''
+        instruction = ''
     read_only = detail.get("read_only") or re.match(r"\s*(what|why|how|summari[sz]e|explain|describe|review|analy[sz]e|read)\b", request) or re.search(r"\bread.only\b|\bdo not (?:change|modify)\b", request)
     if read_only and read_only_navigation(detail, operation):
         return True
@@ -46,7 +91,7 @@ def automatic_scope(instruction, detail, operation):
         return False
     target = str(detail.get('target') or '').lower()
     if operation == 'close':
-        return bool(re.search(r'\bclose\b', request) and origin(detail.get('current_url')) in detail.get('authorized_origins', []))
+        return bool((scope or re.search(r'\bclose\b', request)) and origin(detail.get('current_url')) in detail.get('authorized_origins', []))
     if detail.get('target_type') == 'visual':
         return bool(not read_only and origin(detail.get('current_url')) in detail.get('authorized_origins', [])
                     and operation in {'click', 'dblclick'})
@@ -88,20 +133,21 @@ def automatic_scope(instruction, detail, operation):
         if destination and urlsplit(urljoin(detail.get('current_url') or '', destination)).hostname not in named_hosts | ({host} if app_matched else set()):
             return False
     if re.search(r'\b(password|secret|token|api key|credential|billing|payment)\b', target):
-        return False
+        if not (scope and ((operation == 'fill' and detail.get('supplied_value')) or field_edit_key(scope, detail, operation))):
+            return False
     for effect, pattern in [('send', r'\bsend\b'), ('delete', r'\bdelete\b|\bremove\b'),
-                            ('purchase', r'\bbuy\b|\bpurchase\b|\bcheckout\b')]:
-        if re.search(pattern, target):
+                            ('purchase', r'\bbuy\b|\bpurchase\b|\bcheckout\b'), ('submit', r'\bsubmit\b')]:
+        if re.search(pattern, target) and not (scope and effect in allowed):
             return False
     if operation in {'drag', 'type'} or (operation == 'press' and scoped_origins is None):
         return False  # keyboard/coordinate submission needs an explicit review
     if re.search(r'\b(to|cc|bcc|recipient)\b', target):
         value = str((detail.get('arguments') or {}).get('command', {}).get('value', ''))
         addresses = re.findall(r'[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}', value)
-        if not addresses or any(address.lower() not in request for address in addresses):
+        if not addresses or not (scope and detail.get('supplied_value')) and any(address.lower() not in user_request for address in addresses):
             return False
     if operation == 'upload':
-        return bool(re.search(r'\b(upload|attach)\b', request))
+        return bool(scope and 'upload' in allowed) or bool(re.search(r'\b(upload|attach)\b', request))
     if app_matched:
         if scoped_origins is not None:
             return operation in {'click', 'dblclick', 'fill', 'check', 'uncheck', 'select', 'press'}
@@ -163,27 +209,35 @@ class ExecutionApprovals:
         runner = self.runner
         with runner.lock, self.store.transaction():
             if runner.closed or runner.requested or not runner.active_id:
+                detail['_refusal'] = 'RUN_PAUSED' if runner.requested == 'pause' else 'RUN_CANCELLED'
                 return False
             task = self.store.task(runner.active_id)
             navigation_change = tool in {'browser_navigate', 'browser_tabs'} and re.search(r'compose|[?&](?:action|do)=|/delete|/send|logout|signout', str(detail.get('target') or ''), re.I)
             if not mandatory and not external_effect(tool, operation) and not navigation_change:
                 return True
+            if detail.get('_task_id', task['id']) != task['id']:
+                detail['_refusal'] = 'RUN_CANCELLED'
+                return False
+            detail['_task_id'] = task['id']
+            detail['target'] = target_identity(detail)
             instruction = task.get('instruction', '')
-            if operation == 'upload' and re.search(r"\b(?:do not|don't|never)\s+(?:upload|attach)\b", instruction, re.I):
+            scope = detail.get('task_scope')
+            restrictions = instruction if not scope else ''
+            if operation == 'upload' and re.search(r"\b(?:do not|don't|never)\s+(?:upload|attach)\b", restrictions, re.I):
                 self._pause(task['id'], 'Uploading conflicts with an explicit user restriction.')
                 return False
-            if re.search(r"\b(?:do not|don't|never)\s+" + re.escape(operation or '') + r'\b', instruction, re.I):
+            if re.search(r"\b(?:do not|don't|never)\s+" + re.escape(operation or '') + r'\b', restrictions, re.I):
                 self._pause(task['id'], 'This action conflicts with an explicit user restriction.')
                 return False
             command = (detail.get('arguments') or {}).get('command') or {}
-            draft_only = bool(re.search(r'\bdraft\b', instruction, re.I) and not re.search(r'\b(?:and|then)\s+send\b', instruction, re.I))
+            draft_only = bool(not scope and re.search(r'\bdraft\b', instruction, re.I) and not re.search(r'\b(?:and|then)\s+send\b', instruction, re.I))
             if draft_only and (operation in {'click', 'dblclick', 'press', 'type'} and
                                (detail.get('target_type') not in {'ref', 'locator'} or operation == 'press')):
                 self._pause(task['id'], 'Draft-only work requires an identified control, without keyboard submission. Observe the page before continuing.')
                 return False
             observed = detail.get('observed_target') or {}
             send_action = re.search(r'\bsend\b', str(detail.get('target') or ''), re.I) or (draft_only and operation == 'click' and observed.get('type') == 'submit' and observed.get('formAction')) or (operation == 'press' and re.search(r'(control|ctrl|meta|cmd).*enter', str(command.get('key', '')), re.I))
-            if send_action and (not re.search(r'\bsend\b', instruction, re.I) or re.search(r'\bdo not send\b|\bdon.t send\b', instruction, re.I) or (re.search(r'\bdraft\b', instruction, re.I) and not re.search(r'\b(?:and|then)\s+send\b', instruction, re.I))):
+            if not scope and send_action and (not re.search(r'\bsend\b', instruction, re.I) or re.search(r'\bdo not send\b|\bdon.t send\b', instruction, re.I) or (re.search(r'\bdraft\b', instruction, re.I) and not re.search(r'\b(?:and|then)\s+send\b', instruction, re.I))):
                 self._pause(task['id'], 'Sending is outside this draft-only request. Clarify the task before continuing.')
                 return False
             revision = task.get('plan_revision', 0)
@@ -198,7 +252,7 @@ class ExecutionApprovals:
                 or runner.attachments.require(task['id'], item['id']) == 'upload' for item in files))
             tab = getattr(getattr(runner.orchestrator, 'browser', None), 'tabs', {}).get(detail.get('tab'))
             if tab is not None:
-                detail = {**detail, 'application_title': getattr(tab, 'title', '')}
+                detail['application_title'] = getattr(tab, 'title', '')
             login = parse_login_intent(instruction)
             login_state = getattr(runner.orchestrator, 'state', None)
             if (login and login_state and login_state.login_auth_tab == detail.get('tab')
@@ -213,14 +267,16 @@ class ExecutionApprovals:
             reason = ('Policy requires approval for this action' if mandatory else
                       'Action is outside Automatic scope' if task.get('execution_mode') == 'automatic' else
                       'Task is in Approval mode')
-            safe_detail = detail
+            from axis.redaction import redact, collect_secrets
+            secrets = collect_secrets(detail)
+            safe_detail = redact(detail, secrets)
             data = {'tool': tool, 'operation': operation, **safe_detail, 'plan_revision': revision,
                     'approval_reason': reason,
                     'files': files,
                     'task_id': task['id'], 'mode_revision': task.get('mode_revision', 0),
                     'verification': getattr(getattr(runner.orchestrator, 'state', None), 'current_verification', None)}
             if hasattr(data['verification'], 'model_dump'):
-                data['verification'] = data['verification'].model_dump()
+                data['verification'] = redact(data['verification'].model_dump(), secrets)
             encoded = json.dumps(data, sort_keys=True, default=str)
             fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
             identifier = uuid4().hex
@@ -232,14 +288,19 @@ class ExecutionApprovals:
         # This callback runs in the browser tool worker, not the service/event loop.
         approval_started = time.perf_counter()
         while True:
+            recheck = False
             with runner.lock, self.store.transaction():
                 current = self.store.task(task['id'])
                 row = self.store.db.execute('SELECT status FROM execution_approvals WHERE id=?', (identifier,)).fetchone()
                 status = row['status'] if row else 'invalidated'
-                if runner.closed or runner.requested or runner.active_id != task['id'] or current.get('mode_revision', 0) != data['mode_revision'] or current.get('plan_revision', 0) != revision:
+                if runner.closed or runner.requested or runner.active_id != task['id'] or current.get('plan_revision', 0) != revision:
                     self.invalidate(task['id'])
+                    detail['_refusal'] = 'RUN_PAUSED' if runner.requested == 'pause' else 'RUN_CANCELLED'
                     return False
-                if status != 'pending':
+                if current.get('mode_revision', 0) != data['mode_revision']:
+                    self.invalidate(task['id'])
+                    recheck = True
+                elif status != 'pending':
                     current.pop('pending_approval', None)
                     timings = current.setdefault('timings', {})
                     timings['approval_wait_ms'] = timings.get('approval_wait_ms', 0) + int(
@@ -251,4 +312,6 @@ class ExecutionApprovals:
                         return True
                     self._pause(task['id'], 'The proposed action was not approved. Task context is preserved.')
                     return False
+            if recheck:
+                return self.authorize(tool, operation, detail, mandatory=mandatory)
             time.sleep(.1)

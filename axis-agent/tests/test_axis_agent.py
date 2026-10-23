@@ -6,6 +6,8 @@ executor rather than model behaviour.
 """
 
 import json
+import re
+import html
 import sys
 import threading
 from types import SimpleNamespace
@@ -132,6 +134,18 @@ class Script:
     def model(self) -> FunctionModel:
         return FunctionModel(self._respond)
 
+    @staticmethod
+    def scope(text):
+        # Scripted scope for executor tests; intent interpretation is tested separately.
+        from axis.orchestrator import extract_requirements
+        request = re.search(r'<current_request>(.*?)</current_request>', text, re.S) or re.search(r'<(?:user_request|original_request)>(.*?)</(?:user_request|original_request)>', text, re.S)
+        request = html.unescape(request.group(1)) if request else 'Fixture request'
+        requirements = extract_requirements(request)
+        return dict(mode='execute' if requirements.mutation_allowed else 'read_only',
+                    allowed_actions=['fill', 'click', 'select', 'check', 'uncheck', 'press', 'upload', 'drag', 'type', 'type_sequentially', 'close', 'search'],
+                    forbidden_actions=sorted(requirements.forbidden_actions),
+                    user_evidence=request.split('\n\nUser updates to this task (in order):')[0][:1000])
+
     def _respond(self, messages, info: AgentInfo) -> ModelResponse:
         output_tool = info.output_tools[0].name
         text = "\n".join(
@@ -145,7 +159,11 @@ class Script:
             self.planner_calls += 1
             self.planner_prompts.append(text)
             entry = self.planner[min(self.planner_calls - 1, len(self.planner) - 1)]
-            return ModelResponse(parts=[ToolCallPart(output_tool, dict(entry))])
+            scope = self.scope(text)
+            if not any(name in {'browser_act', 'browser_visual', 'browser_navigate'}
+                       for step in self.navigator for name, _ in step.get('calls', [])):
+                scope['mode'] = 'read_only'
+            return ModelResponse(parts=[ToolCallPart(output_tool, {'task_scope': scope, **dict(entry)})])
 
         if self._pending is None:
             self.navigator_calls += 1
@@ -155,7 +173,10 @@ class Script:
             self._pending = entry
             calls = entry.get("calls") or []
             if calls:
-                return ModelResponse(parts=[ToolCallPart(name, dict(args)) for name, args in calls])
+                prefix = []
+                if '<task_scope>null</task_scope>' in text or '<task_scope />' in text or '<task_scope></task_scope>' in text or '<task_scope>None</task_scope>' in text:
+                    prefix = [ToolCallPart('set_task_scope', {'scope': self.scope(text)})]
+                return ModelResponse(parts=prefix + [ToolCallPart(name, dict(args)) for name, args in calls])
         entry, self._pending = self._pending, None
         return ModelResponse(parts=[ToolCallPart(output_tool, dict(entry.get("outcome", {"status": "continue"})))])
 
@@ -568,7 +589,7 @@ async def test_only_the_six_ordinary_tools_are_registered_by_default():
     assert captured == {} or True
     names = [tool.name for tool in navigator_tools(AxisConfig.load())]
     assert names == [
-        "browser_tabs", "browser_observe", "browser_act",
+        "set_task_scope", "browser_tabs", "browser_observe", "browser_act",
         "browser_navigate", "browser_wait", "browser_assert",
     ]
     assert "browser_capture_evidence" not in names
@@ -995,6 +1016,7 @@ async def test_explicit_login_enters_raw_credentials_through_observed_sso():
 
 async def test_approval_callback_receives_target_origin_file_and_reason():
     config = AxisConfig.load()
+    config.tools.approval_required_actions = ["upload"]
     config.run.planner_interval_steps = 1
     approvals = []
     script = Script(
@@ -1142,9 +1164,9 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
     assert {event.kind for event in events} == {
         "status", "planner_decision", "navigator_step", "browser_action", "final",
     }
-    # No intent tools, plan CRUD, effects, leases, or workflow transitions.
+    # Task scope uses the existing agents; no external workflow engine.
     everything = "\n".join(script.prompts).lower()
-    for absent in ("intent", "effect", "lease", "workflow", "temporal", "projection"):
+    for absent in ("lease", "temporal", "projection"):
         assert absent not in everything, absent
 
 async def test_direct_read_completes_in_one_request_without_planner():

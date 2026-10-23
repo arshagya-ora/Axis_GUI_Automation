@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior
 from pydantic_ai import Agent, ModelHTTPError, RunCancelled, UsageLimitExceeded, UsageLimits, format_as_xml
 
 import browser_tools as bt
@@ -26,6 +27,7 @@ from browser_tools import BrowserRuntime, ToolFault
 
 from .agents import AxisDeps, RECOVERY_POLICY, UNKNOWN_OUTCOME_CODES, StepGate, StepBudgetYield, browser_context
 from .execution import automatic_scope, external_effect, origin
+from .redaction import redact, collect_secrets
 from .login import authorized_login_action, login_destination_matches, parse_login_intent
 from .models import (
     ActionRecord,
@@ -516,6 +518,7 @@ class AxisOrchestrator:
         """
         if self.state is None or self.state.status != "paused":
             raise ValueError("Only a paused live task can be resumed.")
+        self.browser.refresh_capabilities()
         self.resume()
         try:
             return await self._loop()
@@ -535,11 +538,13 @@ class AxisOrchestrator:
         if self.state is None:
             return await self.start_task(follow_up)
         state = self.state
+        self.browser.refresh_capabilities()
         attachments = self.documents or self.attachment_session
         if attachments:
             follow_up = attachments.input_prompt(follow_up, follow_up=True)
             self.attachment_session = attachments
             self.documents = attachments if attachments.catalog() else None
+        state.task_scope = None
         state.add_followup(follow_up)
         if attachments:
             state.follow_ups[-1] = follow_up
@@ -654,6 +659,11 @@ class AxisOrchestrator:
     def _emit(self, kind: str, **detail: Any) -> None:
         if self.on_event is None:
             return
+        secrets = collect_secrets(detail)
+        if self.state:
+            self.state.sensitive_values.update(collect_secrets(self._current_request()) | secrets)
+            secrets = self.state.sensitive_values
+        detail = redact(detail, secrets)
         detail.setdefault("at_ms", self._elapsed_ms())
         try:
             self.on_event(AxisEvent(kind=kind, detail=detail))
@@ -844,7 +854,8 @@ class AxisOrchestrator:
                 return stopped.result
 
             request = self._current_request()
-            if gui_action_request(request) and plan.decision == 'complete' and not any(
+            action_requested = state.task_scope.mode == 'execute' if state.task_scope else gui_action_request(request)
+            if action_requested and plan.decision == 'complete' and not any(
                 action.success and action.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
                 for action in state.actions):
                 routing_error = 'This request requires work in the named browser application. Select a matching tab and perform the action before answering.'
@@ -1178,6 +1189,10 @@ class AxisOrchestrator:
                 raise _Stop(self._result("cancelled", reason="The user cancelled the run."))
             if gate.stopped == "paused":
                 raise _Stop(self._result("paused", reason="The run is paused; state is preserved."))
+            incompatible = next((r for r in failures if r.code == 'BRIDGE_PROTOCOL_MISMATCH'), None)
+            if incompatible is not None:
+                state.last_error = incompatible.error or incompatible.code
+                raise _Stop(self._result('paused', reason=state.last_error, recoverable=True))
             if outcome.stop_condition_met:
                 raise _Stop(self._result('failed', reason=outcome.reason,
                                         answer=outcome.final_answer or outcome.summary))
@@ -1188,9 +1203,6 @@ class AxisOrchestrator:
                     recoverable=True))
             if repeated_rejection:
                 raise _Stop(self._result('failed', reason='VERIFICATION_MISMATCH: The same completion check remains unresolved after recovery. ' + rejection, recoverable=True))
-            incompatible = next((r for r in failures if r.code == 'BRIDGE_PROTOCOL_MISMATCH'), None)
-            if incompatible is not None:
-                raise _Stop(self._result('failed', reason=incompatible.error or incompatible.code, recoverable=True))
             if repeated_check is not None:
                 raise _Stop(self._result("failed", reason=self._verification_failure_reason(repeated_check), recoverable=True))
 
@@ -1284,6 +1296,7 @@ class AxisOrchestrator:
             "current_request": self._current_request(),
             "reference_context": state.reference_context,
             "requirements": state.requirements.model_dump(mode="json"),
+            "task_scope": state.task_scope.model_dump() if state.task_scope else None,
             "current_plan_summary": state.current_plan_summary,
             "current_goal": state.current_goal,
             "success_condition": state.current_success_condition,
@@ -1319,7 +1332,7 @@ class AxisOrchestrator:
                 state.document_synthesis_only = True
             context['document_synthesis_only'] = state.document_synthesis_only
         context['execution_mode'] = getattr(self, 'execution_mode', 'automatic')
-        context['browser_action_required'] = gui_action_request(context['current_request'])
+        context['browser_action_required'] = state.task_scope.mode == 'execute' if state.task_scope else False
         context['requested_application'] = named_gui(context['current_request'])
         if self.tab is not None and self.tab in self.browser.tabs:
             context["browser"] = {
@@ -1338,8 +1351,35 @@ class AxisOrchestrator:
             deps=None,
         )
         state.plan_ms = int((time.monotonic() - started) * 1000)
+        if decision.task_scope is not None:
+            try:
+                self._set_task_scope(decision.task_scope)
+            except ValueError as error:
+                raise _Stop(self._result('failed', reason=str(error), recoverable=True)) from error
         self._retain_source_notes(decision)
         return decision
+
+    def _supplied_text(self):
+        text = self._current_request()
+        if self.documents:
+            sources = self.documents.procedure_context()['items']
+            text += '\n' + '\n'.join(item.get('text', '') for item in sources)
+        return text
+
+    def _set_task_scope(self, scope):
+        state = self.state
+        if state.task_scope is not None:
+            if state.task_scope != scope:
+                raise ValueError('Task scope is already set. Only a new user message can change it.')
+            return
+        messages = [state.original_request, *state.follow_ups]
+        quote = ' '.join(scope.user_evidence.casefold().split())
+        if not quote or not any(quote in ' '.join(message.casefold().split()) for message in messages):
+            raise ValueError('Task scope must cite the user request, not a document or page.')
+        state.task_scope = scope
+        state.requirements.mutation_allowed = scope.mode == 'execute'
+        state.requirements.forbidden_actions = set(scope.forbidden_actions)
+        self.browser.forbidden_actions = frozenset(scope.forbidden_actions)
 
     def _retain_source_notes(self, decision: PlanDecision) -> None:
         state = self.state
@@ -1519,6 +1559,10 @@ class AxisOrchestrator:
             effect_authorizer=getattr(self, 'effect_authorizer', None) or self._authorize_effect,
             forbidden_actions=frozenset(task.requirements.forbidden_actions),
             mutation_allowed=task.requirements.mutation_allowed,
+            task_scope=task.task_scope,
+            sensitive_values=task.sensitive_values,
+            supplied_text=self._supplied_text(),
+            set_scope=self._set_task_scope,
             pending_changes=task.pending_changes,
             is_paused=lambda: bool(self.state and self.state.status == "paused"),
             is_cancelled=lambda: bool(self.state and self.state.status == "cancelled"),
@@ -1533,6 +1577,7 @@ class AxisOrchestrator:
             ),
             on_record=self._register_action,
             bind_verification=lambda tab, command, target: self._bind_verification_target(tab, command, target, gate.records),
+            bind_postcondition=self._bind_field_postcondition,
             bind_pending_verification=self._bind_pending_verification,
             on_dispatch=lambda: self._emit("status", phase="action_started"),
         )
@@ -1547,6 +1592,8 @@ class AxisOrchestrator:
         history = [item for item in task.change_history if item.get('url') == state.url]
         if history:
             prompt += '\n' + format_as_xml(history, root_tag='observed_changes')
+        prompt += '\n' + format_as_xml({'task_scope': task.task_scope.model_dump() if task.task_scope else None,
+            'user_request': task.original_request, 'follow_ups': task.follow_ups}, root_tag='task_intent')
         if task.direct_execution:
             prompt += "\nComplete the user's request directly. Return task_complete with final_answer and runtime evidence_ids after verification. Use needs_plan with a concrete reason only when strategic decomposition is needed."
         else:
@@ -1627,6 +1674,10 @@ class AxisOrchestrator:
             )
             transient = status in {429, 500, 502, 503, 504}
             raise _Stop(self._result("failed", reason=reason, recoverable=transient and self.documents is not None)) from exc
+        except ModelAPIError as exc:
+            raise _Stop(self._result('failed', reason='The model provider connection failed or timed out.', recoverable=True)) from exc
+        except UnexpectedModelBehavior as exc:
+            raise _Stop(self._result('failed', reason='The model could not produce a valid action after correction.', recoverable=True)) from exc
         except RunCancelled:
             if state.status != "paused":
                 state.status = "cancelled"
@@ -1650,11 +1701,11 @@ class AxisOrchestrator:
                 return await agent.run(prompt, deps=deps, usage=state.usage,
                     usage_limits=UsageLimits(request_limit=self._run_limits().max_model_requests),
                     cancellation_token=state.cancellation_token)
-            except ModelHTTPError as error:
+            except ModelAPIError as error:
                 state.usage.requests = max(int(state.usage.requests), before + 1)
-                if (error.status_code not in {429, 500, 502, 503, 504}
+                if ((isinstance(error, ModelHTTPError) and error.status_code not in {429, 500, 502, 503, 504})
                         or attempt >= self.config.run.provider_retries
-                        or (deps is not None and (deps.gate.actions_used or deps.gate.records))
+                        or (deps is not None and (deps.gate.actions_used or deps.gate.records or getattr(deps.gate, 'in_flight', None)))
                         or int(state.usage.requests) >= self._run_limits().max_model_requests):
                     raise
                 delay = self.config.run.provider_retry_delay * 2**attempt
@@ -2532,6 +2583,20 @@ class AxisOrchestrator:
         pending.verification_locator = scoped
         pending.verification_url = pending.source_url
 
+    def _bind_field_postcondition(self, tab, command):
+        check = self.state.current_verification
+        if not check or check.locator or command.assertion not in {'value', 'checked'}:
+            return
+        locator = command.locator
+        identity = locator.name or locator.label or locator.placeholder
+        normalize = lambda value: ' '.join((value or '').casefold().rstrip(' *').split())
+        if not identity or normalize(identity) != normalize(check.target):
+            return
+        try:
+            self._bind_verification_target(tab, command, check.target)
+        except ValueError:
+            pass  # A stale, unrelated or uncertain check still needs explicit binding.
+
     def _bind_verification_target(self, tab, command, target, records=()):
         """Bind an inferred label before its assertion, using a fresh unique scoped target."""
         state = self.state
@@ -2561,7 +2626,8 @@ class AxisOrchestrator:
         interactions.extend(p.sequence for p in state.pending_changes.values() if p.goal_id == state.current_goal_id and p.tab == tab)
         after = max([state.last_interaction_by_tab.get(tab, 0), *interactions])
         unique = any(a.passed and not a.superseded_by and a.goal_id == state.current_goal_id and a.tab == tab
-                     and a.sequence > after and a.assertion == 'count' and a.expected == 1
+                     and a.sequence > after and ((a.assertion == 'count' and a.expected == 1)
+                          or (a.assertion == command.assertion and a.expected == expected and a.match == 'exact'))
                      and self._assertion_target_refines(a.target, candidate.target)
                      for a in state.assertions)
         if not unique:

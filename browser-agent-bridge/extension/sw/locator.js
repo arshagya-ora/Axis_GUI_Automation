@@ -95,7 +95,7 @@ export function createLocatorHandlers({
       await chromeApi.scripting.executeScript({
         target,
         func: source => {
-          if (!globalThis.__browserAgentBridgeDomA11y) (0, eval)(source);
+          if (!globalThis.__browserAgentBridgeDomA11y?.fillNativeDate) (0, eval)(source);
         },
         args: [domA11ySource],
         world: 'MAIN'
@@ -322,12 +322,17 @@ export function createLocatorHandlers({
       error.diagnostic = { assertion, property: 'value', element: compactLocatorElement(element) };
       throw error;
     }
-    if (result.count === 1 && element && predicate(element)) {
-      return { ok: true, assertion, expected, actual: actualOf(element), elapsedMs: Date.now() - started, frame: frameTarget.frame };
+    const sensitive = element?.type?.toLowerCase() === 'password';
+    const passed = assertion === 'toHaveValue' && typeof result.valueMatches === 'boolean'
+      ? result.valueMatches : predicate(element || {});
+    const safeExpected = sensitive ? '[REDACTED]' : expected;
+    const safeActual = sensitive ? '[REDACTED]' : element ? actualOf(element) : null;
+    if (result.count === 1 && element && passed) {
+      return { ok: true, assertion, expected: safeExpected, actual: safeActual, elapsedMs: Date.now() - started, frame: frameTarget.frame };
     }
-    throw createLocatorExpectTimeoutError(params, assertion, frameTarget, {
-      expected,
-      actual: element ? actualOf(element) : null,
+    throw createLocatorExpectTimeoutError(sensitive ? { ...params, expected: '[REDACTED]', expectedValue: '[REDACTED]', value: '[REDACTED]' } : params, assertion, frameTarget, {
+      expected: safeExpected,
+      actual: safeActual,
       elapsedMs: Date.now() - started,
       last: result
     });
@@ -571,7 +576,7 @@ export function createLocatorHandlers({
     const frameTarget = await resolveFrameTarget(tabId, params);
     const readiness = params.force === true ? null : await waitForLocatorActionable(tabId, { ...params, index, _ignoreTopLevelTextLocator: true }, 'fill', frameTarget);
     const prepared = await runLocatorScript(tabId, { ...params, index, replace: params.replace !== false, _ignoreTopLevelTextLocator: true }, 'prepareTextInput', frameTarget);
-    const result = prepared.inputMode === 'select'
+    const result = ['select', 'date'].includes(prepared.inputMode)
       ? await runLocatorScript(tabId, { ...params, fillText: text, index, _ignoreTopLevelTextLocator: true }, 'fill', frameTarget)
       : await dispatchRealTextInput(tabId, text, params).then(() => runLocatorScript(tabId, { ...params, index, _ignoreTopLevelTextLocator: true }, 'summarize', frameTarget));
     await recordAction(tabId, 'locator.fill', { locator: locatorSpecForRecording({ ...params, _ignoreTopLevelTextLocator: true }), index, text, frameSelector: params.frameSelector || params.locator?.frameSelector || null, frameId: frameTarget.frameId }, result);
@@ -969,8 +974,18 @@ export function createLocatorHandlers({
     // Focus + select the field in-page so real input replaces its content. This
     // works for input/textarea/contentEditable (a triple-click would only select
     // one line of a textarea).
-    const { frameId, frameTarget, target } = await focusRef(tabId, params, 'locator.fillRef', params.replace !== false);
-    await dispatchRealTextInput(tabId, text, params);
+    let { frameId, frameTarget, target } = await focusRef(tabId, params, 'locator.fillRef', params.replace !== false);
+    if (target.element?.type === 'date') {
+      if (params.replace === false) throw new Error('Date fields require replacement, not appended text.');
+      const response = await chromeApi.tabs.sendMessage(tabId, {
+        type: 'FILL_ACCESSIBILITY_REF_DATE', ref: parseRef(params.ref, frameId).ref,
+        snapshotId: target.snapshotId || params.snapshotId, value: text
+      }, { frameId });
+      if (!response?.ok) throw Object.assign(new Error(response?.error || 'Native date filling failed.'), { code: response?.code });
+      target = response.target;
+    } else {
+      await dispatchRealTextInput(tabId, text, params);
+    }
     await recordAction(tabId, 'locator.fillRef', { ref: params.ref, snapshotId: target.snapshotId || params.snapshotId || null, text, frameId }, { element: target.element });
     return refActionResult(params, frameTarget, target, frameId);
   }
@@ -1041,6 +1056,7 @@ export function createLocatorHandlers({
     return {
       index: element.index,
       tagName: element.tagName,
+      type: element.type || '',
       id: element.id || '',
       role: element.role || '',
       accessibleName: element.accessibleName || '',
@@ -1345,7 +1361,7 @@ export function createLocatorHandlers({
         }
 
         if (options.action === 'fill') {
-          fillElement(element, options.text);
+          await fillElement(element, options.text);
           return { element: summarizeElement(element, options.index) };
         }
 
@@ -1486,7 +1502,10 @@ export function createLocatorHandlers({
               actionability
             };
           }
-          return { ...base, element: summarizeElement(element, options.index) };
+          const summary = summarizeElement(element, options.index);
+          const valueMatches = options.wait?.assertion === 'toHaveValue' && matches.length === 1 && 'value' in element
+            ? matchesExpectedTextInPage(String(element.value), options.wait.expected, options.wait.match || {}) : undefined;
+          return { ...base, element: summary, valueMatches };
         }
 
         function annotateActionabilitySnapshot(snapshot, wait, previousRect) {
@@ -1540,7 +1559,7 @@ export function createLocatorHandlers({
             if (wait.assertion === 'toBeDisabled') return element.disabled === true;
             if (wait.assertion === 'toBeEditable') return (element.editable === true) === wait.expected;
             if (wait.assertion === 'toBeChecked') return element.checked === wait.expected;
-            if (wait.assertion === 'toHaveValue') return element.hasValue === false || matchesExpectedTextInPage(element.value || '', wait.expected, wait.match || {});
+            if (wait.assertion === 'toHaveValue') return element.hasValue === false || snapshot.valueMatches === true;
           }
           if (wait.kind === 'actionability') {
             const checks = snapshot.actionability || {};
@@ -1711,7 +1730,11 @@ export function createLocatorHandlers({
           });
         }
 
-        function fillElement(element, text) {
+        async function fillElement(element, text) {
+          if (element.tagName.toLowerCase() === 'input' && element.type === 'date') {
+            await domA11y.fillNativeDate(element, text);
+            return;
+          }
           if (element.tagName.toLowerCase() === 'select' && 'value' in element) {
             element.value = text;
           } else {
@@ -1722,8 +1745,9 @@ export function createLocatorHandlers({
         }
 
         function prepareTextInput(element, index, replace) {
-          if (element.tagName.toLowerCase() === 'select') {
-            return { element: summarizeElement(element, index), inputMode: 'select' };
+          if (element.tagName.toLowerCase() === 'select' || element.type === 'date') {
+            if (element.type === 'date' && !replace) throw new Error('Date fields require replacement, not appended text.');
+            return { element: summarizeElement(element, index), inputMode: element.type === 'date' ? 'date' : 'select' };
           }
           if (typeof element.focus === 'function') element.focus({ preventScroll: true });
           if (element.isContentEditable) {

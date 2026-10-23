@@ -569,3 +569,30 @@ test('scoped observations use the real resolver and retain roles, state, context
   await assert.rejects(handlers.locatorSnapshot({tabId: 1, locator: {role: 'link', name: 'Missing'}}), error => error.code === 'TARGET_NOT_FOUND');
   await assert.rejects(handlers.locatorSnapshot({tabId: 1, locator: {role: 'button'}}), error => error.code === 'TARGET_AMBIGUOUS' && error.data.count === 3);
 });
+
+
+test('password assertions compare the live value without exposing it or toggling visibility', async () => {
+  const input = new FakeInput('input', {attrs: {id: 'password', type: 'password'}, value: 'fixture-secret'});
+  const session = await runAccessibilitySession(makeDocument([input]));
+  Object.assign(session.context, {setTimeout, clearTimeout, setInterval, clearInterval,
+    MutationObserver: class { observe() {} disconnect() {} }});
+  const {createLocatorHandlers} = await importLocatorModule();
+  const handlers = createLocatorHandlers({
+    assertTabId: id => id, assertTabAllowed: async () => {},
+    resolveFrameTarget: async tabId => ({target: {tabId}}),
+    chromeApi: {scripting: {async executeScript({func,args}) {
+      session.context.options = args[0];
+      return [{result: await vm.runInContext('(' + func.toString() + ')(options)',session.context)}];
+    }}}
+  });
+  const params = {tabId: 1, selector: '#password', expected: 'fixture-secret', timeoutMs: 10, intervalMs: 1};
+  const result = await handlers.expectLocatorToHaveValue(params);
+  assert.equal(result.ok,true);
+  assert.equal(input.getAttribute('type'),'password');
+  assert.ok(!JSON.stringify(result).includes('fixture-secret'));
+  await assert.rejects(handlers.expectLocatorToHaveValue({...params,expected:'wrong-secret'}),error => {
+    const output = JSON.stringify({message:error.message,diagnostic:error.diagnostic});
+    assert.ok(!output.includes('fixture-secret') && !output.includes('wrong-secret'));
+    return error.code === 'LOCATOR_EXPECT_TIMEOUT';
+  });
+});

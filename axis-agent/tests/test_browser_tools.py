@@ -547,7 +547,8 @@ def test_reading_another_format_does_not_discard_document_refs():
 
 
 @pytest.mark.parametrize('capabilities, warning', [
-    ({'valuePropertyEvidence': True, 'attributeParameter': True}, False),
+    ({'valuePropertyEvidence': True, 'attributeParameter': True, 'nativeDateFill': True, 'privateValueAssertions': True}, False),
+    ({'valuePropertyEvidence': True, 'attributeParameter': True}, True),
     ({'valuePropertyEvidence': True}, True),
     ({}, True),
 ])
@@ -584,3 +585,65 @@ def test_text_assertion_retains_property_metadata_without_changing_expected_resu
     assert result['data']['passed']
     assert result['data']['expected'] == 'Enabled'
     assert result['data']['actual']['element']['hasValue'] is False
+
+
+def test_old_password_verifier_requests_reload_instead_of_reporting_empty():
+    bridge, runtime, tab = runtime_with_tab()
+    bridge.responses['extension.info'] = {'methods':['expect.locator.toHaveValue'],'capabilities':{}}
+    def legacy():
+        raise bt.BrowserBridgeError('Value check timed out', data={'code':'LOCATOR_EXPECT_TIMEOUT',
+            'diagnostic':{'actual':'','last':{'element':{'type':'password'}}}})
+    bridge.responses['expect.locator.toHaveValue'] = legacy
+    result = bt.browser_assert(context(runtime),tab,bt.ValueAssertion(assertion='value',locator=bt.Locator(label='Password'),expected='fixture-secret'))
+    assert result['error']['code'] == 'BRIDGE_PROTOCOL_MISMATCH'
+    assert 'Reload' in result['error']['message']
+    assert 'fixture-secret' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('current', [False, True])
+def test_password_check_uses_live_capabilities_without_revealing_value(current):
+    bridge, runtime, tab = runtime_with_tab()
+    methods = ['locator.count', 'expect.locator.toHaveValue']
+    bridge.responses['extension.info'] = {'version': '1.1.0', 'methods': methods, 'capabilities': {}}
+    runtime.refresh_capabilities()
+    bridge.responses['extension.info']['capabilities'] = {'privateValueAssertions': current}
+    bridge.responses['locator.count'] = {'count': 1, 'elements': [{'type': 'password'}]}
+    bridge.responses['expect.locator.toHaveValue'] = {'ok': True, 'actual': '[REDACTED]'}
+    result = bt.browser_assert(context(runtime), tab, bt.ValueAssertion(
+        assertion='value', locator=bt.Locator(label='Password'), expected='fixture-secret'))
+    if current:
+        assert result['ok'] and result['data']['passed']
+        assert not any(method == 'locator.count' for method, _ in bridge.calls)
+    else:
+        assert result['error']['code'] == 'BRIDGE_PROTOCOL_MISMATCH'
+        assert 'fixture-secret' not in json.dumps(result)
+        assert not any(method == 'expect.locator.toHaveValue' for method, _ in bridge.calls)
+
+
+def test_capability_refresh_clears_warning_after_extension_reload():
+    bridge, runtime, _ = runtime_with_tab()
+    bridge.responses['extension.info'] = {'version': '1.1.0', 'capabilities': {}}
+    runtime.refresh_capabilities()
+    assert runtime.capability_warning
+    bridge.responses['extension.info']['capabilities'] = dict.fromkeys(
+        ['valuePropertyEvidence', 'attributeParameter', 'nativeDateFill', 'privateValueAssertions'], True)
+    runtime.refresh_capabilities()
+    assert runtime.capability_warning is None
+
+
+@pytest.mark.parametrize('current', [False, True])
+def test_real_password_diagnostic_shape_does_not_hide_genuine_mismatch(current):
+    bridge, runtime, tab = runtime_with_tab()
+    bridge.responses['extension.info'] = {'methods': ['expect.locator.toHaveValue'],
+        'capabilities': {'privateValueAssertions': current}}
+    def mismatch():
+        raise bt.BrowserBridgeError('Value check timed out', data={'code': 'LOCATOR_EXPECT_TIMEOUT',
+            'diagnostic': {'actual': '[REDACTED]', 'count': 1, 'candidates': [{'type': 'password'}]}})
+    bridge.responses['expect.locator.toHaveValue'] = mismatch
+    result = bt.browser_assert(context(runtime), tab, bt.ValueAssertion(
+        assertion='value', locator=bt.Locator(label='Password'), expected='fixture-secret'))
+    if current:
+        assert result['ok'] and not result['data']['passed']
+        assert 'Reload' not in result['data']['message']
+    else:
+        assert result['error']['code'] == 'BRIDGE_PROTOCOL_MISMATCH'
